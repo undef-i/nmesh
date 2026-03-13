@@ -1,5 +1,5 @@
 # nmesh
-nmesh is a simple, decentralized VPN.
+A simple, decentralized VPN.
 
 ## Build
 
@@ -24,7 +24,7 @@ peer = 203.0.113.1:11451
 ## Run
 
 ```bash
-sudo ./build/nmesh -c nmesh.conf
+sudo ./build/release/nmesh -c nmesh.conf
 
 ```
 
