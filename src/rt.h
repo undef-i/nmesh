@@ -10,7 +10,7 @@
 #define RTO_MAX 30000U
 #define RTO_INIT 1000U
 #define RT_M_INF 0xFFFFU
-#define RT_MTU_MIN 68U
+#define RT_MTU_MIN 128U
 #define RT_MTU_DEF 1280U
 #define RT_MTU_MAX 65535U
 
@@ -241,7 +241,7 @@ bool rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
              uint64_t n_ver, bool *req_seq);
 void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
                  uint64_t ver, uint64_t sys_ts);
-void rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
+bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
                    uint64_t sys_ts);
 void rt_dad_stl (Rt *t, uint64_t sys_ts, PPool *pool, const char *peers_path);
 void pp_init (PPool *p, const char *persist_path);
