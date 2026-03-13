@@ -58,6 +58,36 @@ u32_wr (uint8_t *dst, uint32_t v)
   dst[3] = (uint8_t)v;
 }
 
+static void
+gsp_ent_ser (uint8_t *dst, const GspEnt *src)
+{
+  memcpy (dst, src->lla, 16);
+  memcpy (dst + 16, src->ep_ip, 16);
+  u16_wr (dst + 32, src->ep_port);
+  dst[34] = src->flags;
+  dst[35] = src->state;
+  u16_wr (dst + 36, src->mtu);
+  u32_wr (dst + 38, src->seq);
+  u32_wr (dst + 42, src->adv_m);
+  memcpy (dst + 46, src->nhop_lla, 16);
+  u64_wr (dst + 62, src->ver);
+}
+
+static void
+gsp_ent_des (GspEnt *dst, const uint8_t *src)
+{
+  memcpy (dst->lla, src, 16);
+  memcpy (dst->ep_ip, src + 16, 16);
+  dst->ep_port = u16_rd (src + 32);
+  dst->flags = src[34];
+  dst->state = src[35];
+  dst->mtu = u16_rd (src + 36);
+  dst->seq = u32_rd (src + 38);
+  dst->adv_m = u32_rd (src + 42);
+  memcpy (dst->nhop_lla, src + 46, 16);
+  dst->ver = u64_rd (src + 62);
+}
+
 static bool
 lla_inf_s (Rt *rt, const uint8_t src_ip[16], uint16_t src_port,
            const uint8_t suffix[8], uint8_t out_lla[16])
@@ -310,7 +340,7 @@ gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
-      memcpy (pl_buf + wr_off, &gsp_ent, sizeof (gsp_ent));
+      gsp_ent_ser (pl_buf + wr_off, &gsp_ent);
       act_cnt++;
     }
   if (act_cnt == 0)
@@ -362,7 +392,7 @@ gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt, const uint8_t tgt_lla[16],
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
-      memcpy (pl_buf + wr_off, &gsp_ent, sizeof (gsp_ent));
+      gsp_ent_ser (pl_buf + wr_off, &gsp_ent);
       act_cnt++;
     }
   u16_wr (pl_buf, (uint16_t)act_cnt);
@@ -637,7 +667,7 @@ on_gsp (const uint8_t *raw, size_t raw_len, const uint8_t src_ip[16],
     {
       size_t rd_off = 2 + gsp_idx * GSP_SZ;
       GspEnt gsp_ent;
-      memcpy (&gsp_ent, pt_ptr + rd_off, sizeof (gsp_ent));
+      gsp_ent_des (&gsp_ent, pt_ptr + rd_off);
       static const uint8_t z_lla[16] = { 0 };
       bool is_z = (memcmp (gsp_ent.lla, z_lla, 16) == 0);
       if (!is_z && !IS_LLA_VAL (gsp_ent.lla))

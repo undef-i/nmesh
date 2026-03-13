@@ -53,6 +53,8 @@ frag_asm (uint32_t msg_id, uint16_t off, uint16_t tot_len, const uint8_t *data,
     return NULL;
   if (data_len == 0)
     return NULL;
+  if ((size_t)off + data_len > sizeof (g_frag_bkt[0].buf))
+    return NULL;
   if ((size_t)off + data_len > tot_len)
     return NULL;
   FBkt *b = frag_bkt_get (msg_id);
@@ -66,7 +68,6 @@ frag_asm (uint32_t msg_id, uint16_t off, uint16_t tot_len, const uint8_t *data,
     }
   if (b->tot_len != tot_len)
     {
-      b->is_act = false;
       return NULL;
     }
   memcpy (b->buf + off, data, data_len);
@@ -74,6 +75,8 @@ frag_asm (uint32_t msg_id, uint16_t off, uint16_t tot_len, const uint8_t *data,
     {
       uint32_t pos = (uint32_t)off + (uint32_t)i;
       uint32_t bit_idx = pos >> 3;
+      if (bit_idx >= sizeof (b->rx_bmp))
+        return NULL;
       uint8_t mask = (uint8_t)(1U << (pos & 7U));
       if ((b->rx_bmp[bit_idx] & mask) != 0)
         continue;

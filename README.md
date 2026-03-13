@@ -27,3 +27,8 @@ peer = 203.0.113.1:11451
 sudo ./build/nmesh -c nmesh.conf
 
 ```
+
+## Known Issues
+
+- Physical link MTU values below `128` are not supported.
+

@@ -37,11 +37,112 @@
 #define TAP_F_MAX 16384
 #define PEER_FLS_TK 5
 #define KA_TMO 25000ULL
+#define RX_RP_MAX 512
 static uint64_t g_tx_ts = 0;
 static uint64_t g_rx_ts = 0;
 static uint32_t g_frag_mid = 1;
 static Rt *g_rt = NULL;
+
+typedef struct
+{
+  bool is_act;
+  uint8_t ip[16];
+  uint16_t port;
+  uint64_t max_cnt;
+  uint64_t map;
+} RxRp;
+
+static RxRp g_rx_rp[RX_RP_MAX];
+
 static uint64_t sys_ts (void);
+
+static uint64_t
+nonce_cnt_rd (const uint8_t nonce[24])
+{
+  return ((uint64_t)nonce[16] << 56) | ((uint64_t)nonce[17] << 48)
+         | ((uint64_t)nonce[18] << 40) | ((uint64_t)nonce[19] << 32)
+         | ((uint64_t)nonce[20] << 24) | ((uint64_t)nonce[21] << 16)
+         | ((uint64_t)nonce[22] << 8) | (uint64_t)nonce[23];
+}
+
+static bool
+rx_rp_chk (const uint8_t ip[16], uint16_t port, const uint8_t nonce[24])
+{
+  uint64_t cnt = nonce_cnt_rd (nonce);
+  RxRp *slot = NULL;
+  for (size_t i = 0; i < RX_RP_MAX; i++)
+    {
+      if (!g_rx_rp[i].is_act)
+        {
+          if (!slot)
+            slot = &g_rx_rp[i];
+          continue;
+        }
+      if (memcmp (g_rx_rp[i].ip, ip, 16) == 0 && g_rx_rp[i].port == port)
+        {
+          slot = &g_rx_rp[i];
+          break;
+        }
+    }
+  if (!slot)
+    return false;
+  if (!slot->is_act)
+    {
+      slot->is_act = true;
+      memcpy (slot->ip, ip, 16);
+      slot->port = port;
+      slot->max_cnt = cnt;
+      slot->map = 1ULL;
+      return true;
+    }
+  if (cnt > slot->max_cnt)
+    {
+      uint64_t sh = cnt - slot->max_cnt;
+      slot->map = (sh >= 64) ? 0ULL : (slot->map << sh);
+      slot->map |= 1ULL;
+      slot->max_cnt = cnt;
+      return true;
+    }
+  uint64_t df = slot->max_cnt - cnt;
+  if (df >= 64)
+    return false;
+  {
+    uint64_t bit = (1ULL << df);
+    if ((slot->map & bit) != 0)
+      return false;
+    slot->map |= bit;
+  }
+  return true;
+}
+
+static void
+rx_rp_rst_ep (const uint8_t ip[16], uint16_t port)
+{
+  for (size_t i = 0; i < RX_RP_MAX; i++)
+    {
+      if (!g_rx_rp[i].is_act)
+        continue;
+      if (memcmp (g_rx_rp[i].ip, ip, 16) != 0)
+        continue;
+      if (g_rx_rp[i].port != port)
+        continue;
+      memset (&g_rx_rp[i], 0, sizeof (g_rx_rp[i]));
+    }
+}
+
+static void
+rx_rp_rst_lla (Rt *rt, const uint8_t lla[16])
+{
+  if (!rt || !lla)
+    return;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      Re *re = &rt->re_arr[i];
+      if (memcmp (re->lla, lla, 16) != 0)
+        continue;
+      rx_rp_rst_ep (re->ep_ip, re->ep_port);
+    }
+}
 
 static void
 on_udp_emsg (const uint8_t dst_ip[16], uint16_t dst_port, size_t atmpt_plen)
@@ -1091,6 +1192,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                              &pt_len);
       if (dec_res != 0)
         continue;
+      if (!rx_rp_chk (src_ip, src_port, raw_buf + PKT_CH_SZ))
+        continue;
       rt_rx_ack (rt, src_ip, src_port, ts);
       (void)hdr.local_port;
       switch (hdr.pkt_type)
@@ -1285,7 +1388,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                      "mismatch\n");
                     break;
                   }
-                rt_peer_sess (rt, peer_lla, peer_sid, ts);
+                if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
+                  rx_rp_rst_lla (rt, peer_lla);
                 if (hdr.rel_f == 0)
                   rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
                 if (hdr.rel_f == 0 && !is_ip_bgn (src_ip)
@@ -1316,7 +1420,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                      "mismatch\n");
                     break;
                   }
-                rt_peer_sess (rt, peer_lla, peer_sid, ts);
+                if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
+                  rx_rp_rst_lla (rt, peer_lla);
                 if (hdr.rel_f == 0)
                   rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
                 uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);

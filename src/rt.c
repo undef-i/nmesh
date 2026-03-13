@@ -25,6 +25,18 @@
 #define RT_MTU_EPS 10U
 #define RT_PRB_BST 3U
 
+static bool
+seq_gt (uint32_t a, uint32_t b)
+{
+  return ((int32_t)(a - b)) > 0;
+}
+
+static bool
+seq_lt (uint32_t a, uint32_t b)
+{
+  return seq_gt (b, a);
+}
+
 static uint16_t
 rt_mtu_ub (const Rt *t)
 {
@@ -355,8 +367,11 @@ trg_mark (Rt *t, const uint8_t lla[16])
 {
   if (!IS_LLA_VAL (lla))
     return;
-  memcpy (t->trg_lla, lla, 16);
-  t->has_trg = true;
+  if (!t->has_trg)
+    {
+      memcpy (t->trg_lla, lla, 16);
+      t->has_trg = true;
+    }
 }
 
 static bool
@@ -546,7 +561,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         continue;
       if (re->is_act)
         cur_re->is_act = true;
-      if (re->seq > cur_re->seq)
+      if (seq_gt (re->seq, cur_re->seq))
         cur_re->seq = re->seq;
       if (re->adv_m > 0)
         cur_re->adv_m = re->adv_m;
@@ -892,9 +907,10 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
         continue;
       if (re->ep_port != port)
         continue;
+      if (!re->is_act || re->state != RT_ACT)
+        is_mod = true;
       re_rx_ack (re, sys_ts);
       trg_mark (t, re->lla);
-      is_mod = true;
     }
   if (is_mod)
     rt_map_rbd (t);
@@ -903,7 +919,6 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
 void
 rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
 {
-  bool is_mod = false;
   for (uint32_t i = 0; i < t->cnt; i++)
     {
       Re *re = &t->re_arr[i];
@@ -912,21 +927,46 @@ rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
       if (re->ep_port != port)
         continue;
       re->tx_ts = sys_ts;
-      is_mod = true;
     }
-  if (is_mod)
-    rt_map_rbd (t);
 }
 
 bool
 rt_trg_pop (Rt *t, uint8_t out_lla[16])
 {
-  if (!t->has_trg)
+  if (!t || t->cnt == 0)
     return false;
-  if (out_lla)
-    memcpy (out_lla, t->trg_lla, 16);
+  uint32_t start = 0;
+  if (t->has_trg)
+    {
+      for (uint32_t i = 0; i < t->cnt; i++)
+        {
+          if (memcmp (t->re_arr[i].lla, t->trg_lla, 16) == 0)
+            {
+              start = (i + 1U) % t->cnt;
+              break;
+            }
+        }
+    }
+  for (uint32_t step = 0; step < t->cnt; step++)
+    {
+      uint32_t i = (start + step) % t->cnt;
+      Re *re = &t->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (re->state != RT_PND)
+        continue;
+      if (!IS_LLA_VAL (re->lla))
+        continue;
+      if (memcmp (re->lla, t->our_lla, 16) == 0)
+        continue;
+      if (out_lla)
+        memcpy (out_lla, re->lla, 16);
+      memcpy (t->trg_lla, re->lla, 16);
+      t->has_trg = true;
+      return true;
+    }
   t->has_trg = false;
-  return true;
+  return false;
 }
 
 void
@@ -1547,11 +1587,11 @@ rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
     {
       return true;
     }
-  if (n_seq > se->fwd_seq)
+  if (seq_gt (n_seq, se->fwd_seq))
     return true;
   if (n_seq == se->fwd_seq && n_metric < se->fwd_m)
     return true;
-  if (n_seq < se->fwd_seq && req_seq)
+  if (seq_lt (n_seq, se->fwd_seq) && req_seq)
     *req_seq = true;
   return false;
 }
@@ -1579,7 +1619,8 @@ rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
       se->fwd_seq = seq;
       se->fwd_m = metric;
     }
-  else if (seq > se->fwd_seq || (seq == se->fwd_seq && metric < se->fwd_m))
+  else if (seq_gt (seq, se->fwd_seq)
+           || (seq == se->fwd_seq && metric < se->fwd_m))
     {
       se->fwd_seq = seq;
       se->fwd_m = metric;
@@ -1589,12 +1630,12 @@ rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
   se->gc_ts = sys_ts;
 }
 
-void
+bool
 rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
               uint64_t sys_ts)
 {
   if (peer_sid == 0)
-    return;
+    return false;
   bool is_rbt = false;
   for (uint32_t re_idx = 0; re_idx < t->cnt; re_idx++)
     {
@@ -1613,7 +1654,7 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
         }
     }
   if (!is_rbt)
-    return;
+      return false;
   for (uint32_t re_idx = 0; re_idx < t->cnt; re_idx++)
     {
       Re *re = &t->re_arr[re_idx];
@@ -1640,4 +1681,5 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
     }
   rt_map_rbd (t);
   trg_mark (t, rt_id);
+  return true;
 }
