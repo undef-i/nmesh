@@ -1,0 +1,8 @@
+[submodule "ext/monocypher"]
+	path = ext/monocypher
+	url = https://github.com/LoupVaillant/Monocypher.git
+	ignore = dirty
+[submodule "ext/uthash"]
+	path = ext/uthash
+	url = https://github.com/troydhanson/uthash.git
+	ignore = dirty
