@@ -41,6 +41,7 @@
 static uint64_t g_tx_ts = 0;
 static uint64_t g_rx_ts = 0;
 static uint32_t g_frag_mid = 1;
+static uint32_t g_rnd_st = 0;
 static Rt *g_rt = NULL;
 
 typedef struct
@@ -55,6 +56,24 @@ typedef struct
 static RxRp g_rx_rp[RX_RP_MAX];
 
 static uint64_t sys_ts (void);
+
+static uint32_t
+u32_rnd (void)
+{
+  if (g_rnd_st == 0)
+    {
+      uint64_t s = sys_ts ();
+      g_rnd_st = (uint32_t)(s ^ (s >> 32) ^ 0x9e3779b9U);
+      if (g_rnd_st == 0)
+        g_rnd_st = 0x6d2b79f5U;
+    }
+  uint32_t x = g_rnd_st;
+  x ^= (x << 13);
+  x ^= (x >> 17);
+  x ^= (x << 5);
+  g_rnd_st = x;
+  return x;
+}
 
 static uint64_t
 nonce_cnt_rd (const uint8_t nonce[24])
@@ -541,6 +560,8 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
   if (cfg->port != new_cfg.port || cfg->l_exp != new_cfg.l_exp)
     fprintf (stderr, "main: listen/port changed in config but not "
                      "hot-applied\n");
+  if (cfg->mtu != new_cfg.mtu)
+    fprintf (stderr, "main: tap mtu changed in config but not hot-applied\n");
   if (cfg->p2p != new_cfg.p2p)
     {
       cfg->p2p = new_cfg.p2p;
@@ -603,7 +624,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
         pmtu = mtu;
     }
   uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
-  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + 32U);
+  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
   int32_t frag_cap
       = (int32_t)pmtu - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr) + 16U);
   if (frag_cap <= 0)
@@ -728,7 +749,7 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         pmtu = mtu;
     }
   uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
-  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + 32U);
+  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
   uint16_t m_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
   size_t frag_pfx = sizeof (FragHdr) + 16U;
   if (m_tap_f <= frag_pfx)
@@ -1002,7 +1023,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
       uint16_t pmtu = rt_mtu (rt, &dec);
       uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
-      const uint16_t tnl_oh = (uint16_t)(oip_oh + 8 + 32);
+      const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
       int32_t frag_cap = (int32_t)pmtu
                          - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr)
                                      + ((rel_f != 0) ? 16U : 0U));
@@ -1097,13 +1118,18 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           size_t chunk_max = max_tap_f - frag_pfx;
           if (chunk_max == 0)
             continue;
+          uint32_t n_frags = (uint32_t)((frame_len + chunk_max - 1) / chunk_max);
+          if (n_frags == 0)
+            n_frags = 1;
           uint32_t msg_id = g_frag_mid++;
           if (g_frag_mid == 0)
             g_frag_mid = 1;
           size_t off = 0;
           while (off < frame_len)
             {
-              if (bc >= BATCH_MAX)
+              bool is_dup_tx = (n_frags > 1) && ((u32_rnd () % n_frags) != 0);
+              int need = is_dup_tx ? 2 : 1;
+              if (bc + need > BATCH_MAX)
                 {
                   if (udp_tx_arr (udp, batch_arr, bc) < 0)
                     {
@@ -1129,6 +1155,14 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               batch_arr[bc].data = out_ptr;
               batch_arr[bc].data_len = out_len;
               bc++;
+              if (is_dup_tx)
+                {
+                  memcpy (batch_arr[bc].dst_ip, tx_ip, 16);
+                  batch_arr[bc].dst_port = tx_port;
+                  batch_arr[bc].data = out_ptr;
+                  batch_arr[bc].data_len = out_len;
+                  bc++;
+                }
               rt_tx_ack (rt, tx_ip, tx_port, now);
               g_tx_ts = now;
               off += chunk_len;
@@ -1694,6 +1728,9 @@ main (int argc, char **argv)
     sid = (uint64_t)t.tv_sec ^ ((uint64_t)t.tv_nsec << 32)
           ^ (uint64_t)getpid ();
   }
+  g_rnd_st = (uint32_t)(sid ^ (sid >> 32));
+  if (g_rnd_st == 0)
+    g_rnd_st = 0x6d2b79f5U;
   printf ("main: session id: %016llx\n", (unsigned long long)sid);
   static PPool pool;
   pp_init (&pool, cfg_path);
@@ -1740,6 +1777,7 @@ main (int argc, char **argv)
       return 1;
     }
   tap_addr_set ("nmesh", cfg.addr);
+  tap_mtu_set ("nmesh", cfg.mtu);
   rt_pmtu_ub_set (&rt, RT_MTU_MAX);
   printf ("main: tap device nmesh created.\n");
   static Udp udp;

@@ -153,6 +153,21 @@ tap_addr_set (const char *name, const uint8_t lla[16])
     }
 }
 
+void
+tap_mtu_set (const char *name, uint16_t mtu)
+{
+  if (!name)
+    return;
+  if (mtu < 128)
+    mtu = 128;
+  char cmd[256];
+  snprintf (cmd, sizeof (cmd), "ip link set dev %s mtu %u", name,
+            (unsigned)mtu);
+  if (system (cmd) < 0)
+    {
+    }
+}
+
 int
 tap_mtu_get (const char *name, uint16_t *mtu)
 {

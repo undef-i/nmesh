@@ -360,6 +360,24 @@ rt_map_rbd (Rt *t)
   rt_idx_fre (t->dir_m_idx);
   t->map = n_map;
   t->dir_m_idx = n_idx;
+  t->map_dirty = false;
+}
+
+static void
+rt_map_mark (Rt *t)
+{
+  if (!t)
+    return;
+  t->map_dirty = true;
+}
+
+static void
+rt_map_ens (Rt *t)
+{
+  if (!t)
+    return;
+  if (!t->map || t->map_dirty)
+    rt_map_rbd (t);
 }
 
 static void
@@ -436,6 +454,7 @@ nh_m (Rt *t, const uint8_t relay_lla[16], const uint8_t relay_ip[16],
     return UINT32_MAX;
   if (is_z16 (relay_lla))
     return UINT32_MAX;
+  rt_map_ens (t);
   if (!t->dir_m_idx)
     return UINT32_MAX;
   uint8_t key[18];
@@ -628,7 +647,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
           if (sys_ts > 0)
             re_rx_ack (cur_re, sys_ts);
         }
-      rt_map_rbd (t);
+      rt_map_mark (t);
       trg_mark (t, cur_re->lla);
       return;
     }
@@ -668,7 +687,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       if (ne.is_act)
         ne.state = RT_ACT;
       t->re_arr[t->cnt++] = ne;
-      rt_map_rbd (t);
+      rt_map_mark (t);
       trg_mark (t, ne.lla);
     }
 }
@@ -678,8 +697,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
 {
   if (is_z16 (dst_lla))
     return false;
-  if (!t->map)
-    rt_map_rbd (t);
+  rt_map_ens (t);
   RtMap *re = NULL;
   HASH_FIND (hh, t->map, dst_lla, 16, re);
   if (!re)
@@ -788,7 +806,7 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
           t->re_arr[i].sm_m = (t->re_arr[i].sm_m * 7U + rtt_ms) / 8U;
         }
       t->re_arr[i].rt_m = t->re_arr[i].sm_m;
-      rt_map_rbd (t);
+      rt_map_mark (t);
       trg_mark (t, t->re_arr[i].lla);
       return;
     }
@@ -848,7 +866,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
                     ? t->re_arr[i].sm_m
                     : RT_M_INF;
         }
-      rt_map_rbd (t);
+      rt_map_mark (t);
       trg_mark (t, t->re_arr[i].lla);
       return;
     }
@@ -882,7 +900,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       re_mtu_sync (t, &ne);
       memcpy (ne.nhop_lla, lla, 16);
       t->re_arr[t->cnt++] = ne;
-      rt_map_rbd (t);
+      rt_map_mark (t);
       trg_mark (t, ne.lla);
       if (!is_z16)
         {
@@ -913,7 +931,7 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
       trg_mark (t, re->lla);
     }
   if (is_mod)
-    rt_map_rbd (t);
+    rt_map_mark (t);
 }
 
 void
@@ -998,8 +1016,7 @@ rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
       dec.type = RT_VP;
       return dec;
     }
-  if (!t->map)
-    rt_map_rbd (t);
+  rt_map_ens (t);
   RtMap *re = NULL;
   HASH_FIND (hh, t->map, dst_lla, 16, re);
   if (!re)
@@ -1412,7 +1429,7 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
       is_mod = true;
     }
   if (is_mod)
-    rt_map_rbd (t);
+    rt_map_mark (t);
 }
 
 bool
@@ -1555,7 +1572,7 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
       t->re_arr[wr_idx++] = *re;
     }
   t->cnt = wr_idx;
-  rt_map_rbd (t);
+  rt_map_mark (t);
 }
 
 void
@@ -1679,7 +1696,7 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
       se->last_ver = 0;
       se->gc_ts = sys_ts;
     }
-  rt_map_rbd (t);
+  rt_map_mark (t);
   trg_mark (t, rt_id);
   return true;
 }

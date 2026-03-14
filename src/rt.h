@@ -175,6 +175,7 @@ typedef struct
   uint8_t our_lla[16];
   uint32_t prb_nxt_id;
   uint16_t mtu_ub;
+  bool map_dirty;
   bool has_trg;
   uint8_t trg_lla[16];
 } Rt;
