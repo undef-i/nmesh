@@ -257,6 +257,7 @@ cfg_load (const char *path, Cfg *cfg)
 {
   memset (cfg, 0, sizeof (*cfg));
   cfg->port = 50000;
+  cfg->mtu = 1280;
   cfg->p2p = P2P_EN;
   FILE *fp = fopen (path, "r");
   if (!fp)
@@ -285,6 +286,16 @@ cfg_load (const char *path, Cfg *cfg)
         {
           cfg->port = (uint16_t)strtoul (v, NULL, 10);
           cfg->l_exp = true;
+        }
+      else if (strcmp (k, "mtu") == 0)
+        {
+          unsigned long m_v = strtoul (v, NULL, 10);
+          if (m_v < 128UL || m_v > 65535UL)
+            {
+              fclose (fp);
+              return -1;
+            }
+          cfg->mtu = (uint16_t)m_v;
         }
       else if (strcmp (k, "p2p") == 0)
         {
