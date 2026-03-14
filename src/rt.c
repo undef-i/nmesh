@@ -1202,9 +1202,8 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
         continue;
       if (sys_ts < re->prb_ddl)
         continue;
-      bool has_pong
-          = (re->pong_ts >= re->prb_tx_ts)
-            && ((re->pong_ts - re->prb_tx_ts) <= RT_PRB_TMO);
+      bool has_pong = (re->pong_ts >= re->prb_tx_ts)
+                      && ((re->pong_ts - re->prb_tx_ts) <= RT_PRB_TMO);
       if (!has_pong)
         {
           re->prb_mtu = 0;
@@ -1734,7 +1733,7 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
         }
     }
   if (!is_rbt)
-      return false;
+    return false;
   for (uint32_t re_idx = 0; re_idx < t->cnt; re_idx++)
     {
       Re *re = &t->re_arr[re_idx];

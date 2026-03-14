@@ -5,12 +5,12 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #ifdef __linux__
 #include <linux/errqueue.h>
@@ -468,8 +468,7 @@ udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu)
     return -1;
   uint16_t m = 0;
   bool has_mtu = false;
-  for (struct cmsghdr *c = CMSG_FIRSTHDR (&msg); c;
-       c = CMSG_NXTHDR (&msg, c))
+  for (struct cmsghdr *c = CMSG_FIRSTHDR (&msg); c; c = CMSG_NXTHDR (&msg, c))
     {
       if (c->cmsg_level != IPPROTO_IP && c->cmsg_level != IPPROTO_IPV6)
         continue;

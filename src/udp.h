@@ -49,5 +49,4 @@ bool udp_w_want (const Udp *s);
 int udp_w_hnd (Udp *s);
 uint64_t udp_bp_ev (void);
 uint16_t udp_mtu_get (const Udp *s);
-int udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port,
-                uint16_t *mtu);
+int udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu);

@@ -16,13 +16,13 @@ typedef struct __attribute__ ((packed))
   uint8_t pkt_type;
   uint8_t rel_f;
   uint8_t hop_c;
-  uint8_t _pad;
-  uint16_t local_port;
-  uint8_t src_sfx[8];
 } PktHdr;
 
-#define PKT_CH_SZ 14
-#define PKT_HDR_SZ (PKT_CH_SZ + 24 + 16)
+#define PKT_TF_REL 0x80
+#define PKT_TF_TYPE_MASK 0x7f
+#define PKT_CH_SZ 2
+#define PKT_NONCE_SZ 12
+#define PKT_HDR_SZ (PKT_CH_SZ + PKT_NONCE_SZ + 16)
 #define V6_PL_MAX 9000
 #define UDP_PL_MAX (PKT_HDR_SZ + 16 + V6_PL_MAX)
 #define TAP_HR 128
@@ -46,8 +46,7 @@ typedef struct __attribute__ ((packed))
 typedef struct __attribute__ ((packed))
 {
   uint32_t mid;
-  uint16_t off;
-  uint16_t tot_len;
+  uint16_t off_mf;
 } FragHdr;
 
 typedef struct __attribute__ ((packed))
@@ -57,9 +56,9 @@ typedef struct __attribute__ ((packed))
 } ProbeHdr;
 
 #define GSP_SZ sizeof (GspEnt)
-_Static_assert (sizeof (PktHdr) == 14, "PktHdr size");
+_Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
 _Static_assert (sizeof (GspEnt) == 70, "GspEnt size");
-_Static_assert (sizeof (FragHdr) == 8, "FragHdr size");
+_Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
-_Static_assert (PKT_HDR_SZ == 54, "PKT_HDR_SZ");
+_Static_assert (PKT_HDR_SZ == 30, "PKT_HDR_SZ");
 _Static_assert (UDP_PL_MAX == (PKT_HDR_SZ + 16 + V6_PL_MAX), "UDP_PL_MAX");

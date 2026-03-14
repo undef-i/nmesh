@@ -121,7 +121,7 @@ tap_addr_set (const char *name, const uint8_t lla[16])
   char addr_str[64];
   snprintf (addr_str, sizeof (addr_str),
             "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-            "%02x%02x:%02x%02x:%02x%02x:%02x%02x/64",
+            "%02x%02x:%02x%02x:%02x%02x:%02x%02x/96",
             lla[0], lla[1], lla[2], lla[3], lla[4], lla[5], lla[6], lla[7],
             lla[8], lla[9], lla[10], lla[11], lla[12], lla[13], lla[14],
             lla[15]);

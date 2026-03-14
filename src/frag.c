@@ -27,16 +27,34 @@ frag_bkt_get (uint32_t msg_id)
 static FBkt *
 frag_bkt_new (uint32_t msg_id)
 {
+  uint64_t now = sys_ts ();
   uint32_t start = msg_id % FRAG_BKT_MAX;
+  int oldest_idx = -1;
+  uint64_t oldest_ts = UINT64_MAX;
   for (uint32_t step = 0; step < FRAG_BKT_MAX; step++)
     {
       uint32_t idx = (start + step) % FRAG_BKT_MAX;
-      if (g_frag_bkt[idx].is_act)
-        continue;
       FBkt *b = &g_frag_bkt[idx];
+      if (!b->is_act)
+        {
+          memset (b, 0, sizeof (*b));
+          b->msg_id = msg_id;
+          b->cre_ts = now;
+          b->is_act = true;
+          return b;
+        }
+      if (b->cre_ts < oldest_ts)
+        {
+          oldest_ts = b->cre_ts;
+          oldest_idx = (int)idx;
+        }
+    }
+  if (oldest_idx >= 0)
+    {
+      FBkt *b = &g_frag_bkt[oldest_idx];
       memset (b, 0, sizeof (*b));
       b->msg_id = msg_id;
-      b->cre_ts = sys_ts ();
+      b->cre_ts = now;
       b->is_act = true;
       return b;
     }
@@ -44,32 +62,39 @@ frag_bkt_new (uint32_t msg_id)
 }
 
 uint8_t *
-frag_asm (uint32_t msg_id, uint16_t off, uint16_t tot_len, const uint8_t *data,
-          size_t data_len)
+frag_asm (uint32_t msg_id, uint16_t off, bool mf, const uint8_t *data,
+          size_t data_len, uint16_t *out_len)
 {
   if (!data)
     return NULL;
-  if (tot_len == 0)
-    return NULL;
   if (data_len == 0)
     return NULL;
-  if ((size_t)off + data_len > sizeof (g_frag_bkt[0].buf))
+  if ((size_t)off + data_len > UINT16_MAX)
     return NULL;
-  if ((size_t)off + data_len > tot_len)
+  if ((size_t)off + data_len > sizeof (g_frag_bkt[0].buf))
     return NULL;
   FBkt *b = frag_bkt_get (msg_id);
   if (!b)
     b = frag_bkt_new (msg_id);
   if (!b)
     return NULL;
-  if (b->tot_len == 0)
+
+  uint16_t end = (uint16_t)((size_t)off + data_len);
+  if (!mf)
     {
-      b->tot_len = tot_len;
+      if (end == 0)
+        return NULL;
+      if (b->end_seen && b->tot_len != end)
+        return NULL;
+      b->tot_len = end;
+      b->end_seen = true;
     }
-  if (b->tot_len != tot_len)
+
+  if (b->end_seen && end > b->tot_len)
     {
       return NULL;
     }
+
   memcpy (b->buf + off, data, data_len);
   for (size_t i = 0; i < data_len; i++)
     {
@@ -84,8 +109,10 @@ frag_asm (uint32_t msg_id, uint16_t off, uint16_t tot_len, const uint8_t *data,
       if (b->rx_bytes < b->tot_len)
         b->rx_bytes++;
     }
-  if (b->rx_bytes == b->tot_len)
+  if (b->end_seen && b->rx_bytes == b->tot_len)
     {
+      if (out_len)
+        *out_len = b->tot_len;
       b->is_act = false;
       return b->buf;
     }
