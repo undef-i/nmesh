@@ -90,11 +90,11 @@ gsp_ent_des (GspEnt *dst, const uint8_t *src)
 
 static bool
 lla_inf_s (Rt *rt, const uint8_t src_ip[16], uint16_t src_port,
-           const uint8_t suffix[8], uint8_t out_lla[16])
+           uint8_t out_lla[16])
 {
   for (uint32_t re_idx = 0; re_idx < rt->cnt; re_idx++)
     {
-      Re *re = &rt->re_arr[re_idx];
+      const Re *re = &rt->re_arr[re_idx];
       if (re->r2d != 0)
         continue;
       if (memcmp (re->ep_ip, src_ip, 16) != 0)
@@ -102,8 +102,6 @@ lla_inf_s (Rt *rt, const uint8_t src_ip[16], uint16_t src_port,
       if (re->ep_port != src_port)
         continue;
       if (!IS_LLA_VAL (re->lla))
-        continue;
-      if (memcmp (re->lla + 8, suffix, 8) != 0)
         continue;
       memcpy (out_lla, re->lla, 16);
       return true;
@@ -253,62 +251,58 @@ is_ip_bgn (const uint8_t ip[16])
 }
 
 static void
-hdr_bld (uint8_t pkt_type, uint8_t rel_f, uint8_t hop_c, uint16_t l_port,
-         const uint8_t our_lla[16], uint8_t hdr[PKT_CH_SZ])
+hdr_bld (uint8_t pkt_type, uint8_t rel_f, uint8_t hop_c,
+         uint8_t hdr[PKT_CH_SZ])
 {
-  hdr[0] = pkt_type;
-  hdr[1] = rel_f;
-  hdr[2] = hop_c;
-  hdr[3] = 0;
-  hdr[4] = (uint8_t)(l_port >> 8);
-  hdr[5] = (uint8_t)(l_port & 0xff);
-  memcpy (hdr + 6, our_lla + 8, 8);
+  hdr[0] = (uint8_t)(pkt_type & PKT_TF_TYPE_MASK);
+  if (rel_f != 0)
+    hdr[0] |= PKT_TF_REL;
+  hdr[1] = hop_c;
 }
 
 static uint8_t *
 pkt_enc (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
          size_t pl_len, uint8_t *buf, size_t *out_len)
 {
-  uint8_t nonce[24], mac[16];
+  uint8_t nonce[PKT_NONCE_SZ], mac[16];
   memcpy (buf, hdr, PKT_CH_SZ);
-  uint8_t *ct_ptr = buf + PKT_CH_SZ + 24 + 16;
+  uint8_t *ct_ptr = buf + PKT_CH_SZ + PKT_NONCE_SZ + 16;
   cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, ct_ptr);
-  memcpy (buf + PKT_CH_SZ, nonce, 24);
-  memcpy (buf + PKT_CH_SZ + 24, mac, 16);
+  memcpy (buf + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
+  memcpy (buf + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
   *out_len = PKT_HDR_SZ + pl_len;
   return buf;
 }
 
 uint8_t *
 ping_bld (Cry *s, const uint8_t our_lla[16], uint64_t ts, uint64_t sid,
-          uint16_t local_port, uint8_t *buf, size_t *out_len)
+          uint8_t *buf, size_t *out_len)
 {
   uint8_t payload[PING_PL_SZ];
   u64_wr (payload, ts);
   u64_wr (payload + 8, sid);
   memcpy (payload + 16, our_lla, 16);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_PING, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_PING, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, PING_PL_SZ, buf, out_len);
 }
 
 uint8_t *
 pong_bld (Cry *s, const uint8_t our_lla[16], uint64_t o_ts, uint64_t sid,
-          uint16_t local_port, uint8_t *buf, size_t *out_len)
+          uint8_t *buf, size_t *out_len)
 {
   uint8_t payload[PING_PL_SZ];
   u64_wr (payload, o_ts);
   u64_wr (payload + 8, sid);
   memcpy (payload + 16, our_lla, 16);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_PONG, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_PONG, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, PING_PL_SZ, buf, out_len);
 }
 
 uint8_t *
 gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
-         const uint8_t our_lla[16], uint16_t local_port, uint8_t *buf,
-         size_t *out_len)
+         const uint8_t our_lla[16], uint8_t *buf, size_t *out_len)
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
@@ -351,14 +345,13 @@ gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
   u16_wr (pl_buf, (uint16_t)act_cnt);
   size_t pl_len = (size_t)(2 + act_cnt * (int)GSP_SZ);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_GSP, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_GSP, 0, 32, hdr);
   return pkt_enc (s, hdr, pl_buf, pl_len, buf, out_len);
 }
 
 uint8_t *
 gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt, const uint8_t tgt_lla[16],
-            const uint8_t our_lla[16], uint16_t local_port, uint8_t *buf,
-            size_t *out_len)
+            const uint8_t our_lla[16], uint8_t *buf, size_t *out_len)
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
@@ -398,102 +391,92 @@ gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt, const uint8_t tgt_lla[16],
   u16_wr (pl_buf, (uint16_t)act_cnt);
   size_t pl_len = (size_t)(2 + act_cnt * (int)GSP_SZ);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_GSP, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_GSP, 0, 32, hdr);
   return pkt_enc (s, hdr, pl_buf, pl_len, buf, out_len);
 }
 
 uint8_t *
-seq_req_bld (Cry *s, const uint8_t tgt_lla[16], const uint8_t our_lla[16],
-             uint16_t local_port, uint8_t *buf, size_t *out_len)
+seq_req_bld (Cry *s, const uint8_t tgt_lla[16], uint8_t *buf, size_t *out_len)
 {
   uint8_t payload[16];
   memcpy (payload, tgt_lla, 16);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_SEQ_REQ, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_SEQ_REQ, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, sizeof (payload), buf, out_len);
 }
 
 uint8_t *
 hp_bld (Cry *s, const uint8_t req_lla[16], const uint8_t tgt_lla[16],
-        const uint8_t our_lla[16], uint16_t local_port, uint8_t *buf,
-        size_t *out_len)
+        uint8_t *buf, size_t *out_len)
 {
   uint8_t payload[32];
   memcpy (payload, req_lla, 16);
   memcpy (payload + 16, tgt_lla, 16);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_HP, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_HP, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, 32, buf, out_len);
 }
 
 uint8_t *
 data_bld_zc (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len, uint8_t rel_f,
-             const uint8_t dest_lla[16], const uint8_t our_lla[16],
-             uint16_t local_port, uint8_t hop_c, size_t *out_len)
+             uint8_t hop_c, size_t *out_len)
 {
   uint8_t *payload = ipv6_ptr_start;
   size_t pl_len = ipv6_len;
-  if (rel_f != 0 && dest_lla != NULL)
-    {
-      payload -= 16;
-      memcpy (payload, dest_lla, 16);
-      pl_len += 16;
-    }
   uint8_t *pkt_ptr = payload - PKT_HDR_SZ;
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_DATA, rel_f, hop_c, local_port, our_lla, hdr);
-  uint8_t nonce[24], mac[16];
+  hdr_bld (PT_DATA, rel_f, hop_c, hdr);
+  uint8_t nonce[PKT_NONCE_SZ], mac[16];
   cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, payload);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
-  memcpy (pkt_ptr + PKT_CH_SZ, nonce, 24);
-  memcpy (pkt_ptr + PKT_CH_SZ + 24, mac, 16);
+  memcpy (pkt_ptr + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
+  memcpy (pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
 }
 
 uint8_t *
 frag_bld_zc (Cry *s, uint8_t *chunk_ptr, size_t chunk_len, uint32_t msg_id,
-             uint16_t off, uint16_t tot_len, uint8_t rel_f,
-             const uint8_t dest_lla[16], const uint8_t our_lla[16],
-             uint16_t local_port, uint8_t hop_c, size_t *out_len)
+             uint16_t off, bool mf, uint8_t rel_f, const uint8_t dest_tail[4],
+             uint8_t hop_c, size_t *out_len)
 {
+  if ((off & 0x8000U) != 0)
+    return NULL;
   uint8_t *payload = chunk_ptr;
   size_t pl_len = chunk_len;
   payload -= sizeof (FragHdr);
   u32_wr (payload, msg_id);
-  u16_wr (payload + 4, off);
-  u16_wr (payload + 6, tot_len);
+  uint16_t off_mf = (uint16_t)(off | (mf ? 0x8000U : 0U));
+  u16_wr (payload + 4, off_mf);
   pl_len += sizeof (FragHdr);
-  if (rel_f != 0 && dest_lla != NULL)
+  if (rel_f != 0 && dest_tail != NULL)
     {
-      payload -= 16;
-      memcpy (payload, dest_lla, 16);
-      pl_len += 16;
+      payload -= 4;
+      memcpy (payload, dest_tail, 4);
+      pl_len += 4;
     }
   uint8_t *pkt_ptr = payload - PKT_HDR_SZ;
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_FRAG, rel_f, hop_c, local_port, our_lla, hdr);
-  uint8_t nonce[24], mac[16];
+  hdr_bld (PT_FRAG, rel_f, hop_c, hdr);
+  uint8_t nonce[PKT_NONCE_SZ], mac[16];
   cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, payload);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
-  memcpy (pkt_ptr + PKT_CH_SZ, nonce, 24);
-  memcpy (pkt_ptr + PKT_CH_SZ + 24, mac, 16);
+  memcpy (pkt_ptr + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
+  memcpy (pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
 }
 
 uint8_t *
-keep_bld (Cry *s, const uint8_t our_lla[16], uint16_t local_port, uint8_t *buf,
-          size_t *out_len)
+keep_bld (Cry *s, uint8_t *buf, size_t *out_len)
 {
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_DATA, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_DATA, 0, 32, hdr);
   return pkt_enc (s, hdr, NULL, 0, buf, out_len);
 }
 
 uint8_t *
-mtu_prb_bld (Cry *s, const uint8_t our_lla[16], uint16_t local_port,
-             uint32_t probe_id, uint16_t probe_mtu, size_t t_pl_len,
+mtu_prb_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu, size_t t_pl_len,
              uint8_t *buf, size_t *out_len)
 {
   size_t pl_len = sizeof (ProbeHdr);
@@ -510,20 +493,19 @@ mtu_prb_bld (Cry *s, const uint8_t our_lla[16], uint16_t local_port,
   u32_wr (payload, probe_id);
   u16_wr (payload + 4, probe_mtu);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_MTU_PRB, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_MTU_PRB, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, pl_len, buf, out_len);
 }
 
 uint8_t *
-mtu_ack_bld (Cry *s, const uint8_t our_lla[16], uint16_t local_port,
-             uint32_t probe_id, uint16_t probe_mtu, uint8_t *buf,
+mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu, uint8_t *buf,
              size_t *out_len)
 {
   uint8_t payload[sizeof (ProbeHdr)];
   u32_wr (payload, probe_id);
   u16_wr (payload + 4, probe_mtu);
   uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_MTU_ACK, 0, 32, local_port, our_lla, hdr);
+  hdr_bld (PT_MTU_ACK, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, sizeof (payload), buf, out_len);
 }
 
@@ -533,13 +515,12 @@ pkt_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
 {
   if (raw_len < PKT_HDR_SZ)
     return -1;
-  hdr_out->pkt_type = raw[0];
-  hdr_out->rel_f = raw[1];
-  hdr_out->hop_c = raw[2];
-  hdr_out->local_port = (uint16_t)(((uint16_t)raw[4] << 8) | raw[5]);
-  memcpy (hdr_out->src_sfx, raw + 6, 8);
+  uint8_t tf = raw[0];
+  hdr_out->pkt_type = (uint8_t)(tf & PKT_TF_TYPE_MASK);
+  hdr_out->rel_f = (uint8_t)((tf & PKT_TF_REL) != 0);
+  hdr_out->hop_c = raw[1];
   const uint8_t *nonce = raw + PKT_CH_SZ;
-  const uint8_t *mac = raw + PKT_CH_SZ + 24;
+  const uint8_t *mac = raw + PKT_CH_SZ + PKT_NONCE_SZ;
   const uint8_t *ct = raw + PKT_HDR_SZ;
   size_t ct_len = raw_len - PKT_HDR_SZ;
   if (ct_len > pt_len)
@@ -548,52 +529,6 @@ pkt_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
     return -1;
   *pt_out = pt_buf;
   *pt_len_out = ct_len;
-  return 0;
-}
-
-int
-frag_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
-          size_t pt_len, PktHdr *hdr_out, uint8_t dest_lla[16],
-          uint32_t *msg_id, uint16_t *off, uint16_t *tot_len,
-          uint8_t **chunk_out, size_t *chunk_len)
-{
-  uint8_t *pt = NULL;
-  size_t pt_len_out = 0;
-  if (pkt_dec (s, raw, raw_len, pt_buf, pt_len, hdr_out, &pt, &pt_len_out)
-      != 0)
-    return -1;
-  if (hdr_out->pkt_type != PT_FRAG)
-    return -1;
-  size_t p_off = 0;
-  if (hdr_out->rel_f != 0)
-    {
-      if (pt_len_out < 16 + sizeof (FragHdr))
-        return -1;
-      if (dest_lla)
-        memcpy (dest_lla, pt, 16);
-      p_off = 16;
-    }
-  else
-    {
-      if (pt_len_out < sizeof (FragHdr))
-        return -1;
-      if (dest_lla)
-        memset (dest_lla, 0, 16);
-    }
-  const uint8_t *frag_hdr = pt + p_off;
-  if (msg_id)
-    *msg_id = u32_rd (frag_hdr);
-  if (off)
-    *off = u16_rd (frag_hdr + 4);
-  if (tot_len)
-    *tot_len = u16_rd (frag_hdr + 6);
-  p_off += sizeof (FragHdr);
-  if (p_off > pt_len_out)
-    return -1;
-  if (chunk_out)
-    *chunk_out = pt + p_off;
-  if (chunk_len)
-    *chunk_len = pt_len_out - p_off;
   return 0;
 }
 
@@ -616,44 +551,27 @@ gsp_prs_mtu_ack (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
 }
 
 int
-on_ping (const uint8_t *raw, size_t raw_len, Cry *s, uint64_t *o_ts,
-         uint64_t *sid, uint8_t *lla)
+on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
+         uint8_t *lla)
 {
-  uint8_t pt_buf[PING_PL_SZ];
-  PktHdr pkt_hdr;
-  uint8_t *pt_ptr;
-  size_t pt_len_out;
-  if (pkt_dec (s, raw, raw_len, pt_buf, sizeof (pt_buf), &pkt_hdr, &pt_ptr,
-               &pt_len_out)
-      != 0)
+  if (!pt || pt_len < PING_PL_SZ)
     return -1;
-  if (pt_len_out < PING_PL_SZ)
-    return -1;
-  *o_ts = u64_rd (pt_ptr);
+  *o_ts = u64_rd (pt);
   if (sid)
-    *sid = u64_rd (pt_ptr + 8);
+    *sid = u64_rd (pt + 8);
   if (lla)
-    memcpy (lla, pt_ptr + 16, 16);
+    memcpy (lla, pt + 16, 16);
   return 0;
 }
 
 int
-on_gsp (const uint8_t *raw, size_t raw_len, const uint8_t src_ip[16],
-        uint16_t src_port, const uint8_t our_lla[16], Cry *s, Rt *rt,
-        PPool *pool, uint64_t sys_ts, bool *is_mod, bool *o_req_seq,
-        uint8_t seq_tgt[16])
+on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
+        uint16_t src_port, const uint8_t our_lla[16], Rt *rt, PPool *pool,
+        uint64_t sys_ts, bool *is_mod, bool *o_req_seq, uint8_t seq_tgt[16])
 {
-  uint8_t pt_buf[2 + GSP_MAX * GSP_SZ];
-  PktHdr pkt_hdr;
-  uint8_t *pt_ptr;
-  size_t pt_len;
-  if (pkt_dec (s, raw, raw_len, pt_buf, sizeof (pt_buf), &pkt_hdr, &pt_ptr,
-               &pt_len)
-      != 0)
+  if (!pt || pt_len < 2)
     return -1;
-  if (pt_len < 2)
-    return -1;
-  uint16_t cnt = u16_rd (pt_ptr);
+  uint16_t cnt = u16_rd (pt);
   size_t max_cnt = (pt_len - 2) / GSP_SZ;
   size_t act_cnt = cnt < (uint16_t)max_cnt ? cnt : (uint16_t)max_cnt;
   uint32_t rt_c_old = rt->cnt;
@@ -661,13 +579,13 @@ on_gsp (const uint8_t *raw, size_t raw_len, const uint8_t src_ip[16],
   if (o_req_seq)
     *o_req_seq = false;
   uint8_t src_lla[16] = { 0 };
-  bool has_s_lla = lla_inf_s (rt, src_ip, src_port, pkt_hdr.src_sfx, src_lla);
+  bool has_s_lla = lla_inf_s (rt, src_ip, src_port, src_lla);
   uint16_t mtu_s = mtu_inf_s (rt, src_ip, src_port);
   for (size_t gsp_idx = 0; gsp_idx < act_cnt; gsp_idx++)
     {
       size_t rd_off = 2 + gsp_idx * GSP_SZ;
       GspEnt gsp_ent;
-      gsp_ent_des (&gsp_ent, pt_ptr + rd_off);
+      gsp_ent_des (&gsp_ent, pt + rd_off);
       static const uint8_t z_lla[16] = { 0 };
       bool is_z = (memcmp (gsp_ent.lla, z_lla, 16) == 0);
       if (!is_z && !IS_LLA_VAL (gsp_ent.lla))
@@ -782,41 +700,25 @@ on_gsp (const uint8_t *raw, size_t raw_len, const uint8_t src_ip[16],
 }
 
 int
-on_seq_req (const uint8_t *raw, size_t raw_len, Cry *s, uint8_t tgt_lla[16])
+on_seq_req (const uint8_t *pt, size_t pt_len, uint8_t tgt_lla[16])
 {
-  uint8_t pt_buf[32];
-  PktHdr pkt_hdr;
-  uint8_t *pt_ptr;
-  size_t pt_len;
-  if (pkt_dec (s, raw, raw_len, pt_buf, sizeof (pt_buf), &pkt_hdr, &pt_ptr,
-               &pt_len)
-      != 0)
-    {
-      return -1;
-    }
+  if (!pt)
+    return -1;
   if (pt_len < 16)
     return -1;
-  memcpy (tgt_lla, pt_ptr, 16);
+  memcpy (tgt_lla, pt, 16);
   return 0;
 }
 
 int
-on_hp (const uint8_t *raw, size_t raw_len, Cry *s, Udp *udp, Rt *rt,
-       const uint8_t o_lla[16], uint16_t local_port, uint64_t sid, uint64_t ts)
+on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
+       const uint8_t o_lla[16], uint64_t sid, uint64_t ts)
 {
-  uint8_t pt_buf[64];
-  PktHdr pkt_hdr;
-  uint8_t *pt_ptr;
-  size_t pt_len;
-  if (pkt_dec (s, raw, raw_len, pt_buf, sizeof (pt_buf), &pkt_hdr, &pt_ptr,
-               &pt_len)
-      != 0)
-    return -1;
-  if (pt_len < 32)
+  if (!pt || pt_len < 32)
     return -1;
   uint8_t req_lla[16], tgt_lla[16];
-  memcpy (req_lla, pt_ptr, 16);
-  memcpy (tgt_lla, pt_ptr + 16, 16);
+  memcpy (req_lla, pt, 16);
+  memcpy (tgt_lla, pt + 16, 16);
   if (memcmp (tgt_lla, o_lla, 16) == 0)
     {
       Re req_re;
@@ -841,7 +743,7 @@ on_hp (const uint8_t *raw, size_t raw_len, Cry *s, Udp *udp, Rt *rt,
         {
           uint8_t p_buf[UDP_PL_MAX];
           size_t p_len;
-          ping_bld (s, o_lla, ts, sid, local_port, p_buf, &p_len);
+          ping_bld (s, o_lla, ts, sid, p_buf, &p_len);
           udp_tx (udp, req_re.ep_ip, req_re.ep_port, p_buf, p_len);
         }
       return 0;
@@ -851,7 +753,7 @@ on_hp (const uint8_t *raw, size_t raw_len, Cry *s, Udp *udp, Rt *rt,
     {
       uint8_t out_buf[UDP_PL_MAX];
       size_t out_len;
-      hp_bld (s, req_lla, tgt_lla, o_lla, local_port, out_buf, &out_len);
+      hp_bld (s, req_lla, tgt_lla, out_buf, &out_len);
       udp_tx (udp, tgt_re.ep_ip, tgt_re.ep_port, out_buf, out_len);
     }
   return 0;

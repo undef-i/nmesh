@@ -225,8 +225,8 @@ bool rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
                   uint32_t *prb_id);
 void rt_pmtu_ack_ep (Rt *t, const uint8_t ip[16], uint16_t port,
                      uint32_t probe_id, uint16_t probe_mtu, uint64_t sys_ts);
-void rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port,
-                     uint16_t pmtu, uint64_t sys_ts);
+void rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
+                     uint64_t sys_ts);
 void rt_mtu_tk (Rt *t, uint64_t sys_ts);
 void rt_pmtu_ub_set (Rt *t, uint16_t mtu);
 void rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port,

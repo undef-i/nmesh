@@ -49,6 +49,7 @@ typedef struct
   bool is_act;
   uint8_t ip[16];
   uint16_t port;
+  uint8_t sid[4];
   uint64_t max_cnt;
   uint64_t map;
 } RxRp;
@@ -76,19 +77,29 @@ u32_rnd (void)
 }
 
 static uint64_t
-nonce_cnt_rd (const uint8_t nonce[24])
+nonce_cnt_rd (const uint8_t nonce[PKT_NONCE_SZ])
 {
-  return ((uint64_t)nonce[16] << 56) | ((uint64_t)nonce[17] << 48)
-         | ((uint64_t)nonce[18] << 40) | ((uint64_t)nonce[19] << 32)
-         | ((uint64_t)nonce[20] << 24) | ((uint64_t)nonce[21] << 16)
-         | ((uint64_t)nonce[22] << 8) | (uint64_t)nonce[23];
+  return ((uint64_t)nonce[4] << 56) | ((uint64_t)nonce[5] << 48)
+         | ((uint64_t)nonce[6] << 40) | ((uint64_t)nonce[7] << 32)
+         | ((uint64_t)nonce[8] << 24) | ((uint64_t)nonce[9] << 16)
+         | ((uint64_t)nonce[10] << 8) | (uint64_t)nonce[11];
+}
+
+static void
+nonce_sid_rd (const uint8_t nonce[PKT_NONCE_SZ], uint8_t sid[4])
+{
+  memcpy (sid, nonce, 4);
 }
 
 static bool
-rx_rp_chk (const uint8_t ip[16], uint16_t port, const uint8_t nonce[24])
+rx_rp_chk (const uint8_t ip[16], uint16_t port,
+           const uint8_t nonce[PKT_NONCE_SZ])
 {
+  uint8_t sid[4];
+  nonce_sid_rd (nonce, sid);
   uint64_t cnt = nonce_cnt_rd (nonce);
   RxRp *slot = NULL;
+  RxRp *same_ep = NULL;
   for (size_t i = 0; i < RX_RP_MAX; i++)
     {
       if (!g_rx_rp[i].is_act)
@@ -97,12 +108,18 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port, const uint8_t nonce[24])
             slot = &g_rx_rp[i];
           continue;
         }
-      if (memcmp (g_rx_rp[i].ip, ip, 16) == 0 && g_rx_rp[i].port == port)
+      if (memcmp (g_rx_rp[i].ip, ip, 16) != 0 || g_rx_rp[i].port != port)
+        continue;
+      if (memcmp (g_rx_rp[i].sid, sid, sizeof (sid)) == 0)
         {
           slot = &g_rx_rp[i];
           break;
         }
+      if (!same_ep)
+        same_ep = &g_rx_rp[i];
     }
+  if (!slot)
+    slot = same_ep;
   if (!slot)
     return false;
   if (!slot->is_act)
@@ -110,6 +127,14 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port, const uint8_t nonce[24])
       slot->is_act = true;
       memcpy (slot->ip, ip, 16);
       slot->port = port;
+      memcpy (slot->sid, sid, sizeof (sid));
+      slot->max_cnt = cnt;
+      slot->map = 1ULL;
+      return true;
+    }
+  if (memcmp (slot->sid, sid, sizeof (sid)) != 0)
+    {
+      memcpy (slot->sid, sid, sizeof (sid));
       slot->max_cnt = cnt;
       slot->map = 1ULL;
       return true;
@@ -227,12 +252,6 @@ is_tcp_syn (const uint8_t *l3, size_t l3_len)
       return (l3[40 + 13] & 0x02U) != 0;
     }
   return false;
-}
-
-static bool
-is_sfx_match (const uint8_t lla[16], const uint8_t suffix[8])
-{
-  return memcmp (lla + 8, suffix, 8) == 0;
 }
 
 static bool
@@ -424,6 +443,23 @@ rt_key_get (const Rt *rt, const uint8_t *frame, const uint8_t our_lla[16],
   return memcmp (out_lla, our_lla, 16) != 0;
 }
 
+static bool
+mesh_dst_lla_from_frame (const uint8_t *frame, const uint8_t base_lla[16],
+                         uint8_t out_lla[16])
+{
+  if (!frame || !base_lla || !out_lla)
+    return false;
+  const uint8_t *dst_mac = frame;
+  if (dst_mac[0] != 0x02 || dst_mac[1] != 0x00)
+    return false;
+  memcpy (out_lla, base_lla, 16);
+  out_lla[12] = dst_mac[2];
+  out_lla[13] = dst_mac[3];
+  out_lla[14] = dst_mac[4];
+  out_lla[15] = dst_mac[5];
+  return true;
+}
+
 static void
 rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
 {
@@ -601,9 +637,10 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
 }
 
 static bool
-rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
+rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
              const uint8_t dest_lla[16], const uint8_t *frame,
-             size_t frame_len, uint8_t hop_c, uint64_t ts)
+             size_t frame_len, uint8_t hop_c, uint64_t ts,
+             const uint8_t s_ip[16], uint16_t s_port)
 {
   if (!udp || !cry_ctx || !rt || !cfg || !dest_lla || !frame)
     return false;
@@ -616,6 +653,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
   uint16_t tx_port = 0;
   if (!rt_nh_get (rt, cfg, dest_lla, &dec, tx_ip, &tx_port))
     return false;
+  if (s_ip && memcmp (tx_ip, s_ip, 16) == 0 && tx_port == s_port)
+    return false;
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
     {
@@ -626,7 +665,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
   uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
   const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
   int32_t frag_cap
-      = (int32_t)pmtu - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr) + 16U);
+      = (int32_t)pmtu - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr) + 4U);
   if (frag_cap <= 0)
     return false;
   static uint8_t rel_f_buf[TAP_F_MAX + TAP_HR + TAP_TR];
@@ -674,18 +713,18 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
   if (!is_tiny && ((size_t)frame_len + (size_t)tnl_oh) <= (size_t)pmtu)
     {
       static uint8_t rel_p_buf[UDP_PL_MAX + TAP_HR];
-      uint8_t *pl_dst = rel_p_buf + TAP_HR + PKT_HDR_SZ + 16;
+      uint8_t *pl_dst = rel_p_buf + TAP_HR + PKT_HDR_SZ;
       memcpy (pl_dst, frame_pkt, frame_len);
       size_t out_len = 0;
-      uint8_t *out_ptr = data_bld_zc (cry_ctx, pl_dst, frame_len, 1, dest_lla,
-                                      cfg->addr, act_port, hop_c, &out_len);
+      uint8_t *out_ptr
+          = data_bld_zc (cry_ctx, pl_dst, frame_len, 1, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
     }
   else
     {
-      size_t frag_pfx = sizeof (FragHdr) + 16U;
+      size_t frag_pfx = sizeof (FragHdr) + 4U;
       if (m_tap_f <= frag_pfx)
         return false;
       size_t chunk_max = m_tap_f - frag_pfx;
@@ -694,6 +733,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
       uint32_t mid = g_frag_mid++;
       if (g_frag_mid == 0)
         g_frag_mid = 1;
+      uint8_t dst_tail[4];
+      memcpy (dst_tail, dest_lla + 12, 4);
       static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR];
       size_t off = 0;
       while (off < frame_len)
@@ -702,13 +743,13 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
           if (chunk_len > chunk_max)
             chunk_len = chunk_max;
           uint8_t *chunk_dst
-              = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 16U;
+              = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
           memcpy (chunk_dst, frame_pkt + off, chunk_len);
           size_t out_len = 0;
+          bool mf = (off + chunk_len) < frame_len;
           uint8_t *out_ptr
               = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, (uint16_t)off,
-                             (uint16_t)frame_len, 1, dest_lla, cfg->addr,
-                             act_port, hop_c, &out_len);
+                             mf, 1, dst_tail, hop_c, &out_len);
           udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
           rt_tx_ack (rt, tx_ip, tx_port, ts);
           g_tx_ts = ts;
@@ -719,8 +760,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
     {
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
-      hp_bld (cry_ctx, cfg->addr, dest_lla, cfg->addr, act_port, hp_buf,
-              &hp_len);
+      hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
       udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
     }
   return true;
@@ -728,9 +768,10 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint16_t act_port,
 
 static bool
 relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-                uint16_t act_port, const uint8_t dest_lla[16], uint32_t mid,
-                uint16_t frag_off, uint16_t t_len, const uint8_t *chunk,
-                size_t chunk_len, uint8_t hop_c, uint64_t ts)
+                const uint8_t dest_lla[16], uint32_t mid, uint16_t frag_off,
+                bool mf_in, const uint8_t *chunk, size_t chunk_len,
+                uint8_t hop_c, uint64_t ts, const uint8_t s_ip[16],
+                uint16_t s_port)
 {
   if (!udp || !cry_ctx || !rt || !cfg || !dest_lla || !chunk)
     return false;
@@ -740,6 +781,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   uint8_t tx_ip[16] = { 0 };
   uint16_t tx_port = 0;
   if (!rt_nh_get (rt, cfg, dest_lla, &dec, tx_ip, &tx_port))
+    return false;
+  if (s_ip && memcmp (tx_ip, s_ip, 16) == 0 && tx_port == s_port)
     return false;
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
@@ -751,12 +794,14 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
   const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
   uint16_t m_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
-  size_t frag_pfx = sizeof (FragHdr) + 16U;
+  size_t frag_pfx = sizeof (FragHdr) + 4U;
   if (m_tap_f <= frag_pfx)
     return false;
   size_t chunk_max = m_tap_f - frag_pfx;
   if (chunk_max == 0)
     return false;
+  uint8_t dst_tail[4];
+  memcpy (dst_tail, dest_lla + 12, 4);
   bool is_tx = false;
   static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR];
   for (size_t sub_off = 0; sub_off < chunk_len;)
@@ -768,12 +813,14 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (abs_off > UINT16_MAX)
         break;
       uint8_t *chunk_dst
-          = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 16U;
+          = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
       memcpy (chunk_dst, chunk + sub_off, sub_len);
       size_t out_len = 0;
-      uint8_t *out_ptr = frag_bld_zc (cry_ctx, chunk_dst, sub_len, mid,
-                                      (uint16_t)abs_off, t_len, 1, dest_lla,
-                                      cfg->addr, act_port, hop_c, &out_len);
+      bool is_last_sub = (sub_off + sub_len) == chunk_len;
+      bool mf_out = mf_in || !is_last_sub;
+      uint8_t *out_ptr
+          = frag_bld_zc (cry_ctx, chunk_dst, sub_len, mid, (uint16_t)abs_off,
+                         mf_out, 1, dst_tail, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
@@ -784,8 +831,7 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
-      hp_bld (cry_ctx, cfg->addr, dest_lla, cfg->addr, act_port, hp_buf,
-              &hp_len);
+      hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
       udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
     }
   return is_tx;
@@ -793,7 +839,7 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
 static void
 on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-        uint16_t act_port, uint64_t sid)
+        uint64_t sid)
 {
   (void)sid;
   static uint64_t l_nh_ts = 0;
@@ -839,8 +885,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         {
           size_t out_len;
           uint8_t *out_ptr
-              = data_bld_zc (cry_ctx, frame_pkt, frame_len, 0, NULL, cfg->addr,
-                             act_port, 32, &out_len);
+              = data_bld_zc (cry_ctx, frame_pkt, frame_len, 0, 32, &out_len);
           static const uint8_t z_lla[16] = { 0 };
           uint8_t uniq_lla[256][16];
           int u_cnt = 0;
@@ -1026,7 +1071,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
       int32_t frag_cap = (int32_t)pmtu
                          - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr)
-                                     + ((rel_f != 0) ? 16U : 0U));
+                                     + ((rel_f != 0) ? 4U : 0U));
       if (frag_cap <= 0)
         {
           static uint64_t l_cr_ts = 0;
@@ -1037,7 +1082,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                        "tunnel overhead %u\n",
                        (unsigned)pmtu,
                        (unsigned)(tnl_oh + (uint16_t)sizeof (FragHdr)
-                                  + ((rel_f != 0) ? 16U : 0U)));
+                                  + ((rel_f != 0) ? 4U : 0U)));
               l_cr_ts = now;
             }
           continue;
@@ -1088,9 +1133,8 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               ((size_t)frame_len + (size_t)tnl_oh) <= (size_t)pmtu, 1))
         {
           size_t out_len;
-          uint8_t *out_ptr
-              = data_bld_zc (cry_ctx, frame_pkt, frame_len, rel_f, rel_dst_lla,
-                             cfg->addr, act_port, 32, &out_len);
+          uint8_t *out_ptr = data_bld_zc (cry_ctx, frame_pkt, frame_len, rel_f,
+                                          32, &out_len);
           if (bc >= BATCH_MAX)
             {
               if (udp_tx_arr (udp, batch_arr, bc) < 0)
@@ -1110,7 +1154,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
       else
         {
-          size_t frag_pfx = sizeof (FragHdr) + ((rel_f != 0) ? 16U : 0U);
+          size_t frag_pfx = sizeof (FragHdr) + ((rel_f != 0) ? 4U : 0U);
           if (max_tap_f <= frag_pfx)
             {
               continue;
@@ -1118,12 +1162,16 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           size_t chunk_max = max_tap_f - frag_pfx;
           if (chunk_max == 0)
             continue;
-          uint32_t n_frags = (uint32_t)((frame_len + chunk_max - 1) / chunk_max);
+          uint32_t n_frags
+              = (uint32_t)((frame_len + chunk_max - 1) / chunk_max);
           if (n_frags == 0)
             n_frags = 1;
           uint32_t msg_id = g_frag_mid++;
           if (g_frag_mid == 0)
             g_frag_mid = 1;
+          uint8_t rel_dst_tail[4] = { 0 };
+          if (rel_f != 0 && rel_dst_lla != NULL)
+            memcpy (rel_dst_tail, rel_dst_lla + 12, 4);
           size_t off = 0;
           while (off < frame_len)
             {
@@ -1143,13 +1191,13 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 chunk_len = chunk_max;
               uint8_t *chunk_dst = frag_bufs[bc] + TAP_HR + PKT_HDR_SZ
                                    + sizeof (FragHdr)
-                                   + ((rel_f != 0) ? 16U : 0U);
+                                   + ((rel_f != 0) ? 4U : 0U);
               memcpy (chunk_dst, frame_pkt + off, chunk_len);
               size_t out_len = 0;
+              bool mf = (off + chunk_len) < frame_len;
               uint8_t *out_ptr = frag_bld_zc (
-                  cry_ctx, chunk_dst, chunk_len, msg_id, (uint16_t)off,
-                  (uint16_t)frame_len, rel_f, rel_dst_lla, cfg->addr, act_port,
-                  32, &out_len);
+                  cry_ctx, chunk_dst, chunk_len, msg_id, (uint16_t)off, mf,
+                  rel_f, (rel_f != 0) ? rel_dst_tail : NULL, 32, &out_len);
               memcpy (batch_arr[bc].dst_ip, tx_ip, 16);
               batch_arr[bc].dst_port = tx_port;
               batch_arr[bc].data = out_ptr;
@@ -1172,8 +1220,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         {
           static uint8_t hp_buf[UDP_PL_MAX];
           size_t hp_len;
-          hp_bld (cry_ctx, cfg->addr, rt_key, cfg->addr, act_port, hp_buf,
-                  &hp_len);
+          hp_bld (cry_ctx, cfg->addr, rt_key, hp_buf, &hp_len);
           udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
         }
       if (bc >= BATCH_MAX - 2)
@@ -1197,7 +1244,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
 static void
 on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-        uint16_t act_port, uint64_t sid, PPool *pool)
+        uint64_t sid, PPool *pool)
 {
   static uint8_t buf_arr[BATCH_MAX][UDP_PL_MAX];
   static uint8_t ips[BATCH_MAX][16];
@@ -1229,7 +1276,6 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (!rx_rp_chk (src_ip, src_port, raw_buf + PKT_CH_SZ))
         continue;
       rt_rx_ack (rt, src_ip, src_port, ts);
-      (void)hdr.local_port;
       switch (hdr.pkt_type)
         {
         case PT_DATA:
@@ -1237,7 +1283,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             g_rx_ts = ts;
             if (hdr.rel_f != 0)
               {
-                if (pt_len < 16)
+                if (pt_len < ETH_HLEN)
                   break;
                 if (hdr.hop_c <= 1)
                   {
@@ -1245,9 +1291,11 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                      "routing loop detected\n");
                     break;
                   }
-                const uint8_t *dest_lla = pt;
-                const uint8_t *fwd_frame = pt + 16;
-                size_t fwd_len = pt_len - 16;
+                const uint8_t *fwd_frame = pt;
+                size_t fwd_len = pt_len;
+                uint8_t dest_lla[16] = { 0 };
+                if (!mesh_dst_lla_from_frame (fwd_frame, cfg->addr, dest_lla))
+                  break;
                 if (memcmp (dest_lla, cfg->addr, 16) == 0)
                   {
                     if (fwd_len < ETH_HLEN)
@@ -1279,9 +1327,9 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   }
                 else
                   {
-                    rel_fwd_dat (udp, cry_ctx, rt, cfg, act_port, dest_lla,
-                                 fwd_frame, fwd_len, (uint8_t)(hdr.hop_c - 1),
-                                 ts);
+                    rel_fwd_dat (udp, cry_ctx, rt, cfg, dest_lla, fwd_frame,
+                                 fwd_len, (uint8_t)(hdr.hop_c - 1), ts, src_ip,
+                                 src_port);
                   }
               }
             else
@@ -1325,45 +1373,46 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             uint8_t dest_lla[16] = { 0 };
             if (hdr.rel_f != 0)
               {
-                if (payload_len < 16 + sizeof (FragHdr))
+                if (payload_len < 4 + sizeof (FragHdr))
                   break;
                 if (hdr.hop_c <= 1)
                   break;
-                memcpy (dest_lla, payload, 16);
-                payload += 16;
-                payload_len -= 16;
+                memcpy (dest_lla, cfg->addr, 16);
+                memcpy (dest_lla + 12, payload, 4);
+                payload += 4;
+                payload_len -= 4;
               }
             if (payload_len < sizeof (FragHdr))
               break;
             uint32_t msg_id
                 = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16)
                   | ((uint32_t)payload[2] << 8) | (uint32_t)payload[3];
-            uint16_t frag_off
+            uint16_t off_mf
                 = (uint16_t)(((uint16_t)payload[4] << 8) | payload[5]);
-            uint16_t tot_len
-                = (uint16_t)(((uint16_t)payload[6] << 8) | payload[7]);
+            uint16_t frag_off = (uint16_t)(off_mf & 0x7fffU);
+            bool mf = (off_mf & 0x8000U) != 0;
             const uint8_t *chunk = payload + sizeof (FragHdr);
             size_t chunk_len = payload_len - sizeof (FragHdr);
-            if ((size_t)frag_off + chunk_len > tot_len)
-              break;
             if (hdr.rel_f != 0 && memcmp (dest_lla, cfg->addr, 16) != 0)
               {
-                relay_fwd_frag (udp, cry_ctx, rt, cfg, act_port, dest_lla,
-                                msg_id, frag_off, tot_len, chunk, chunk_len,
-                                (uint8_t)(hdr.hop_c - 1), ts);
+                relay_fwd_frag (udp, cry_ctx, rt, cfg, dest_lla, msg_id,
+                                frag_off, mf, chunk, chunk_len,
+                                (uint8_t)(hdr.hop_c - 1), ts, src_ip,
+                                src_port);
                 break;
               }
+            uint16_t full_len = 0;
             uint8_t *full_l3
-                = frag_asm (msg_id, frag_off, tot_len, chunk, chunk_len);
+                = frag_asm (msg_id, frag_off, mf, chunk, chunk_len, &full_len);
             if (!full_l3)
               break;
-            if (tot_len < ETH_HLEN)
+            if (full_len < ETH_HLEN)
               break;
             int retries = 10;
             bool is_wr = false;
             while (retries-- > 0)
               {
-                if (write (tap_fd, full_l3, tot_len) >= 0)
+                if (write (tap_fd, full_l3, full_len) >= 0)
                   {
                     is_wr = true;
                     break;
@@ -1381,7 +1430,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 fprintf (stderr,
                          "tap: queue full, drop reassembled "
                          "packet len=%u\n",
-                         (unsigned)tot_len);
+                         (unsigned)full_len);
               }
             break;
           }
@@ -1393,8 +1442,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               break;
             static uint8_t ack_buf[UDP_PL_MAX];
             size_t ack_len = 0;
-            mtu_ack_bld (cry_ctx, cfg->addr, act_port, probe_id, probe_mtu,
-                         ack_buf, &ack_len);
+            mtu_ack_bld (cry_ctx, probe_id, probe_mtu, ack_buf, &ack_len);
             udp_tx (udp, src_ip, src_port, ack_buf, ack_len);
             rt_tx_ack (rt, src_ip, src_port, ts);
             break;
@@ -1412,16 +1460,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           {
             uint64_t req_ts, peer_sid;
             uint8_t peer_lla[16];
-            if (on_ping (raw_buf, raw_len, cry_ctx, &req_ts, &peer_sid,
-                         peer_lla)
-                == 0)
+            if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla) == 0)
               {
-                if (!is_sfx_match (peer_lla, hdr.src_sfx))
-                  {
-                    fprintf (stderr, "main: ping lla/header "
-                                     "mismatch\n");
-                    break;
-                  }
                 if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
                   rx_rp_rst_lla (rt, peer_lla);
                 if (hdr.rel_f == 0)
@@ -1433,7 +1473,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   }
                 static uint8_t pong_buf[UDP_PL_MAX];
                 size_t pong_len;
-                pong_bld (cry_ctx, cfg->addr, req_ts, sid, act_port, pong_buf,
+                pong_bld (cry_ctx, cfg->addr, req_ts, sid, pong_buf,
                           &pong_len);
                 udp_tx (udp, src_ip, src_port, pong_buf, pong_len);
                 rt_tx_ack (rt, src_ip, src_port, ts);
@@ -1444,16 +1484,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           {
             uint64_t req_ts, peer_sid;
             uint8_t peer_lla[16];
-            if (on_ping (raw_buf, raw_len, cry_ctx, &req_ts, &peer_sid,
-                         peer_lla)
-                == 0)
+            if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla) == 0)
               {
-                if (!is_sfx_match (peer_lla, hdr.src_sfx))
-                  {
-                    fprintf (stderr, "main: pong lla/header "
-                                     "mismatch\n");
-                    break;
-                  }
                 if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
                   rx_rp_rst_lla (rt, peer_lla);
                 if (hdr.rel_f == 0)
@@ -1475,14 +1507,13 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 bool is_mod = false;
                 bool req_seq = false;
                 uint8_t seq_tgt[16] = { 0 };
-                on_gsp (raw_buf, raw_len, src_ip, src_port, cfg->addr, cry_ctx,
-                        rt, pool, ts, &is_mod, &req_seq, seq_tgt);
+                on_gsp (pt, pt_len, src_ip, src_port, cfg->addr, rt, pool, ts,
+                        &is_mod, &req_seq, seq_tgt);
                 if (req_seq)
                   {
                     static uint8_t req_buf[UDP_PL_MAX];
                     size_t req_len = 0;
-                    seq_req_bld (cry_ctx, seq_tgt, cfg->addr, act_port,
-                                 req_buf, &req_len);
+                    seq_req_bld (cry_ctx, seq_tgt, req_buf, &req_len);
                     udp_tx (udp, src_ip, src_port, req_buf, req_len);
                     rt_tx_ack (rt, src_ip, src_port, ts);
                   }
@@ -1492,7 +1523,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         case PT_SEQ_REQ:
           {
             uint8_t tgt_lla[16];
-            if (on_seq_req (raw_buf, raw_len, cry_ctx, tgt_lla) == 0)
+            if (on_seq_req (pt, pt_len, tgt_lla) == 0)
               {
                 if (memcmp (tgt_lla, cfg->addr, 16) == 0)
                   {
@@ -1511,8 +1542,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           {
             if (cfg->p2p == P2P_EN)
               {
-                on_hp (raw_buf, raw_len, cry_ctx, udp, rt, cfg->addr, act_port,
-                       sid, ts);
+                on_hp (pt, pt_len, cry_ctx, udp, rt, cfg->addr, sid, ts);
               }
             break;
           }
@@ -1558,21 +1588,21 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   size_t ping_len = 0;
   if (is_prb)
     {
-      ping_bld (cry_ctx, cfg->addr, ts, sid, act_port, p_buf, &ping_len);
+      ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &ping_len);
     }
   static uint8_t ka_buf[UDP_PL_MAX];
   size_t ka_len = 0;
   if (is_idle)
     {
-      keep_bld (cry_ctx, cfg->addr, act_port, ka_buf, &ka_len);
+      keep_bld (cry_ctx, ka_buf, &ka_len);
     }
   bool is_gsp = ((tk_cnt % UPD_TK) == 0);
   static uint8_t g_buf[UDP_PL_MAX];
   size_t gsp_len = 0;
   if (is_gsp)
     {
-      gsp_bld (cry_ctx, rt->re_arr, (int)rt->cnt, *gsp_off, cfg->addr,
-               act_port, g_buf, &gsp_len);
+      gsp_bld (cry_ctx, rt->re_arr, (int)rt->cnt, *gsp_off, cfg->addr, g_buf,
+               &gsp_len);
     }
   bool has_dt = false;
   uint8_t dt_lla[16] = { 0 };
@@ -1580,8 +1610,8 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   size_t dt_len = 0;
   if (cfg->p2p == P2P_EN && rt_trg_pop (rt, dt_lla))
     {
-      gsp_dt_bld (cry_ctx, rt->re_arr, (int)rt->cnt, dt_lla, cfg->addr,
-                  act_port, dt_buf, &dt_len);
+      gsp_dt_bld (cry_ctx, rt->re_arr, (int)rt->cnt, dt_lla, cfg->addr, dt_buf,
+                  &dt_len);
       has_dt = (dt_len > 0);
     }
   static UdpMsg batch_arr[BATCH_MAX];
@@ -1611,8 +1641,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         {
           if (ping_len == 0)
             {
-              ping_bld (cry_ctx, cfg->addr, ts, sid, act_port, p_buf,
-                        &ping_len);
+              ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &ping_len);
             }
           memcpy (batch_arr[bc].dst_ip, rt->re_arr[i].ep_ip, 16);
           batch_arr[bc].dst_port = rt->re_arr[i].ep_port;
@@ -1669,14 +1698,13 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint16_t prb_u_oh = (uint16_t)(prb_o_oh + 8U);
         size_t t_pl_len = (prb_mtu > prb_u_oh) ? (size_t)(prb_mtu - prb_u_oh)
                                                : (size_t)PKT_HDR_SZ;
-        mtu_prb_bld (cry_ctx, cfg->addr, act_port, probe_id, prb_mtu, t_pl_len,
-                     prb_buf, &probe_len);
+        mtu_prb_bld (cry_ctx, probe_id, prb_mtu, t_pl_len, prb_buf,
+                     &probe_len);
         udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_buf, probe_len);
         {
           static uint8_t prb_ping_buf[UDP_PL_MAX];
           size_t prb_ping_len = 0;
-          ping_bld (cry_ctx, cfg->addr, ts, sid, act_port, prb_ping_buf,
-                    &prb_ping_len);
+          ping_bld (cry_ctx, cfg->addr, ts, sid, prb_ping_buf, &prb_ping_len);
           udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_ping_buf,
                   prb_ping_len);
         }
@@ -1700,8 +1728,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             continue;
           static uint8_t hp_buf[UDP_PL_MAX];
           size_t hp_len = 0;
-          hp_bld (cry_ctx, cfg->addr, dec->lla, cfg->addr, act_port, hp_buf,
-                  &hp_len);
+          hp_bld (cry_ctx, cfg->addr, dec->lla, hp_buf, &hp_len);
           udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
         }
     }
@@ -1906,15 +1933,14 @@ main (int argc, char **argv)
           uint64_t tok = ev_arr[i].data.u64;
           if (tok == ID_TAP)
             {
-              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid);
+              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
           else if (tok == ID_UDP)
             {
               if ((ev_arr[i].events & EPOLLIN) != 0)
                 {
-                  on_udp (tap_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
-                          &pool);
+                  on_udp (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, &pool);
                 }
               if ((ev_arr[i].events & EPOLLERR) != 0)
                 {
@@ -2159,9 +2185,8 @@ main (int argc, char **argv)
                                                 (unsigned)prb_mtu);
                                     else
                                       snprintf (row->mtu, sizeof (row->mtu),
-                                                "%u (%u-%u)",
-                                                (unsigned)pmtu, (unsigned)lkg,
-                                                (unsigned)ukb);
+                                                "%u (%u-%u)", (unsigned)pmtu,
+                                                (unsigned)lkg, (unsigned)ukb);
                                   }
                                 else
                                   {
