@@ -2,7 +2,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#define FRAG_BKT_MAX 1024
+#define FRAG_BKT_MAX 64
 
 typedef struct
 {

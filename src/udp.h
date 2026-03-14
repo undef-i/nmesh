@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #define BATCH_MAX 64
-#define UDP_PND_MAX 4096
+#define UDP_PND_MAX 256
 
 typedef struct
 {
