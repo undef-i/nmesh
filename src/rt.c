@@ -1189,11 +1189,32 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
       if (memcmp (re->lla, t->our_lla, 16) == 0)
         continue;
       re_mtu_sync (t, re);
+      if (re->hld_ts != 0 && sys_ts >= re->hld_ts)
+        {
+          re->mtu_ukb = rt_mtu_ub (t);
+          if (re->mtu_ukb < re->mtu_lkg)
+            re->mtu_ukb = re->mtu_lkg;
+          re->mtu_st = MTU_ST_S;
+          re->hld_ts = 0;
+          re->vfy_ts = 0;
+        }
       if (re->prb_mtu == 0)
         continue;
       if (sys_ts < re->prb_ddl)
         continue;
-      if (re->prb_tx >= RT_PRB_BST)
+      bool has_pong
+          = (re->pong_ts >= re->prb_tx_ts)
+            && ((re->pong_ts - re->prb_tx_ts) <= RT_PRB_TMO);
+      if (!has_pong)
+        {
+          re->prb_mtu = 0;
+          re->prb_id = 0;
+          re->prb_tx = 0;
+          re->prb_ddl = 0;
+          re_mtu_sync (t, re);
+          continue;
+        }
+      if (re->prb_tx >= 2)
         {
           uint16_t fail_mtu = re->prb_mtu;
           if (fail_mtu <= re->mtu_lkg)
@@ -1213,6 +1234,13 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
             re->mtu = re->mtu_lkg;
           re->vfy_ts = 0;
           re->mtu_st = MTU_ST_S;
+        }
+      else
+        {
+          re->prb_tx++;
+          re->prb_tx_ts = sys_ts;
+          re->prb_ddl = sys_ts + RT_PRB_TMO;
+          continue;
         }
       re->prb_mtu = 0;
       re->prb_id = 0;
@@ -1350,6 +1378,41 @@ rt_pmtu_ack_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint32_t probe_id,
         }
       re_mtu_sync (t, re);
       return;
+    }
+}
+
+void
+rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
+                uint64_t sys_ts)
+{
+  if (!t || !ip || pmtu == 0)
+    return;
+  uint16_t ub = rt_mtu_ub (t);
+  if (pmtu < RT_MTU_MIN)
+    pmtu = RT_MTU_MIN;
+  if (pmtu > ub)
+    pmtu = ub;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      Re *re = &t->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0)
+        continue;
+      if (re->ep_port != port)
+        continue;
+      re->mtu_lkg = pmtu;
+      re->mtu_ukb = pmtu;
+      re->mtu = pmtu;
+      re->mtu_st = MTU_ST_F;
+      re->prb_mtu = 0;
+      re->prb_id = 0;
+      re->prb_tx = 0;
+      re->prb_ddl = 0;
+      re->ack_ts = sys_ts;
+      re->vfy_ts = 0;
+      re->hld_ts = sys_ts + RT_MTU_HLD;
+      re_mtu_sync (t, re);
     }
 }
 
