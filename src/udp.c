@@ -6,11 +6,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <linux/errqueue.h>
 #include <linux/udp.h>
 #endif
 static UdpEmsgsizeCallback g_emsg_cb = NULL;
@@ -143,9 +146,9 @@ udp_init (Udp *s, uint16_t *port)
     {
       perror ("udp: setsockopt ipv6_v6only failed");
     }
-#if defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_DO)
+#if defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_WANT)
   {
-    int pmtu4 = IP_PMTUDISC_DO;
+    int pmtu4 = IP_PMTUDISC_WANT;
     if (setsockopt (s->fd, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu4, sizeof (pmtu4))
         < 0)
       {
@@ -153,14 +156,32 @@ udp_init (Udp *s, uint16_t *port)
       }
   }
 #endif
-#if defined(IPV6_MTU_DISCOVER) && defined(IPV6_PMTUDISC_DO)
+#if defined(IP_RECVERR)
   {
-    int pmtu6 = IPV6_PMTUDISC_DO;
+    int on = 1;
+    if (setsockopt (s->fd, IPPROTO_IP, IP_RECVERR, &on, sizeof (on)) < 0)
+      {
+        perror ("udp: setsockopt ip_recverr failed");
+      }
+  }
+#endif
+#if defined(IPV6_MTU_DISCOVER) && defined(IPV6_PMTUDISC_WANT)
+  {
+    int pmtu6 = IPV6_PMTUDISC_WANT;
     if (setsockopt (s->fd, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &pmtu6,
                     sizeof (pmtu6))
         < 0)
       {
         perror ("udp: setsockopt ipv6_mtu_discover failed");
+      }
+  }
+#endif
+#if defined(IPV6_RECVERR)
+  {
+    int on = 1;
+    if (setsockopt (s->fd, IPPROTO_IPV6, IPV6_RECVERR, &on, sizeof (on)) < 0)
+      {
+        perror ("udp: setsockopt ipv6_recverr failed");
       }
   }
 #endif
@@ -405,4 +426,106 @@ udp_w_hnd (Udp *s)
   if (!s)
     return -1;
   return udp_pend_fls (s);
+}
+
+uint16_t
+udp_mtu_get (const Udp *s)
+{
+  if (!s || s->fd < 0)
+    return 1500;
+  struct ifreq ifr;
+  memset (&ifr, 0, sizeof (ifr));
+  strncpy (ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+  if (ioctl (s->fd, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0)
+    return (uint16_t)ifr.ifr_mtu;
+  return 1500;
+}
+
+int
+udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu)
+{
+#if defined(__linux__) && defined(MSG_ERRQUEUE)
+  if (!s || s->fd < 0 || !dst_ip || !dst_port || !mtu)
+    return -1;
+  uint8_t data[1];
+  struct iovec iov;
+  memset (&iov, 0, sizeof (iov));
+  iov.iov_base = data;
+  iov.iov_len = sizeof (data);
+  uint8_t cbuf[512];
+  struct sockaddr_storage name;
+  memset (&name, 0, sizeof (name));
+  struct msghdr msg;
+  memset (&msg, 0, sizeof (msg));
+  msg.msg_name = &name;
+  msg.msg_namelen = sizeof (name);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof (cbuf);
+  ssize_t rc = recvmsg (s->fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+  if (rc < 0)
+    return -1;
+  uint16_t m = 0;
+  bool has_mtu = false;
+  for (struct cmsghdr *c = CMSG_FIRSTHDR (&msg); c;
+       c = CMSG_NXTHDR (&msg, c))
+    {
+      if (c->cmsg_level != IPPROTO_IP && c->cmsg_level != IPPROTO_IPV6)
+        continue;
+#if defined(IP_RECVERR)
+      if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVERR)
+        {
+          struct sock_extended_err *e
+              = (struct sock_extended_err *)CMSG_DATA (c);
+          if (e && e->ee_info > 0)
+            {
+              m = (uint16_t)e->ee_info;
+              has_mtu = true;
+            }
+        }
+#endif
+#if defined(IPV6_RECVERR)
+      if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_RECVERR)
+        {
+          struct sock_extended_err *e
+              = (struct sock_extended_err *)CMSG_DATA (c);
+          if (e && e->ee_info > 0)
+            {
+              m = (uint16_t)e->ee_info;
+              has_mtu = true;
+            }
+        }
+#endif
+    }
+  if (!has_mtu)
+    return -1;
+  if (name.ss_family == AF_INET6)
+    {
+      struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&name;
+      memcpy (dst_ip, sa6->sin6_addr.s6_addr, 16);
+      *dst_port = ntohs (sa6->sin6_port);
+    }
+  else if (name.ss_family == AF_INET)
+    {
+      struct sockaddr_in *sa4 = (struct sockaddr_in *)&name;
+      memset (dst_ip, 0, 16);
+      dst_ip[10] = 0xff;
+      dst_ip[11] = 0xff;
+      memcpy (dst_ip + 12, &sa4->sin_addr, 4);
+      *dst_port = ntohs (sa4->sin_port);
+    }
+  else
+    {
+      return -1;
+    }
+  *mtu = m;
+  return 0;
+#else
+  (void)s;
+  (void)dst_ip;
+  (void)dst_port;
+  (void)mtu;
+  return -1;
+#endif
 }

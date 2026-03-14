@@ -1672,6 +1672,14 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         mtu_prb_bld (cry_ctx, cfg->addr, act_port, probe_id, prb_mtu, t_pl_len,
                      prb_buf, &probe_len);
         udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_buf, probe_len);
+        {
+          static uint8_t prb_ping_buf[UDP_PL_MAX];
+          size_t prb_ping_len = 0;
+          ping_bld (cry_ctx, cfg->addr, ts, sid, act_port, prb_ping_buf,
+                    &prb_ping_len);
+          udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_ping_buf,
+                  prb_ping_len);
+        }
         rt_tx_ack (rt, prb_re.ep_ip, prb_re.ep_port, ts);
       }
   }
@@ -1778,7 +1786,6 @@ main (int argc, char **argv)
     }
   tap_addr_set ("nmesh", cfg.addr);
   tap_mtu_set ("nmesh", cfg.mtu);
-  rt_pmtu_ub_set (&rt, RT_MTU_MAX);
   printf ("main: tap device nmesh created.\n");
   static Udp udp;
   uint16_t act_port = cfg.port;
@@ -1808,13 +1815,17 @@ main (int argc, char **argv)
     {
       printf ("main: udp gso reserve enabled (segment=1200)\n");
     }
+  {
+    uint16_t hw_mtu = udp_mtu_get (&udp);
+    rt_pmtu_ub_set (&rt, hw_mtu);
+  }
   rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
   int epfd = epoll_create1 (0);
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.u64 = ID_TAP;
   epoll_ctl (epfd, EPOLL_CTL_ADD, tap_fd, &ev);
-  ev.events = EPOLLIN;
+  ev.events = EPOLLIN | EPOLLERR;
   ev.data.u64 = ID_UDP;
   epoll_ctl (epfd, EPOLL_CTL_ADD, udp.fd, &ev);
   bool u_w_watch = false;
@@ -1904,6 +1915,16 @@ main (int argc, char **argv)
                 {
                   on_udp (tap_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
                           &pool);
+                }
+              if ((ev_arr[i].events & EPOLLERR) != 0)
+                {
+                  uint8_t dst_ip[16];
+                  uint16_t dst_port = 0;
+                  uint16_t pmtu = 0;
+                  while (udp_err_rd (&udp, dst_ip, &dst_port, &pmtu) == 0)
+                    {
+                      rt_pmtu_ptb_ep (&rt, dst_ip, dst_port, pmtu, sys_ts ());
+                    }
                 }
               if ((ev_arr[i].events & EPOLLOUT) != 0)
                 {
