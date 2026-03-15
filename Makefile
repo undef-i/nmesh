@@ -2,13 +2,26 @@ CC = musl-gcc
 TARGET_NAME = nmesh
 BUILD_DIR = build
 
-SRCS = $(wildcard src/*.c) ext/monocypher/src/monocypher.c
-vpath %.c src ext/monocypher/src
+LIBSODIUM_DIR = ext/libsodium/src/libsodium
+LIBSODIUM_INC = $(LIBSODIUM_DIR)/include
+LIBSODIUM_SRCS = $(shell find $(LIBSODIUM_DIR) -name "*.c" \
+                -not -path "*/armcrypto/*" \
+                -not -path "*/sandy2x/fe51_ns.c" \
+                -not -path "*/wasm32/*")
 
-CFLAGS_COMMON = -std=gnu11 -Wall -Wextra -Iext/monocypher/src -Iext/uthash/src
+SRCS = $(wildcard src/*.c) $(LIBSODIUM_SRCS)
+vpath %.c src $(shell find $(LIBSODIUM_DIR) -type d)
+
+CFLAGS_COMMON = -std=gnu11 -Wall -Wextra -Isrc -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium -Iext/uthash/src \
+                -DSODIUM_STATIC -DCONFIG_H_IS_NOT_HERE -D_GNU_SOURCE \
+                -march=x86-64 -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
+                -DHAVE_CPUID -DHAVE_MMINTRIN_H -DHAVE_EMMINTRIN_H -DHAVE_PMMINTRIN_H \
+                -DHAVE_TMMINTRIN_H -DHAVE_SMMINTRIN_H -DHAVE_AVXINTRIN_H -DHAVE_AVX2INTRIN_H \
+                -DHAVE_WMMINTRIN_H -DHAVE_IMMINTRIN_H -DHAVE_TI_MODE -DHAVE_GETXBV \
+                -DHAVE_PCLMUL_INTRIN -DHAVE_AVX_INTRIN -DHAVE_ADXINTRIN_H -DHAVE_RDRAND
 LDFLAGS_COMMON = -static
 
-CFLAGS_RELEASE = -Os -flto -ffunction-sections -fdata-sections \
+CFLAGS_RELEASE = -O3 -flto -ffunction-sections -fdata-sections \
                  -fno-asynchronous-unwind-tables -fno-stack-protector \
                  -fno-ident -fmerge-all-constants
 LDFLAGS_RELEASE = -flto -Wl,--gc-sections -s -Wl,--build-id=none \

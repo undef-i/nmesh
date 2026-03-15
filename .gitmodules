@@ -6,3 +6,7 @@
 	path = ext/uthash
 	url = https://github.com/troydhanson/uthash.git
 	ignore = dirty
+[submodule "ext/libsodium"]
+	path = ext/libsodium
+	url = https://github.com/jedisct1/libsodium.git
+	ignore = dirty
