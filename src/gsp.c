@@ -426,11 +426,9 @@ data_bld_zc (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len, uint8_t rel_f,
   uint8_t *pkt_ptr = payload - PKT_HDR_SZ;
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_DATA, rel_f, hop_c, hdr);
-  uint8_t nonce[PKT_NONCE_SZ], mac[16];
-  cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, payload);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
-  memcpy (pkt_ptr + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
-  memcpy (pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
+  cry_enc (s, payload, pl_len, pkt_ptr, PKT_CH_SZ, pkt_ptr + PKT_CH_SZ,
+           pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, payload);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
 }
@@ -458,11 +456,9 @@ frag_bld_zc (Cry *s, uint8_t *chunk_ptr, size_t chunk_len, uint32_t msg_id,
   uint8_t *pkt_ptr = payload - PKT_HDR_SZ;
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_FRAG, rel_f, hop_c, hdr);
-  uint8_t nonce[PKT_NONCE_SZ], mac[16];
-  cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, payload);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
-  memcpy (pkt_ptr + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
-  memcpy (pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
+  cry_enc (s, payload, pl_len, pkt_ptr, PKT_CH_SZ, pkt_ptr + PKT_CH_SZ,
+           pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, payload);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
 }

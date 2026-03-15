@@ -723,7 +723,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       = (int32_t)pmtu - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr) + 4U);
   if (frag_cap <= 0)
     return false;
-  static uint8_t rel_f_buf[TAP_F_MAX + TAP_HR + TAP_TR];
+  static uint8_t rel_f_buf[TAP_F_MAX + TAP_HR + TAP_TR] __attribute__ ((aligned (32)));
   uint8_t *frame_pkt = rel_f_buf + TAP_HR;
   memcpy (frame_pkt, frame, frame_len);
   uint16_t m_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
@@ -767,7 +767,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   }
   if (!is_tiny && ((size_t)frame_len + (size_t)tnl_oh) <= (size_t)pmtu)
     {
-      static uint8_t rel_p_buf[UDP_PL_MAX + TAP_HR];
+      static uint8_t rel_p_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
       uint8_t *pl_dst = rel_p_buf + TAP_HR + PKT_HDR_SZ;
       memcpy (pl_dst, frame_pkt, frame_len);
       size_t out_len = 0;
@@ -790,7 +790,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         g_frag_mid = 1;
       uint8_t dst_tail[4];
       memcpy (dst_tail, dest_lla + 12, 4);
-      static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR];
+      static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
       size_t off = 0;
       while (off < frame_len)
         {
@@ -907,8 +907,8 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     bool is_val;
   } fast_path;
 
-  static uint8_t frame_bufs[BATCH_MAX][TAP_F_MAX + TAP_HR + TAP_TR];
-  static uint8_t frag_bufs[BATCH_MAX][UDP_PL_MAX + TAP_HR];
+  static uint8_t frame_bufs[BATCH_MAX][TAP_F_MAX + TAP_HR + TAP_TR] __attribute__ ((aligned (32)));
+  static uint8_t frag_bufs[BATCH_MAX][UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
   static UdpMsg batch_arr[BATCH_MAX];
   int bc = 0;
   for (int i = 0; i < BATCH_MAX; i++)
@@ -1322,7 +1322,7 @@ static void
 on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint64_t sid, PPool *pool)
 {
-  static uint8_t buf_arr[BATCH_MAX][UDP_PL_MAX];
+  static uint8_t buf_arr[BATCH_MAX][UDP_PL_MAX] __attribute__ ((aligned (32)));
   static uint8_t ips[BATCH_MAX][16];
   static uint16_t ports[BATCH_MAX];
   static size_t len_arr[BATCH_MAX];
@@ -1340,7 +1340,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (raw_len < PKT_HDR_SZ)
         continue;
       PktHdr hdr;
-      static uint8_t pt_store[TAP_HR + ETH_HLEN + UDP_PL_MAX];
+      static uint8_t pt_store[TAP_HR + ETH_HLEN + UDP_PL_MAX] __attribute__ ((aligned (32)));
       uint8_t *pt_buf = pt_store + TAP_HR + ETH_HLEN;
       uint8_t *pt;
       size_t pt_len;

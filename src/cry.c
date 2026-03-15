@@ -1,8 +1,6 @@
 #include "cry.h"
-#include "monocypher.h"
-#include <fcntl.h>
+#include <sodium.h>
 #include <string.h>
-#include <unistd.h>
 
 static void
 nonce_full_bld (const uint8_t wire_nonce[CRY_NONCE_WIRE_SZ],
@@ -16,15 +14,11 @@ nonce_full_bld (const uint8_t wire_nonce[CRY_NONCE_WIRE_SZ],
 int
 cry_init (Cry *s, const uint8_t psk[32])
 {
+  if (sodium_init () < 0)
+    return -1;
   memcpy (s->key, psk, 32);
   s->cnt = 1;
-  int fd = open ("/dev/urandom", O_RDONLY);
-  if (fd < 0)
-    return -1;
-  ssize_t n = read (fd, s->n_sid, CRY_NONCE_SID_SZ);
-  close (fd);
-  if (n != CRY_NONCE_SID_SZ)
-    return -1;
+  randombytes_buf (s->n_sid, CRY_NONCE_SID_SZ);
   return 0;
 }
 
@@ -43,10 +37,8 @@ cry_enc (Cry *s, const uint8_t *pt, size_t pt_len, const uint8_t *ad,
   nonce[9] = (uint8_t)(cnt >> 16);
   nonce[10] = (uint8_t)(cnt >> 8);
   nonce[11] = (uint8_t)(cnt);
-  uint8_t full_nonce[CRY_NONCE_FULL_SZ];
-  nonce_full_bld (nonce, full_nonce);
-  uint8_t *ct_ptr = ct;
-  crypto_aead_lock (ct_ptr, mac, s->key, full_nonce, ad, ad_len, pt, pt_len);
+  crypto_aead_chacha20poly1305_ietf_encrypt_detached (
+    ct, mac, NULL, pt, pt_len, ad, ad_len, NULL, nonce, s->key);
 }
 
 int
@@ -54,9 +46,7 @@ cry_dec (Cry *s, const uint8_t *ct, size_t ct_len, const uint8_t *ad,
          size_t ad_len, const uint8_t nonce[CRY_NONCE_WIRE_SZ],
          const uint8_t mac[16], uint8_t *pt)
 {
-  uint8_t full_nonce[CRY_NONCE_FULL_SZ];
-  nonce_full_bld (nonce, full_nonce);
-  int rc = crypto_aead_unlock (pt, mac, s->key, full_nonce, ad, ad_len, ct,
-                               ct_len);
+  int rc = crypto_aead_chacha20poly1305_ietf_decrypt_detached (
+    pt, NULL, ct, ct_len, mac, ad, ad_len, nonce, s->key);
   return (rc == 0) ? 0 : -1;
 }

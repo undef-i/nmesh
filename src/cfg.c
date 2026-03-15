@@ -1,5 +1,5 @@
 #include "cfg.h"
-#include "monocypher.h"
+#include <sodium.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -248,7 +248,7 @@ psk_prs (const char *s, uint8_t out[32])
       if (is_hex)
         return 0;
     }
-  crypto_blake2b (out, 32, (const uint8_t *)s, s_len);
+  crypto_generichash (out, 32, (const uint8_t *)s, s_len, NULL, 0);
   return 0;
 }
 
