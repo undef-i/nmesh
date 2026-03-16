@@ -106,8 +106,7 @@ frag_asm (uint32_t msg_id, uint16_t off, bool mf, const uint8_t *data,
       if ((b->rx_bmp[bit_idx] & mask) != 0)
         continue;
       b->rx_bmp[bit_idx] |= mask;
-      if (b->rx_bytes < b->tot_len)
-        b->rx_bytes++;
+      b->rx_bytes++;
     }
   if (b->end_seen && b->rx_bytes == b->tot_len)
     {
