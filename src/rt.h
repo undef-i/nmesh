@@ -127,6 +127,11 @@ typedef struct RtMap
   uint8_t lla[16];
   Pth *paths;
   Pth *sel_pth;
+  Pth *sel_dir_pth;
+  Pth *sel_rel_pth;
+  uint32_t sel_dir_m;
+  uint32_t sel_rel_m;
+  bool has_pnd_dir;
   UT_hash_handle hh;
 } RtMap;
 

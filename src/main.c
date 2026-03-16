@@ -724,8 +724,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       = (int32_t)pmtu - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr) + 4U);
   if (frag_cap <= 0)
     return false;
-  static uint8_t rel_f_buf[TAP_F_MAX + TAP_HR + TAP_TR] __attribute__ ((aligned (32)));
-  uint8_t *frame_pkt = rel_f_buf + TAP_HR;
+  static uint8_t rel_p_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
+  uint8_t *frame_pkt = rel_p_buf + TAP_HR + PKT_HDR_SZ;
   memcpy (frame_pkt, frame, frame_len);
   uint16_t m_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
   {
@@ -768,12 +768,9 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   }
   if (!is_tiny && ((size_t)frame_len + (size_t)tnl_oh) <= (size_t)pmtu)
     {
-      static uint8_t rel_p_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
-      uint8_t *pl_dst = rel_p_buf + TAP_HR + PKT_HDR_SZ;
-      memcpy (pl_dst, frame_pkt, frame_len);
       size_t out_len = 0;
       uint8_t *out_ptr
-          = data_bld_zc (cry_ctx, pl_dst, frame_len, 1, hop_c, &out_len);
+          = data_bld_zc (cry_ctx, frame_pkt, frame_len, 1, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
@@ -791,7 +788,6 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         g_frag_mid = 1;
       uint8_t dst_tail[4];
       memcpy (dst_tail, dest_lla + 12, 4);
-      static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
       size_t off = 0;
       while (off < frame_len)
         {
@@ -799,7 +795,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           if (chunk_len > chunk_max)
             chunk_len = chunk_max;
           uint8_t *chunk_dst
-              = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
+              = rel_p_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
           memcpy (chunk_dst, frame_pkt + off, chunk_len);
           size_t out_len = 0;
           bool mf = (off + chunk_len) < frame_len;
@@ -860,6 +856,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   memcpy (dst_tail, dest_lla + 12, 4);
   bool is_tx = false;
   static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR];
+  uint8_t *chunk_dst_base
+      = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
   for (size_t sub_off = 0; sub_off < chunk_len;)
     {
       size_t sub_len = chunk_len - sub_off;
@@ -868,14 +866,12 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       uint32_t abs_off = (uint32_t)frag_off + (uint32_t)sub_off;
       if (abs_off > UINT16_MAX)
         break;
-      uint8_t *chunk_dst
-          = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
-      memcpy (chunk_dst, chunk + sub_off, sub_len);
+      memcpy (chunk_dst_base, chunk + sub_off, sub_len);
       size_t out_len = 0;
       bool is_last_sub = (sub_off + sub_len) == chunk_len;
       bool mf_out = mf_in || !is_last_sub;
       uint8_t *out_ptr
-          = frag_bld_zc (cry_ctx, chunk_dst, sub_len, mid, (uint16_t)abs_off,
+          = frag_bld_zc (cry_ctx, chunk_dst_base, sub_len, mid, (uint16_t)abs_off,
                          mf_out, 1, dst_tail, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
@@ -895,9 +891,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
 static void
 on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-        uint64_t sid)
+        uint64_t sid, uint64_t now)
 {
-  uint64_t now = sys_ts();
   (void)sid;
   static uint64_t l_nh_ts = 0;
 
@@ -1378,29 +1373,16 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   {
                     if (fwd_len < ETH_HLEN)
                       break;
-                    int retries = 10;
-                    bool is_wr = false;
-                    while (retries-- > 0)
+                    if (write (tap_fd, fwd_frame, fwd_len) < 0)
                       {
-                        if (write (tap_fd, fwd_frame, fwd_len) >= 0)
+                        if (!(errno == EAGAIN || errno == EWOULDBLOCK
+                              || errno == ENOBUFS))
                           {
-                            is_wr = true;
-                            break;
+                            fprintf (stderr,
+                                     "tap: write error, drop "
+                                     "packet len=%zu\n",
+                                     fwd_len);
                           }
-                        if (errno == EAGAIN || errno == EWOULDBLOCK
-                            || errno == ENOBUFS)
-                          {
-                            sched_yield ();
-                            continue;
-                          }
-                        break;
-                      }
-                    if (!is_wr)
-                      {
-                        fprintf (stderr,
-                                 "tap: queue full, drop "
-                                 "packet len=%zu\n",
-                                 fwd_len);
                       }
                   }
                 else
@@ -1416,29 +1398,16 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 size_t frame_len = pt_len;
                 if (frame_len < ETH_HLEN)
                   break;
-                int retries = 10;
-                bool is_wr = false;
-                while (retries-- > 0)
+                if (write (tap_fd, frame_ptr, frame_len) < 0)
                   {
-                    if (write (tap_fd, frame_ptr, frame_len) >= 0)
+                    if (!(errno == EAGAIN || errno == EWOULDBLOCK
+                          || errno == ENOBUFS))
                       {
-                        is_wr = true;
-                        break;
+                        fprintf (stderr,
+                                 "tap: write error, drop packet "
+                                 "len=%zu\n",
+                                 frame_len);
                       }
-                    if (errno == EAGAIN || errno == EWOULDBLOCK
-                        || errno == ENOBUFS)
-                      {
-                        sched_yield ();
-                        continue;
-                      }
-                    break;
-                  }
-                if (!is_wr)
-                  {
-                    fprintf (stderr,
-                             "tap: queue full, drop packet "
-                             "len=%zu\n",
-                             frame_len);
                   }
               }
             break;
@@ -1486,29 +1455,16 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               break;
             if (full_len < ETH_HLEN)
               break;
-            int retries = 10;
-            bool is_wr = false;
-            while (retries-- > 0)
+            if (write (tap_fd, full_l3, full_len) < 0)
               {
-                if (write (tap_fd, full_l3, full_len) >= 0)
+                if (!(errno == EAGAIN || errno == EWOULDBLOCK
+                      || errno == ENOBUFS))
                   {
-                    is_wr = true;
-                    break;
+                    fprintf (stderr,
+                             "tap: write error, drop reassembled "
+                             "packet len=%u\n",
+                             (unsigned)full_len);
                   }
-                if (errno == EAGAIN || errno == EWOULDBLOCK
-                    || errno == ENOBUFS)
-                  {
-                    sched_yield ();
-                    continue;
-                  }
-                break;
-              }
-            if (!is_wr)
-              {
-                fprintf (stderr,
-                         "tap: queue full, drop reassembled "
-                         "packet len=%u\n",
-                         (unsigned)full_len);
               }
             break;
           }
@@ -1938,8 +1894,8 @@ main (int argc, char **argv)
   bool u_w_watch = false;
   int timer_fd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK);
   struct itimerspec its;
-  its.it_value.tv_sec = GSP_INTV;
-  its.it_value.tv_nsec = 0;
+  its.it_value.tv_sec = 0;
+  its.it_value.tv_nsec = 1000000;
   its.it_interval.tv_sec = GSP_INTV;
   its.it_interval.tv_nsec = 0;
   timerfd_settime (timer_fd, 0, &its, NULL);
@@ -2016,7 +1972,7 @@ main (int argc, char **argv)
           uint64_t tok = ev_arr[i].data.u64;
           if (tok == ID_TAP)
             {
-              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid);
+              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, sys_ts ());
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
           else if (tok == ID_UDP)

@@ -14,18 +14,17 @@ vpath %.c src $(shell find $(LIBSODIUM_DIR) -type d)
 
 CFLAGS_COMMON = -std=gnu11 -Wall -Wextra -Isrc -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium -Iext/uthash/src \
                 -DSODIUM_STATIC -DCONFIG_H_IS_NOT_HERE -D_GNU_SOURCE \
-                -march=x86-64-v3 -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
+                -march=x86-64 -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
                 -DHAVE_CPUID -DHAVE_MMINTRIN_H -DHAVE_EMMINTRIN_H -DHAVE_PMMINTRIN_H \
                 -DHAVE_TMMINTRIN_H -DHAVE_SMMINTRIN_H -DHAVE_AVXINTRIN_H -DHAVE_AVX2INTRIN_H \
                 -DHAVE_WMMINTRIN_H -DHAVE_IMMINTRIN_H -DHAVE_TI_MODE -DHAVE_GETXBV \
-                -DHAVE_PCLMUL_INTRIN -DHAVE_AVX_INTRIN -DHAVE_ADXINTRIN_H -DHAVE_RDRAND \
-                -g -fno-omit-frame-pointer
+                -DHAVE_PCLMUL_INTRIN -DHAVE_AVX_INTRIN -DHAVE_ADXINTRIN_H -DHAVE_RDRAND
 LDFLAGS_COMMON = -static
 
 CFLAGS_RELEASE = -O3 -flto -ffunction-sections -fdata-sections \
-                 -fno-asynchronous-unwind-tables -fno-stack-protector \
-                 -fno-ident -fmerge-all-constants
-LDFLAGS_RELEASE = -flto -Wl,--gc-sections -Wl,--build-id=none \
+                 -fomit-frame-pointer -fno-asynchronous-unwind-tables \
+                 -fno-stack-protector -fno-ident -fmerge-all-constants
+LDFLAGS_RELEASE = -flto -s -Wl,--gc-sections -Wl,--build-id=none \
                   -Wl,-z,norelro -Wl,--no-export-dynamic
 
 CFLAGS_DEBUG = -g -O0 -DDEBUG
