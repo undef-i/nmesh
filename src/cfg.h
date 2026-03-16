@@ -11,6 +11,7 @@ typedef enum
 
 typedef struct
 {
+  char ifname[16];
   uint8_t addr[16];
   uint16_t port;
   uint16_t mtu;

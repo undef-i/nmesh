@@ -14,6 +14,7 @@ make
 Create `nmesh.conf`:
 
 ```ini
+ifname = nmesh
 address = fe80::1
 listen = 11451
 mtu = 1280

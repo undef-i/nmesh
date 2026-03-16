@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -431,13 +432,69 @@ udp_w_hnd (Udp *s)
 uint16_t
 udp_mtu_get (const Udp *s)
 {
+  static const uint8_t v6_pub_dns[16]
+      = { 0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88 };
   if (!s || s->fd < 0)
     return 1500;
-  struct ifreq ifr;
-  memset (&ifr, 0, sizeof (ifr));
-  strncpy (ifr.ifr_name, "eth0", IFNAMSIZ - 1);
-  if (ioctl (s->fd, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0)
-    return (uint16_t)ifr.ifr_mtu;
+  return udp_ep_mtu_get (v6_pub_dns);
+}
+
+uint16_t
+udp_ep_mtu_get (const uint8_t dst_ip[16])
+{
+  if (!dst_ip)
+    return 1500;
+  int is_v4m
+      = (dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0 && dst_ip[3] == 0
+         && dst_ip[4] == 0 && dst_ip[5] == 0 && dst_ip[6] == 0
+         && dst_ip[7] == 0 && dst_ip[8] == 0 && dst_ip[9] == 0
+         && dst_ip[10] == 0xff && dst_ip[11] == 0xff);
+  if (is_v4m)
+    {
+      int fd4 = socket (AF_INET, SOCK_DGRAM, 0);
+      if (fd4 < 0)
+        return 1500;
+      struct sockaddr_in sa4;
+      memset (&sa4, 0, sizeof (sa4));
+      sa4.sin_family = AF_INET;
+      sa4.sin_port = htons (53);
+      memcpy (&sa4.sin_addr, dst_ip + 12, 4);
+      if (connect (fd4, (struct sockaddr *)&sa4, sizeof (sa4)) == 0)
+        {
+          int mtu4 = 0;
+          socklen_t len4 = sizeof (mtu4);
+          if (getsockopt (fd4, IPPROTO_IP, IP_MTU, &mtu4, &len4) == 0
+              && mtu4 > 0)
+            {
+              close (fd4);
+              return (uint16_t)mtu4;
+            }
+        }
+      close (fd4);
+      return 1500;
+    }
+
+  int fd6 = socket (AF_INET6, SOCK_DGRAM, 0);
+  if (fd6 < 0)
+    return 1500;
+  struct sockaddr_in6 sa6;
+  memset (&sa6, 0, sizeof (sa6));
+  sa6.sin6_family = AF_INET6;
+  sa6.sin6_port = htons (53);
+  memcpy (sa6.sin6_addr.s6_addr, dst_ip, 16);
+  if (connect (fd6, (struct sockaddr *)&sa6, sizeof (sa6)) == 0)
+    {
+      int mtu6 = 0;
+      socklen_t len6 = sizeof (mtu6);
+      if (getsockopt (fd6, IPPROTO_IPV6, IPV6_MTU, &mtu6, &len6) == 0
+          && mtu6 > 0)
+        {
+          close (fd6);
+          return (uint16_t)mtu6;
+        }
+    }
+  close (fd6);
   return 1500;
 }
 

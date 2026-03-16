@@ -673,8 +673,9 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       memset (&ne, 0, sizeof (ne));
       memcpy (ne.ep_ip, peers[i].ip, 16);
       ne.ep_port = peers[i].port;
-      ne.is_act = true;
+      ne.is_act = false;
       ne.is_static = true;
+      ne.state = RT_PND;
       ne.lat = RTT_UNK;
       ne.rto = RTO_INIT;
       rt_upd (rt, &ne, ts);
@@ -1707,6 +1708,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           batch_arr[bc].data_len = ka_len;
           bc++;
           rt_tx_ack (rt, rt->re_arr[i].ep_ip, rt->re_arr[i].ep_port, ts);
+          g_tx_ts = ts;
           if (bc == BATCH_MAX)
             {
               udp_tx_arr (udp, batch_arr, bc);
@@ -1856,8 +1858,9 @@ main (int argc, char **argv)
       memset (&ne, 0, sizeof (ne));
       memcpy (ne.ep_ip, peers[i].ip, 16);
       ne.ep_port = peers[i].port;
-      ne.is_act = true;
+      ne.is_act = false;
       ne.is_static = true;
+      ne.state = RT_PND;
       ne.lat = RTT_UNK;
       ne.rto = RTO_INIT;
       rt_upd (&rt, &ne, 0);
@@ -1880,16 +1883,16 @@ main (int argc, char **argv)
     }
   Cry cry_ctx;
   cry_init (&cry_ctx, cfg.psk);
-  tap_stl_rm ("nmesh");
-  int tap_fd = tap_init ("nmesh");
+  tap_stl_rm (cfg.ifname);
+  int tap_fd = tap_init (cfg.ifname);
   if (tap_fd < 0)
     {
       fprintf (stderr, "main: failed to create tap\n");
       return 1;
     }
-  tap_addr_set ("nmesh", cfg.addr);
-  tap_mtu_set ("nmesh", cfg.mtu);
-  printf ("main: tap device nmesh created.\n");
+  tap_addr_set (cfg.ifname, cfg.addr);
+  tap_mtu_set (cfg.ifname, cfg.mtu);
+  printf ("main: tap device %s created.\n", cfg.ifname);
   static Udp udp;
   uint16_t act_port = cfg.port;
   if (udp_init (&udp, &act_port) != 0)
@@ -1995,6 +1998,9 @@ main (int argc, char **argv)
   printf ("main: mesh running; entering epoll loop\n");
   printf ("main: type 's' and press enter to view routing table\n");
   fflush (stdout);
+  on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, &gsp_off, cfg_path, act_port,
+          sid, &pool);
+  udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
   while (1)
     {
       int nev = epoll_wait (epfd, ev_arr, EV_MAX, -1);

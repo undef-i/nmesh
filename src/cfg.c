@@ -259,6 +259,7 @@ cfg_load (const char *path, Cfg *cfg)
   cfg->port = 50000;
   cfg->mtu = 1280;
   cfg->p2p = P2P_EN;
+  strcpy (cfg->ifname, "nmesh");
   FILE *fp = fopen (path, "r");
   if (!fp)
     return -1;
@@ -300,6 +301,11 @@ cfg_load (const char *path, Cfg *cfg)
       else if (strcmp (k, "p2p") == 0)
         {
           cfg->p2p = (strcmp (v, "enable") == 0) ? P2P_EN : P2P_DIS;
+        }
+      else if (strcmp (k, "ifname") == 0)
+        {
+          strncpy (cfg->ifname, v, sizeof (cfg->ifname) - 1);
+          cfg->ifname[sizeof (cfg->ifname) - 1] = '\0';
         }
       else if (strcmp (k, "psk") == 0)
         {
