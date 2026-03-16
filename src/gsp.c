@@ -620,7 +620,20 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       bool is_adv_rch = (adv_m > 0 && adv_m < RT_M_INF);
       bool is_s_alive = ((RtSt)gsp_ent.state != RT_DED);
       bool loc_req_seq = false;
-      if (!rt_fsb (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, &loc_req_seq))
+      bool feasible
+          = rt_fsb (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, &loc_req_seq);
+      SrcEnt *se = NULL;
+      for (uint32_t si = 0; si < rt->src_cnt; si++)
+        {
+          if (memcmp (rt->sources[si].rt_id, gsp_ent.lla, 16) == 0)
+            {
+              se = &rt->sources[si];
+              break;
+            }
+        }
+      bool is_new_poison = (adv_m >= RT_M_INF) && (!se || se->fwd_m < RT_M_INF);
+
+      if (!feasible && !is_new_poison)
         {
           if (loc_req_seq && o_req_seq && seq_tgt)
             {
@@ -629,7 +642,11 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             }
           continue;
         }
-      rt_src_upd (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, sys_ts);
+
+      if (feasible || is_new_poison)
+        {
+          rt_src_upd (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, sys_ts);
+        }
       bool is_s_self = (memcmp (gsp_ent.ep_ip, src_ip, 16) == 0
                         && gsp_ent.ep_port == src_port);
       if (!is_s_self)

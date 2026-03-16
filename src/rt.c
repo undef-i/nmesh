@@ -278,31 +278,15 @@ re_to_pth (const Re *re, Pth *pth)
   pth->tnt_sid = re->tnt_sid;
 }
 
-static Pth *
-pth_fnd (Pth *head, const uint8_t ip[16], uint16_t port, uint32_t r2d)
-{
-  for (Pth *pth = head; pth; pth = pth->next)
-    {
-      if (memcmp (pth->ep_ip, ip, 16) != 0)
-        continue;
-      if (pth->ep_port != port)
-        continue;
-      if (pth->r2d != r2d)
-        continue;
-      return pth;
-    }
-  return NULL;
-}
-
 static void
 rt_map_rbd (Rt *t)
 {
   t->map_dirty = false;
   RtMap *n_map = NULL;
-  EpIdx *n_idx = NULL;
-  for (uint32_t re_idx = 0; re_idx < t->cnt; re_idx++)
+
+  for (uint32_t i = 0; i < t->cnt; i++)
     {
-      Re *re = &t->re_arr[re_idx];
+      Re *re = &t->re_arr[i];
       RtMap *rtm = NULL;
       HASH_FIND (hh, n_map, re->lla, 16, rtm);
       if (!rtm)
@@ -315,135 +299,75 @@ rt_map_rbd (Rt *t)
           rtm->sel_rel_m = UINT32_MAX;
           HASH_ADD (hh, n_map, lla, 16, rtm);
         }
+
       Pth *pth = (Pth *)calloc (1, sizeof (*pth));
       if (!pth)
         continue;
       re_to_pth (re, pth);
       pth->next = rtm->paths;
       rtm->paths = pth;
+
+      if (pth->r2d == 0 && pth->is_act && pth->state != RT_DED)
+        {
+          uint32_t m = pth_m (pth);
+          if (!rtm->sel_dir_pth || m < rtm->sel_dir_m)
+            {
+              rtm->sel_dir_pth = pth;
+              rtm->sel_dir_m = m;
+            }
+        }
     }
+
   RtMap *rtm, *tmp;
   HASH_ITER (hh, n_map, rtm, tmp)
   {
-    RtMap *o_rtm = NULL;
-    HASH_FIND (hh, t->map, rtm->lla, 16, o_rtm);
-    if (o_rtm)
+    for (Pth *p = rtm->paths; p; p = p->next)
       {
-        if (o_rtm->sel_pth)
-          {
-            Pth *sel_pth = pth_fnd (rtm->paths, o_rtm->sel_pth->ep_ip,
-                                    o_rtm->sel_pth->ep_port,
-                                    o_rtm->sel_pth->r2d);
-            if (sel_pth)
-              rtm->sel_pth = sel_pth;
-          }
-        if (o_rtm->sel_dir_pth)
-          {
-            Pth *sel_dir = pth_fnd (rtm->paths, o_rtm->sel_dir_pth->ep_ip,
-                                    o_rtm->sel_dir_pth->ep_port,
-                                    o_rtm->sel_dir_pth->r2d);
-            if (sel_dir)
-              rtm->sel_dir_pth = sel_dir;
-          }
-        if (o_rtm->sel_rel_pth)
-          {
-            Pth *sel_rel = pth_fnd (rtm->paths, o_rtm->sel_rel_pth->ep_ip,
-                                    o_rtm->sel_rel_pth->ep_port,
-                                    o_rtm->sel_rel_pth->r2d);
-            if (sel_rel)
-              rtm->sel_rel_pth = sel_rel;
-          }
-      }
-
-    for (Pth *pth = rtm->paths; pth; pth = pth->next)
-      {
-        if (pth->r2d != 0)
-          continue;
-        if (!pth->is_act && pth->state == RT_PND)
-          rtm->has_pnd_dir = true;
-        if (!pth->is_act || pth->state == RT_DED)
+        if (!p->is_act || p->state == RT_DED)
           continue;
 
-        uint32_t dm = pth_m (pth);
-        if (!rtm->sel_dir_pth || dm < rtm->sel_dir_m)
+        if (p->r2d > 0)
           {
-            rtm->sel_dir_pth = pth;
-            rtm->sel_dir_m = dm;
-          }
-
-        uint8_t key[18];
-        ep_key_bld (pth->ep_ip, pth->ep_port, key);
-        EpIdx *ep_map = NULL;
-        HASH_FIND (hh, n_idx, key, 18, ep_map);
-        if (!ep_map)
-          {
-            ep_map = (EpIdx *)calloc (1, sizeof (*ep_map));
-            if (!ep_map)
+            if (memcmp (p->nhop_lla, t->our_lla, 16) == 0)
               continue;
-            memcpy (ep_map->key, key, 18);
-            memcpy (ep_map->ep_ip, pth->ep_ip, 16);
-            ep_map->ep_port = pth->ep_port;
-            ep_map->b_dir_m = dm;
-            HASH_ADD (hh, n_idx, key, 18, ep_map);
+
+            RtMap *nh = NULL;
+            HASH_FIND (hh, n_map, p->nhop_lla, 16, nh);
+            if (!nh || !nh->sel_dir_pth)
+              continue;
+
+            uint32_t n2r = nh->sel_dir_m;
+            if (n2r >= RT_M_INF)
+              continue;
+
+            uint32_t tot = n2r + p->r2d;
+            if (!rtm->sel_rel_pth || tot < rtm->sel_rel_m)
+              {
+                rtm->sel_rel_pth = p;
+                rtm->sel_rel_m = tot;
+              }
           }
-        else if (dm < ep_map->b_dir_m)
+      }
+
+    rtm->sel_pth = rtm->sel_dir_pth ? rtm->sel_dir_pth : rtm->sel_rel_pth;
+
+    for (Pth *p = rtm->paths; p; p = p->next)
+      {
+        if (p->r2d == 0 && !p->is_act && p->state == RT_PND)
           {
-            ep_map->b_dir_m = dm;
+            rtm->has_pnd_dir = true;
+            break;
           }
       }
   }
 
-  HASH_ITER (hh, n_map, rtm, tmp)
-  {
-    for (Pth *pth = rtm->paths; pth; pth = pth->next)
-      {
-        if (!pth->is_act || pth->state == RT_DED)
-          continue;
-        if (pth->r2d == 0)
-          continue;
-        if (is_z16 (pth->nhop_lla))
-          continue;
-
-        uint8_t nh_key[16];
-        memcpy (nh_key, pth->nhop_lla, 16);
-        RtMap *nh = NULL;
-        HASH_FIND (hh, n_map, nh_key, 16, nh);
-        if (!nh || !nh->sel_dir_pth)
-          continue;
-        if (!nh->sel_dir_pth->is_act || nh->sel_dir_pth->state == RT_DED
-            || nh->sel_dir_pth->r2d != 0)
-          continue;
-
-        uint32_t n2r = pth_m (nh->sel_dir_pth);
-        uint32_t r2d = pth->r2d;
-        if (r2d == 0 || r2d >= RT_M_INF)
-          continue;
-        if (n2r == UINT32_MAX || n2r >= RT_M_INF)
-          continue;
-
-        uint32_t total = n2r + r2d;
-        if (!rtm->sel_rel_pth || total < rtm->sel_rel_m)
-          {
-            rtm->sel_rel_pth = pth;
-            rtm->sel_rel_m = total;
-          }
-      }
-
-    if (rtm->sel_pth)
-      {
-        if (!rtm->sel_pth->is_act || rtm->sel_pth->state == RT_DED)
-          rtm->sel_pth = NULL;
-      }
-    if (!rtm->sel_pth)
-      {
-        rtm->sel_pth = rtm->sel_dir_pth ? rtm->sel_dir_pth : rtm->sel_rel_pth;
-      }
-  }
   rt_map_fre (t->map);
-  rt_idx_fre (t->dir_m_idx);
+  if (t->dir_m_idx)
+    {
+      rt_idx_fre (t->dir_m_idx);
+      t->dir_m_idx = NULL;
+    }
   t->map = n_map;
-  t->dir_m_idx = n_idx;
-  t->map_dirty = false;
 }
 
 static void
@@ -533,19 +457,25 @@ static uint32_t
 nh_m (Rt *t, const uint8_t relay_lla[16], const uint8_t relay_ip[16],
       uint16_t relay_port)
 {
-  if (!t || !relay_lla || !relay_ip)
+  (void)relay_ip;
+  (void)relay_port;
+
+  if (!t || !relay_lla)
     return UINT32_MAX;
   if (is_z16 (relay_lla))
     return UINT32_MAX;
-  if (!t->dir_m_idx)
+
+  rt_map_ens (t);
+
+  if (!t->map)
     return UINT32_MAX;
-  uint8_t key[18];
-  ep_key_bld (relay_ip, relay_port, key);
-  EpIdx *ep_idx = NULL;
-  HASH_FIND (hh, t->dir_m_idx, key, 18, ep_idx);
-  if (!ep_idx || ep_idx->b_dir_m >= RT_M_INF)
+
+  RtMap *nh = NULL;
+  HASH_FIND (hh, t->map, relay_lla, 16, nh);
+  if (!nh || !nh->sel_dir_pth)
     return UINT32_MAX;
-  return ep_idx->b_dir_m;
+
+  return nh->sel_dir_m;
 }
 
 static void
@@ -1059,6 +989,7 @@ rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
 {
   RtDec dec;
   memset (&dec, 0, sizeof (dec));
+
   if (is_z16 (dst_lla))
     {
       dec.type = RT_VP;
@@ -1076,6 +1007,7 @@ rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
     }
 
   rt_map_ens (t);
+
   RtMap *re = NULL;
   HASH_FIND (hh, t->map, dst_lla, 16, re);
   if (!re)
@@ -1084,35 +1016,34 @@ rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
       return dec;
     }
 
-  Pth *dir = re->sel_dir_pth;
-  if (dir && (!dir->is_act || dir->state == RT_DED || dir->r2d != 0))
-    dir = NULL;
+  Pth *b_dir_pth = re->sel_dir_pth;
+  Pth *b_rel_pth = re->sel_rel_pth;
 
-  Pth *rel = re->sel_rel_pth;
-  if (rel && (!rel->is_act || rel->state == RT_DED || rel->r2d == 0
-              || is_z16 (rel->nhop_lla)))
-    rel = NULL;
-
-  if (dir)
+  if (b_dir_pth && b_rel_pth)
     {
-      re->sel_pth = dir;
       dec.type = RT_DIR;
-      memcpy (dec.dir.ip, dir->ep_ip, 16);
-      dec.dir.port = dir->ep_port;
+      memcpy (dec.dir.ip, b_dir_pth->ep_ip, 16);
+      dec.dir.port = b_dir_pth->ep_port;
       return dec;
     }
-  if (re->has_pnd_dir && !rel)
+  if (re->has_pnd_dir && !b_rel_pth)
     {
       dec.type = RT_VP;
       return dec;
     }
-  if (rel)
+  if (b_dir_pth)
     {
-      re->sel_pth = rel;
+      dec.type = RT_DIR;
+      memcpy (dec.dir.ip, b_dir_pth->ep_ip, 16);
+      dec.dir.port = b_dir_pth->ep_port;
+      return dec;
+    }
+  if (b_rel_pth)
+    {
       dec.type = RT_REL;
-      memcpy (dec.rel.relay_ip, rel->ep_ip, 16);
-      dec.rel.relay_port = rel->ep_port;
-      memcpy (dec.rel.relay_lla, rel->nhop_lla, 16);
+      memcpy (dec.rel.relay_ip, b_rel_pth->ep_ip, 16);
+      dec.rel.relay_port = b_rel_pth->ep_port;
+      memcpy (dec.rel.relay_lla, b_rel_pth->nhop_lla, 16);
       return dec;
     }
 
