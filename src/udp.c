@@ -349,16 +349,27 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
   static struct mmsghdr msg_arr[BATCH_MAX];
   static struct sockaddr_in6 addr_arr[BATCH_MAX];
   static struct iovec iovs[BATCH_MAX];
+  static bool is_init = false;
+  if (!is_init)
+    {
+      for (int i = 0; i < BATCH_MAX; i++)
+        {
+          memset (&addr_arr[i], 0, sizeof (addr_arr[i]));
+          memset (&msg_arr[i], 0, sizeof (msg_arr[i]));
+          msg_arr[i].msg_hdr.msg_name = &addr_arr[i];
+          msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
+          msg_arr[i].msg_hdr.msg_iov = &iovs[i];
+          msg_arr[i].msg_hdr.msg_iovlen = 1;
+        }
+      is_init = true;
+    }
   for (int i = 0; i < m_cnt; i++)
     {
       iovs[i].iov_base = buf_arr[i];
       iovs[i].iov_len = UDP_PL_MAX;
-      memset (&addr_arr[i], 0, sizeof (addr_arr[i]));
-      memset (&msg_arr[i], 0, sizeof (msg_arr[i]));
-      msg_arr[i].msg_hdr.msg_name = &addr_arr[i];
       msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
-      msg_arr[i].msg_hdr.msg_iov = &iovs[i];
-      msg_arr[i].msg_hdr.msg_iovlen = 1;
+      msg_arr[i].msg_hdr.msg_flags = 0;
+      msg_arr[i].msg_len = 0;
     }
   int rx_cnt = recvmmsg (s->fd, msg_arr, m_cnt, MSG_DONTWAIT, NULL);
   if (rx_cnt < 0)

@@ -897,6 +897,7 @@ static void
 on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint64_t sid)
 {
+  uint64_t now = sys_ts();
   (void)sid;
   static uint64_t l_nh_ts = 0;
 
@@ -906,7 +907,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     RtDec dec;
     uint64_t val_ts;
     bool is_val;
-  } fast_path;
+  } fast_path[16];
 
   static uint8_t frame_bufs[BATCH_MAX][TAP_F_MAX + TAP_HR + TAP_TR] __attribute__ ((aligned (32)));
   static uint8_t frag_bufs[BATCH_MAX][UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
@@ -936,7 +937,6 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       uint8_t *frame_pkt = pl_ptr + result.pl_start;
       size_t frame_len = result.payload_len;
       const uint8_t *dst_mac = pl_ptr;
-      uint64_t now = sys_ts ();
       if ((dst_mac[0] & 0x01U) != 0U)
         {
           size_t out_len;
@@ -1061,10 +1061,11 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
       RtDec dec;
       memset (&dec, 0, sizeof (dec));
-      if (fast_path.is_val && now <= fast_path.val_ts
-          && memcmp (fast_path.dest_lla, rt_key, 16) == 0)
+      int fp_idx = (int)(rt_key[15] & 0x0f);
+      if (fast_path[fp_idx].is_val && now <= fast_path[fp_idx].val_ts
+          && memcmp (fast_path[fp_idx].dest_lla, rt_key, 16) == 0)
         {
-          dec = fast_path.dec;
+          dec = fast_path[fp_idx].dec;
         }
       else
         {
@@ -1086,10 +1087,10 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   dec = rt_sel (rt, rt_key, cfg->p2p == P2P_EN);
                 }
             }
-          memcpy (fast_path.dest_lla, rt_key, 16);
-          fast_path.dec = dec;
-          fast_path.val_ts = now + 200ULL;
-          fast_path.is_val = true;
+          memcpy (fast_path[fp_idx].dest_lla, rt_key, 16);
+          fast_path[fp_idx].dec = dec;
+          fast_path[fp_idx].val_ts = now + 200ULL;
+          fast_path[fp_idx].is_val = true;
         }
       if (dec.type == RT_NONE)
         continue;
