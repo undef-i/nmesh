@@ -38,7 +38,7 @@ cry_enc (Cry *s, const uint8_t *pt, size_t pt_len, const uint8_t *ad,
   nonce[10] = (uint8_t)(cnt >> 8);
   nonce[11] = (uint8_t)(cnt);
   crypto_aead_chacha20poly1305_ietf_encrypt_detached (
-    ct, mac, NULL, pt, pt_len, ad, ad_len, NULL, nonce, s->key);
+      ct, mac, NULL, pt, pt_len, ad, ad_len, NULL, nonce, s->key);
 }
 
 int
@@ -47,6 +47,6 @@ cry_dec (Cry *s, const uint8_t *ct, size_t ct_len, const uint8_t *ad,
          const uint8_t mac[16], uint8_t *pt)
 {
   int rc = crypto_aead_chacha20poly1305_ietf_decrypt_detached (
-    pt, NULL, ct, ct_len, mac, ad, ad_len, nonce, s->key);
+      pt, NULL, ct, ct_len, mac, ad, ad_len, nonce, s->key);
   return (rc == 0) ? 0 : -1;
 }

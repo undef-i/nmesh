@@ -456,11 +456,10 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
 {
   if (!dst_ip)
     return 1500;
-  int is_v4m
-      = (dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0 && dst_ip[3] == 0
-         && dst_ip[4] == 0 && dst_ip[5] == 0 && dst_ip[6] == 0
-         && dst_ip[7] == 0 && dst_ip[8] == 0 && dst_ip[9] == 0
-         && dst_ip[10] == 0xff && dst_ip[11] == 0xff);
+  int is_v4m = (dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0
+                && dst_ip[3] == 0 && dst_ip[4] == 0 && dst_ip[5] == 0
+                && dst_ip[6] == 0 && dst_ip[7] == 0 && dst_ip[8] == 0
+                && dst_ip[9] == 0 && dst_ip[10] == 0xff && dst_ip[11] == 0xff);
   if (is_v4m)
     {
       int fd4 = socket (AF_INET, SOCK_DGRAM, 0);
