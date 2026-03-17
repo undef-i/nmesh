@@ -631,7 +631,8 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
               break;
             }
         }
-      bool is_new_poison = (adv_m >= RT_M_INF) && (!se || se->fwd_m < RT_M_INF);
+      bool is_new_poison
+          = (adv_m >= RT_M_INF) && (!se || se->fwd_m < RT_M_INF);
 
       if (!feasible && !is_new_poison)
         {

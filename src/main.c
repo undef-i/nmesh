@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <linux/virtio_net.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sched.h>
@@ -22,6 +23,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,7 +36,8 @@
 #define ID_CFG 5
 #define GSP_INTV 4
 #define UPD_TK 4
-#define TAP_F_MAX 16384
+#define TAP_F_MAX 65550
+#define VNET_HL 10
 #define PEER_FLS_TK 5
 #define KA_TMO 25000ULL
 #define RX_RP_MAX 512
@@ -154,30 +157,44 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
   uint8_t sid[4];
   nonce_sid_rd (nonce, sid);
   uint64_t cnt = nonce_cnt_rd (nonce);
+
+  static int l_idx = 0;
   RxRp *slot = NULL;
-  RxRp *same_ep = NULL;
-  for (size_t i = 0; i < RX_RP_MAX; i++)
+
+  if (g_rx_rp[l_idx].is_act && g_rx_rp[l_idx].port == port
+      && memcmp (g_rx_rp[l_idx].ip, ip, 16) == 0
+      && memcmp (g_rx_rp[l_idx].sid, sid, sizeof (sid)) == 0)
     {
-      if (!g_rx_rp[i].is_act)
-        {
-          if (!slot)
-            slot = &g_rx_rp[i];
-          continue;
-        }
-      if (memcmp (g_rx_rp[i].ip, ip, 16) != 0 || g_rx_rp[i].port != port)
-        continue;
-      if (memcmp (g_rx_rp[i].sid, sid, sizeof (sid)) == 0)
-        {
-          slot = &g_rx_rp[i];
-          break;
-        }
-      if (!same_ep)
-        same_ep = &g_rx_rp[i];
+      slot = &g_rx_rp[l_idx];
     }
-  if (!slot)
-    slot = same_ep;
-  if (!slot)
-    return false;
+  else
+    {
+      RxRp *same_ep = NULL;
+      for (size_t i = 0; i < RX_RP_MAX; i++)
+        {
+          if (!g_rx_rp[i].is_act)
+            {
+              if (!slot)
+                slot = &g_rx_rp[i];
+              continue;
+            }
+          if (memcmp (g_rx_rp[i].ip, ip, 16) != 0 || g_rx_rp[i].port != port)
+            continue;
+          if (memcmp (g_rx_rp[i].sid, sid, sizeof (sid)) == 0)
+            {
+              slot = &g_rx_rp[i];
+              break;
+            }
+          if (!same_ep)
+            same_ep = &g_rx_rp[i];
+        }
+      if (!slot)
+        slot = same_ep;
+      if (!slot)
+        return false;
+      l_idx = (int)(slot - g_rx_rp);
+    }
+
   if (!slot->is_act)
     {
       slot->is_act = true;
@@ -694,14 +711,17 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
 
 static bool
 rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-             const uint8_t dest_lla[16], const uint8_t *frame,
-             size_t frame_len, uint8_t hop_c, uint64_t ts,
-             const uint8_t s_ip[16], uint16_t s_port)
+             const uint8_t dest_lla[16], const uint8_t *vnet_frame,
+             size_t vnet_len, uint8_t hop_c, uint64_t ts,
+             const uint8_t src_ip[16], uint16_t src_port)
 {
-  if (!udp || !cry_ctx || !rt || !cfg || !dest_lla || !frame)
+  if (!udp || !cry_ctx || !rt || !cfg || !dest_lla || !vnet_frame)
     return false;
-  if (frame_len < ETH_HLEN || frame_len > TAP_F_MAX || frame_len > UINT16_MAX)
+  if (vnet_len < VNET_HL + ETH_HLEN || vnet_len > TAP_F_MAX
+      || vnet_len > UINT16_MAX)
     return false;
+  const uint8_t *frame = vnet_frame + VNET_HL;
+  size_t frame_len = vnet_len - VNET_HL;
   if (hop_c == 0)
     return false;
   RtDec dec;
@@ -709,7 +729,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   uint16_t tx_port = 0;
   if (!rt_nh_get (rt, cfg, dest_lla, &dec, tx_ip, &tx_port))
     return false;
-  if (s_ip && memcmp (tx_ip, s_ip, 16) == 0 && tx_port == s_port)
+  if (src_ip && memcmp (tx_ip, src_ip, 16) == 0 && tx_port == src_port)
     return false;
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
@@ -766,11 +786,11 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   && is_tcp_syn (frame_pkt + l3_off, frame_len - l3_off);
       }
   }
-  if (!is_tiny && ((size_t)frame_len + (size_t)tnl_oh) <= (size_t)pmtu)
+  if (!is_tiny && ((size_t)vnet_len + (size_t)tnl_oh) <= (size_t)pmtu)
     {
       size_t out_len = 0;
-      uint8_t *out_ptr
-          = data_bld_zc (cry_ctx, frame_pkt, frame_len, 1, hop_c, &out_len);
+      uint8_t *out_ptr = data_bld_zc (cry_ctx, (uint8_t *)vnet_frame, vnet_len,
+                                      1, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
@@ -789,19 +809,26 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       uint8_t dst_tail[4];
       memcpy (dst_tail, dest_lla + 12, 4);
       size_t off = 0;
-      while (off < frame_len)
+      while (off < vnet_len)
         {
-          size_t chunk_len = frame_len - off;
+          size_t chunk_len = vnet_len - off;
           if (chunk_len > chunk_max)
             chunk_len = chunk_max;
           uint8_t *chunk_dst
               = rel_p_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
-          memcpy (chunk_dst, frame_pkt + off, chunk_len);
+          memcpy (chunk_dst, vnet_frame + off, chunk_len);
           size_t out_len = 0;
-          bool mf = (off + chunk_len) < frame_len;
+          bool mf = (off + chunk_len) < vnet_len;
+          if (off > 0x7fffU)
+            break;
           uint8_t *out_ptr
               = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, (uint16_t)off,
                              mf, 1, dst_tail, hop_c, &out_len);
+          if (!out_ptr || out_len == 0)
+            {
+              off += chunk_len;
+              continue;
+            }
           udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
           rt_tx_ack (rt, tx_ip, tx_port, ts);
           g_tx_ts = ts;
@@ -870,9 +897,16 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       size_t out_len = 0;
       bool is_last_sub = (sub_off + sub_len) == chunk_len;
       bool mf_out = mf_in || !is_last_sub;
-      uint8_t *out_ptr
-          = frag_bld_zc (cry_ctx, chunk_dst_base, sub_len, mid, (uint16_t)abs_off,
-                         mf_out, 1, dst_tail, hop_c, &out_len);
+      if (abs_off > 0x7fffU)
+        break;
+      uint8_t *out_ptr = frag_bld_zc (cry_ctx, chunk_dst_base, sub_len, mid,
+                                      (uint16_t)abs_off, mf_out, 1, dst_tail,
+                                      hop_c, &out_len);
+      if (!out_ptr || out_len == 0)
+        {
+          sub_off += sub_len;
+          continue;
+        }
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
@@ -902,10 +936,12 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     RtDec dec;
     uint64_t val_ts;
     bool is_val;
-  } fast_path[16];
+  } fast_path[256];
 
-  static uint8_t frame_bufs[BATCH_MAX][TAP_F_MAX + TAP_HR + TAP_TR] __attribute__ ((aligned (32)));
-  static uint8_t frag_bufs[BATCH_MAX][UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
+  static uint8_t frame_bufs[BATCH_MAX][TAP_F_MAX + TAP_HR + TAP_TR]
+      __attribute__ ((aligned (32)));
+  static uint8_t frag_bufs[BATCH_MAX][UDP_PL_MAX + TAP_HR]
+      __attribute__ ((aligned (32)));
   static UdpMsg batch_arr[BATCH_MAX];
   int bc = 0;
   for (int i = 0; i < BATCH_MAX; i++)
@@ -920,25 +956,33 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             break;
           break;
         }
+      if (n <= VNET_HL)
+        continue;
+      uint8_t *vnet_frame = pl_ptr;
+      size_t vnet_len = (size_t)n;
+      uint8_t *frame_pkt = vnet_frame + VNET_HL;
+      size_t frame_len = vnet_len - VNET_HL;
       FRes result;
-      tap_f_proc (pl_ptr, (size_t)n, cfg->addr, &result);
+      tap_f_proc (frame_pkt, frame_len, cfg->addr, &result);
       if (result.res_type == FRAME_NS_INT)
         {
-          if (write (tap_fd, result.na_frame, result.na_len) < 0)
+          uint8_t z_vnet[VNET_HL] = { 0 };
+          struct iovec iov[2]
+              = { { .iov_base = z_vnet, .iov_len = VNET_HL },
+                  { .iov_base = result.na_frame, .iov_len = result.na_len } };
+          if (writev (tap_fd, iov, 2) < 0)
             {
             }
           continue;
         }
       if (result.res_type != FRAME_V6_DAT)
         continue;
-      uint8_t *frame_pkt = pl_ptr + result.pl_start;
-      size_t frame_len = result.payload_len;
-      const uint8_t *dst_mac = pl_ptr;
+      const uint8_t *dst_mac = frame_pkt;
       if ((dst_mac[0] & 0x01U) != 0U)
         {
           size_t out_len;
           uint8_t *out_ptr
-              = data_bld_zc (cry_ctx, frame_pkt, frame_len, 0, 32, &out_len);
+              = data_bld_zc (cry_ctx, vnet_frame, vnet_len, 0, 32, &out_len);
           static const uint8_t z_lla[16] = { 0 };
           uint8_t uniq_lla[256][16];
           int u_cnt = 0;
@@ -1047,7 +1091,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           continue;
         }
       uint8_t rt_key[16];
-      if (!rt_key_get (rt, pl_ptr, cfg->addr, rt_key))
+      if (!rt_key_get (rt, frame_pkt, cfg->addr, rt_key))
         {
           if (now - l_nh_ts >= 2000ULL)
             {
@@ -1062,7 +1106,8 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
       RtDec dec;
       memset (&dec, 0, sizeof (dec));
-      int fp_idx = (int)(rt_key[15] & 0x0f);
+      int fp_idx
+          = (int)((rt_key[12] ^ rt_key[13] ^ rt_key[14] ^ rt_key[15]) & 0xff);
       if (fast_path[fp_idx].is_val && now <= fast_path[fp_idx].val_ts
           && memcmp (fast_path[fp_idx].dest_lla, rt_key, 16) == 0)
         {
@@ -1188,10 +1233,10 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       }
       if (!is_tiny
           && __builtin_expect (
-              ((size_t)frame_len + (size_t)tnl_oh) <= (size_t)pmtu, 1))
+              ((size_t)vnet_len + (size_t)tnl_oh) <= (size_t)pmtu, 1))
         {
           size_t out_len;
-          uint8_t *out_ptr = data_bld_zc (cry_ctx, frame_pkt, frame_len, rel_f,
+          uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f,
                                           32, &out_len);
           if (bc >= BATCH_MAX)
             {
@@ -1225,7 +1270,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           if (chunk_max == 0)
             continue;
           uint32_t n_frags
-              = (uint32_t)((frame_len + chunk_max - 1) / chunk_max);
+              = (uint32_t)((vnet_len + chunk_max - 1) / chunk_max);
           if (n_frags == 0)
             n_frags = 1;
           uint32_t msg_id = g_frag_mid++;
@@ -1235,7 +1280,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           if (rel_f != 0 && rel_dst_lla != NULL)
             memcpy (rel_dst_tail, rel_dst_lla + 12, 4);
           size_t off = 0;
-          while (off < frame_len)
+          while (off < vnet_len)
             {
               bool is_dup_tx = (n_frags > 1) && ((u32_rnd () % n_frags) != 0);
               int need = is_dup_tx ? 2 : 1;
@@ -1252,19 +1297,21 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   if (tx_rc < fl_bc || udp_w_want (udp))
                     break;
                 }
-              size_t chunk_len = frame_len - off;
+              size_t chunk_len = vnet_len - off;
               if (chunk_len > chunk_max)
                 chunk_len = chunk_max;
               uint8_t *chunk_dst1 = frag_bufs[bc] + TAP_HR + PKT_HDR_SZ
                                     + sizeof (FragHdr)
                                     + ((rel_f != 0) ? 4U : 0U);
-              memcpy (chunk_dst1, frame_pkt + off, chunk_len);
+              memcpy (chunk_dst1, vnet_frame + off, chunk_len);
+              if (off > 0x7fffU)
+                break;
               size_t out_len = 0;
-              bool mf = (off + chunk_len) < frame_len;
+              bool mf = (off + chunk_len) < vnet_len;
               uint8_t *out_ptr = frag_bld_zc (
                   cry_ctx, chunk_dst1, chunk_len, msg_id, (uint16_t)off, mf,
                   rel_f, (rel_f != 0) ? rel_dst_tail : NULL, 32, &out_len);
-              if (!out_ptr)
+              if (!out_ptr || out_len == 0)
                 {
                   off += chunk_len;
                   continue;
@@ -1279,13 +1326,13 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   uint8_t *chunk_dst2 = frag_bufs[bc] + TAP_HR + PKT_HDR_SZ
                                         + sizeof (FragHdr)
                                         + ((rel_f != 0) ? 4U : 0U);
-                  memcpy (chunk_dst2, frame_pkt + off, chunk_len);
+                  memcpy (chunk_dst2, vnet_frame + off, chunk_len);
                   size_t out_len2 = 0;
                   uint8_t *out_ptr2 = frag_bld_zc (
                       cry_ctx, chunk_dst2, chunk_len, msg_id, (uint16_t)off,
                       mf, rel_f, (rel_f != 0) ? rel_dst_tail : NULL, 32,
                       &out_len2);
-                  if (!out_ptr2)
+                  if (!out_ptr2 || out_len2 == 0)
                     {
                       rt_tx_ack (rt, tx_ip, tx_port, now);
                       g_tx_ts = now;
@@ -1337,6 +1384,149 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     }
 }
 
+#define GRO_MAX_SZ 65535
+#define GRO_SLOTS 16
+typedef struct
+{
+  uint8_t buf[GRO_MAX_SZ + 256];
+  size_t len;
+  uint32_t saddr[4];
+  uint16_t sport;
+  uint16_t dport;
+  uint32_t nxt_seq;
+  uint16_t mss;
+  uint8_t mac_hl;
+  uint8_t ip_hl;
+  uint8_t tcp_hl;
+  bool act;
+} GroSt;
+
+static GroSt g_gro[GRO_SLOTS];
+
+static void
+gro_fls (int tap_fd, GroSt *gro)
+{
+  if (!gro->act)
+    return;
+
+  uint16_t l3_plen = gro->len - gro->mac_hl - gro->ip_hl;
+  uint8_t *ip6 = gro->buf + gro->mac_hl;
+  ip6[4] = (l3_plen >> 8) & 0xff;
+  ip6[5] = l3_plen & 0xff;
+
+  uint32_t sum = 0;
+  for (int i = 0; i < 32; i += 2)
+    {
+      uint16_t word;
+      memcpy (&word, ip6 + 8 + i, 2);
+      sum += word;
+    }
+  sum += htons (6);
+  sum += htons (l3_plen);
+  while (sum >> 16)
+    sum = (sum & 0xffff) + (sum >> 16);
+
+  uint16_t final_sum = ~sum;
+  uint8_t *tcp = ip6 + gro->ip_hl;
+  memcpy (tcp + 16, &final_sum, 2);
+
+  struct virtio_net_hdr vh = { 0 };
+  vh.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+  vh.gso_type = VIRTIO_NET_HDR_GSO_TCPV6;
+  vh.hdr_len = gro->mac_hl + gro->ip_hl + gro->tcp_hl;
+  vh.gso_size = gro->mss;
+  vh.csum_start = gro->mac_hl + gro->ip_hl;
+  vh.csum_offset = 16;
+
+  struct iovec iov[2] = { { &vh, sizeof (vh) }, { gro->buf, gro->len } };
+  writev (tap_fd, iov, 2);
+  gro->act = false;
+}
+
+static void
+gro_fls_all (int tap_fd)
+{
+  for (int i = 0; i < GRO_SLOTS; i++)
+    gro_fls (tap_fd, &g_gro[i]);
+}
+
+static void
+gro_fed (int tap_fd, const uint8_t *vnet_frm, size_t vnet_len)
+{
+  if (vnet_len < VNET_HL + 14 + 40 + 20)
+    goto bypass;
+  const uint8_t *frm = vnet_frm + VNET_HL;
+  size_t len = vnet_len - VNET_HL;
+
+  if (frm[12] != 0x86 || frm[13] != 0xdd)
+    goto bypass;
+  const uint8_t *ip6 = frm + 14;
+  if (ip6[6] != 6)
+    goto bypass;
+
+  const uint8_t *tcp = ip6 + 40;
+  uint8_t tcp_hl = (tcp[12] >> 4) * 4;
+  if (14 + 40 + (size_t)tcp_hl > len)
+    goto bypass;
+
+  size_t pl_len = len - 14 - 40 - tcp_hl;
+  if (pl_len == 0)
+    goto bypass;
+
+  uint32_t seq_net;
+  memcpy (&seq_net, tcp + 4, 4);
+  uint32_t seq = ntohl (seq_net);
+
+  uint16_t sp, dp;
+  memcpy (&sp, tcp + 0, 2);
+  memcpy (&dp, tcp + 2, 2);
+  bool psh = (tcp[13] & 0x08) != 0;
+
+  int slot_idx = (sp ^ dp ^ ip6[23]) % GRO_SLOTS;
+  GroSt *gro = &g_gro[slot_idx];
+
+  if (gro->act)
+    {
+      if (sp == gro->sport && dp == gro->dport
+          && memcmp (ip6 + 8, gro->saddr, 16) == 0 && seq == gro->nxt_seq
+          && gro->len + pl_len <= GRO_MAX_SZ)
+        {
+          memcpy (gro->buf + gro->len, tcp + tcp_hl, pl_len);
+          gro->len += pl_len;
+          gro->nxt_seq += pl_len;
+
+          uint8_t *g_tcp = gro->buf + gro->mac_hl + gro->ip_hl;
+          memcpy (g_tcp + 8, tcp + 8, 4);
+          memcpy (g_tcp + 14, tcp + 14, 2);
+          g_tcp[13] |= tcp[13];
+
+          if (psh)
+            gro_fls (tap_fd, gro);
+          return;
+        }
+      gro_fls (tap_fd, gro);
+    }
+
+  memcpy (gro->buf, frm, len);
+  gro->len = len;
+  memcpy (gro->saddr, ip6 + 8, 16);
+  gro->sport = sp;
+  gro->dport = dp;
+  gro->nxt_seq = seq + pl_len;
+  gro->mss = pl_len;
+  gro->mac_hl = 14;
+  gro->ip_hl = 40;
+  gro->tcp_hl = tcp_hl;
+  gro->act = true;
+  return;
+
+bypass:
+  gro_fls_all (tap_fd);
+  if (write (tap_fd, vnet_frm, vnet_len) < 0)
+    {
+    }
+}
+
 static void
 on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint64_t sid, PPool *pool)
@@ -1359,7 +1549,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (raw_len < PKT_HDR_SZ)
         continue;
       PktHdr hdr;
-      static uint8_t pt_store[TAP_HR + ETH_HLEN + UDP_PL_MAX] __attribute__ ((aligned (32)));
+      static uint8_t pt_store[TAP_HR + ETH_HLEN + UDP_PL_MAX]
+          __attribute__ ((aligned (32)));
       uint8_t *pt_buf = pt_store + TAP_HR + ETH_HLEN;
       uint8_t *pt;
       size_t pt_len;
@@ -1378,7 +1569,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             g_rx_ts = ts;
             if (hdr.rel_f != 0)
               {
-                if (pt_len < ETH_HLEN)
+                if (pt_len < VNET_HL + ETH_HLEN)
                   break;
                 if (hdr.hop_c <= 1)
                   {
@@ -1386,51 +1577,32 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                      "routing loop detected\n");
                     break;
                   }
-                const uint8_t *fwd_frame = pt;
-                size_t fwd_len = pt_len;
+                const uint8_t *vnet_frame = pt;
+                size_t vnet_len = pt_len;
+                if (vnet_len < VNET_HL + ETH_HLEN)
+                  break;
+                const uint8_t *fwd_frame = vnet_frame + VNET_HL;
                 uint8_t dest_lla[16] = { 0 };
                 if (!mesh_dst_lla_from_frame (fwd_frame, cfg->addr, dest_lla))
                   break;
                 if (memcmp (dest_lla, cfg->addr, 16) == 0)
                   {
-                    if (fwd_len < ETH_HLEN)
-                      break;
-                    if (write (tap_fd, fwd_frame, fwd_len) < 0)
-                      {
-                        if (!(errno == EAGAIN || errno == EWOULDBLOCK
-                              || errno == ENOBUFS))
-                          {
-                            fprintf (stderr,
-                                     "tap: write error, drop "
-                                     "packet len=%zu\n",
-                                     fwd_len);
-                          }
-                      }
+                    gro_fed (tap_fd, vnet_frame, vnet_len);
                   }
                 else
                   {
-                    rel_fwd_dat (udp, cry_ctx, rt, cfg, dest_lla, fwd_frame,
-                                 fwd_len, (uint8_t)(hdr.hop_c - 1), ts, src_ip,
-                                 src_port);
+                    rel_fwd_dat (udp, cry_ctx, rt, cfg, dest_lla, vnet_frame,
+                                 vnet_len, (uint8_t)(hdr.hop_c - 1), ts,
+                                 src_ip, src_port);
                   }
               }
             else
               {
-                const uint8_t *frame_ptr = pt;
-                size_t frame_len = pt_len;
-                if (frame_len < ETH_HLEN)
+                const uint8_t *vnet_frame = pt;
+                size_t vnet_len = pt_len;
+                if (vnet_len < VNET_HL + ETH_HLEN)
                   break;
-                if (write (tap_fd, frame_ptr, frame_len) < 0)
-                  {
-                    if (!(errno == EAGAIN || errno == EWOULDBLOCK
-                          || errno == ENOBUFS))
-                      {
-                        fprintf (stderr,
-                                 "tap: write error, drop packet "
-                                 "len=%zu\n",
-                                 frame_len);
-                      }
-                  }
+                gro_fed (tap_fd, vnet_frame, vnet_len);
               }
             break;
           }
@@ -1475,19 +1647,9 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 = frag_asm (msg_id, frag_off, mf, chunk, chunk_len, &full_len);
             if (!full_l3)
               break;
-            if (full_len < ETH_HLEN)
+            if (full_len < VNET_HL + ETH_HLEN)
               break;
-            if (write (tap_fd, full_l3, full_len) < 0)
-              {
-                if (!(errno == EAGAIN || errno == EWOULDBLOCK
-                      || errno == ENOBUFS))
-                  {
-                    fprintf (stderr,
-                             "tap: write error, drop reassembled "
-                             "packet len=%u\n",
-                             (unsigned)full_len);
-                  }
-              }
+            gro_fed (tap_fd, full_l3, full_len);
             break;
           }
         case PT_MTU_PRB:
@@ -1604,6 +1766,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           }
         }
     }
+
+  gro_fls_all (tap_fd);
 }
 
 static void
@@ -1870,7 +2034,6 @@ main (int argc, char **argv)
       return 1;
     }
   tap_addr_set (cfg.ifname, cfg.addr);
-  tap_mtu_set (cfg.ifname, cfg.mtu);
   printf ("main: tap device %s created.\n", cfg.ifname);
   static Udp udp;
   uint16_t act_port = cfg.port;

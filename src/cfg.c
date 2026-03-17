@@ -1,9 +1,9 @@
 #include "cfg.h"
-#include <sodium.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

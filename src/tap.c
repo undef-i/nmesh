@@ -23,6 +23,7 @@
 #endif
 #define IFF_TAP 0x0002
 #define IFF_NO_PI 0x1000
+#define IFF_VNET_HDR 0x4000
 #define TAP_TXQ_LEN 10000
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86ddU
@@ -83,12 +84,22 @@ tap_init (const char *name)
   struct ifreq ifr;
   memset (&ifr, 0, sizeof (ifr));
   strncpy (ifr.ifr_name, name, IFNAMSIZ - 1);
-  ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+  ifr.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
   if (ioctl (fd, TUNSETIFF, &ifr) < 0)
     {
       close (fd);
       return -1;
     }
+  {
+    int vnet_hdr_sz = 10;
+    if (ioctl (fd, TUNSETVNETHDRSZ, &vnet_hdr_sz) < 0)
+      {
+      }
+    int offload = TUN_F_CSUM;
+    if (ioctl (fd, TUNSETOFFLOAD, offload) < 0)
+      {
+      }
+  }
   tap_txq_set (name);
   int sock = socket (AF_INET, SOCK_DGRAM, 0);
   if (sock >= 0)
