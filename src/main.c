@@ -910,6 +910,8 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   int bc = 0;
   for (int i = 0; i < BATCH_MAX; i++)
     {
+      if (udp_w_want (udp))
+        break;
       uint8_t *pl_ptr = frame_bufs[i] + TAP_HR;
       ssize_t n = read (tap_fd, pl_ptr, TAP_F_MAX);
       if (n <= 0)
@@ -1022,13 +1024,17 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             {
               if (bc >= BATCH_MAX)
                 {
-                  if (udp_tx_arr (udp, batch_arr, bc) < 0)
+                  int fl_bc = bc;
+                  int tx_rc = udp_tx_arr (udp, batch_arr, bc);
+                  if (tx_rc < 0)
                     {
                       fprintf (stderr, "udp: batch send "
                                        "failed before enqueue "
                                        "multicast\n");
                     }
                   bc = 0;
+                  if (tx_rc < fl_bc || udp_w_want (udp))
+                    break;
                 }
               memcpy (batch_arr[bc].dst_ip, ep_arr[re].ip, 16);
               batch_arr[bc].dst_port = ep_arr[re].port;
@@ -1189,12 +1195,16 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                           32, &out_len);
           if (bc >= BATCH_MAX)
             {
-              if (udp_tx_arr (udp, batch_arr, bc) < 0)
+              int fl_bc = bc;
+              int tx_rc = udp_tx_arr (udp, batch_arr, bc);
+              if (tx_rc < 0)
                 {
                   fprintf (stderr, "udp: batch send failed before "
                                    "enqueue data\n");
                 }
               bc = 0;
+              if (tx_rc < fl_bc || udp_w_want (udp))
+                break;
             }
           memcpy (batch_arr[bc].dst_ip, tx_ip, 16);
           batch_arr[bc].dst_port = tx_port;
@@ -1231,12 +1241,16 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               int need = is_dup_tx ? 2 : 1;
               if (bc + need > BATCH_MAX)
                 {
-                  if (udp_tx_arr (udp, batch_arr, bc) < 0)
+                  int fl_bc = bc;
+                  int tx_rc = udp_tx_arr (udp, batch_arr, bc);
+                  if (tx_rc < 0)
                     {
                       fprintf (stderr, "udp: batch send failed "
                                        "during frag flush\n");
                     }
                   bc = 0;
+                  if (tx_rc < fl_bc || udp_w_want (udp))
+                    break;
                 }
               size_t chunk_len = frame_len - off;
               if (chunk_len > chunk_max)
@@ -1298,20 +1312,28 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
       if (bc >= BATCH_MAX - 2)
         {
-          if (udp_tx_arr (udp, batch_arr, bc) < 0)
+          int fl_bc = bc;
+          int tx_rc = udp_tx_arr (udp, batch_arr, bc);
+          if (tx_rc < 0)
             {
               fprintf (stderr, "udp: batch send failed during "
                                "near-full flush\n");
             }
           bc = 0;
+          if (tx_rc < fl_bc || udp_w_want (udp))
+            break;
         }
     }
   if (bc > 0)
     {
-      if (udp_tx_arr (udp, batch_arr, bc) < 0)
+      int fl_bc = bc;
+      int tx_rc = udp_tx_arr (udp, batch_arr, bc);
+      if (tx_rc < 0)
         {
           fprintf (stderr, "udp: batch send failed during final flush\n");
         }
+      if (tx_rc < fl_bc || udp_w_want (udp))
+        return;
     }
 }
 
