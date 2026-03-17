@@ -1,4 +1,4 @@
-#include "cfg.h"
+#include "config.h"
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
