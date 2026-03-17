@@ -1,4 +1,4 @@
-#include "cry.h"
+#include "crypto.h"
 #include <sodium.h>
 #include <string.h>
 

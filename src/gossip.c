@@ -1,5 +1,5 @@
-#include "gsp.h"
-#include "pkt.h"
+#include "gossip.h"
+#include "packet.h"
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdint.h>
