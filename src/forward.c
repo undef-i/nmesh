@@ -1,11 +1,11 @@
 #include "forward.h"
-#include "utils.h"
 #include "frag.h"
-#include "mss.h"
 #include "gossip.h"
+#include "mss.h"
 #include "packet.h"
-#include <string.h>
+#include "utils.h"
 #include <linux/if_ether.h>
+#include <string.h>
 
 static uint16_t
 ep_mtu_get (const Rt *rt, const uint8_t ip[16], uint16_t port)
