@@ -271,7 +271,7 @@ void on_tap(int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t
     if (result.res_type == FRAME_NS_INT) {
       uint8_t z_vnet[VNET_HL] = { 0 };
       struct iovec iov[2] = { { .iov_base = z_vnet, .iov_len = VNET_HL }, { .iov_base = result.na_frame, .iov_len = result.na_len } };
-      if (writev(tap_fd, iov, 2) < 0) {}
+      if (writev(tap_fd, iov, 2) < 0) { perror("loop: writev(tap) failed"); }
       continue;
     }
     if (result.res_type != FRAME_V6_DAT) continue;
@@ -735,7 +735,7 @@ void on_udp(int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t
 
 void on_tmr(int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, int *gsp_off, const char *peers_path, uint16_t act_port, uint64_t sid, PPool *pool) {
   uint8_t exp_buf[8];
-  if (read(timer_fd, exp_buf, sizeof(exp_buf)) < 0) {}
+  if (read(timer_fd, exp_buf, sizeof(exp_buf)) < 0) { perror("loop: read(timer_fd) failed"); }
   (void)peers_path;
   uint64_t ts = sys_ts();
   rt_mtu_tk(rt, ts);

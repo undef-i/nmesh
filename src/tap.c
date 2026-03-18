@@ -49,7 +49,10 @@ tap_txq_set (const char *name)
   memset (&q, 0, sizeof (q));
   strncpy (q.ifr_name, name, IFNAMSIZ - 1);
   q.ifr_qlen = TAP_TXQ_LEN;
-  ioctl (sock, SIOCSIFTXQLEN, &q);
+  if (ioctl (sock, SIOCSIFTXQLEN, &q) < 0)
+    {
+      perror ("tap: ioctl(SIOCSIFTXQLEN) failed");
+    }
   close (sock);
 }
 
@@ -68,10 +71,12 @@ tap_stl_rm (const char *name)
   snprintf (cmd, sizeof (cmd), "ip link set dev %s down", name);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to set link %s down\n", name);
     }
   snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to flush addresses for %s\n", name);
     }
 }
 
@@ -94,10 +99,12 @@ tap_init (const char *name)
     int vnet_hdr_sz = 10;
     if (ioctl (fd, TUNSETVNETHDRSZ, &vnet_hdr_sz) < 0)
       {
+        perror ("tap: ioctl(TUNSETVNETHDRSZ) failed");
       }
     int offload = TUN_F_CSUM;
     if (ioctl (fd, TUNSETOFFLOAD, offload) < 0)
       {
+        perror ("tap: ioctl(TUNSETOFFLOAD) failed");
       }
   }
   tap_txq_set (name);
@@ -107,9 +114,15 @@ tap_init (const char *name)
       struct ifreq grp;
       memset (&grp, 0, sizeof (grp));
       strncpy (grp.ifr_name, name, IFNAMSIZ - 1);
-      ioctl (sock, SIOCGIFFLAGS, &grp);
+      if (ioctl (sock, SIOCGIFFLAGS, &grp) < 0)
+        {
+          perror ("tap: ioctl(SIOCGIFFLAGS) failed");
+        }
       grp.ifr_flags |= (IFF_UP | IFF_MULTICAST);
-      ioctl (sock, SIOCSIFFLAGS, &grp);
+      if (ioctl (sock, SIOCSIFFLAGS, &grp) < 0)
+        {
+          perror ("tap: ioctl(SIOCSIFFLAGS) failed");
+        }
       close (sock);
     }
   {
@@ -117,6 +130,7 @@ tap_init (const char *name)
     snprintf (cmd, sizeof (cmd), "ip link set dev %s up", name);
     if (system (cmd) < 0)
       {
+        fprintf (stderr, "tap: system(ip link set up) failed\n");
       }
   }
   int flags = fcntl (fd, F_GETFL, 0);
@@ -144,23 +158,28 @@ tap_addr_set (const char *name, const uint8_t lla[16])
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to set address for %s\n", name);
     }
   snprintf (cmd, sizeof (cmd), "ip link set dev %s multicast on", name);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to set multicast for %s\n", name);
     }
   snprintf (cmd, sizeof (cmd), "ip link set dev %s addrgenmode none", name);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to set addrgenmode for %s\n", name);
     }
   snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to flush addresses for %s\n", name);
     }
   snprintf (cmd, sizeof (cmd), "ip -6 addr add %s dev %s scope link", addr_str,
             name);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: failed to add link-local address for %s\n", name);
     }
 }
 
@@ -176,6 +195,7 @@ tap_mtu_set (const char *name, uint16_t mtu)
             (unsigned)mtu);
   if (system (cmd) < 0)
     {
+      fprintf (stderr, "tap: system(ip link set mtu) failed\n");
     }
 }
 
