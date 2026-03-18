@@ -1,0 +1,59 @@
+#pragma once
+#include "route.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define TAP_F_MAX 65550
+#define VNET_HL 10
+#define EV_MAX 10
+#define ID_TAP 1
+#define ID_UDP 2
+#define ID_TMR 3
+#define ID_STD 4
+#define ID_CFG 5
+#define GSP_INTV 4
+#define UPD_TK 4
+#define PEER_FLS_TK 5
+#define KA_TMO 25000ULL
+
+extern uint64_t g_tx_ts;
+extern uint64_t g_rx_ts;
+extern uint32_t g_frag_mid;
+extern uint32_t g_rnd_st;
+extern Rt *g_rt;
+
+uint64_t sys_ts(void);
+uint32_t u32_rnd(void);
+bool rt_gw_fnd(const Rt *rt, const uint8_t our_lla[16], uint8_t out_ip[16], uint16_t *out_port);
+
+static inline uint32_t re_m(const Re *re) {
+  if (re->lat > 0 && re->lat < RTT_UNK) return re->lat;
+  if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK) return re->sm_m;
+  if (re->rt_m > 0 && re->rt_m < RT_M_INF && re->rt_m != RTT_UNK) return re->rt_m;
+  return RT_M_INF;
+}
+
+static inline bool is_ip_v4m(const uint8_t ip[16]) {
+  if (!ip) return false;
+  return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 && ip[4] == 0
+         && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 && ip[8] == 0 && ip[9] == 0
+         && ip[10] == 0xff && ip[11] == 0xff;
+}
+
+static inline bool is_tcp_syn(const uint8_t *l3, size_t l3_len) {
+  if (!l3 || l3_len < 20) return false;
+  uint8_t v = (uint8_t)((l3[0] >> 4) & 0x0f);
+  if (v == 4) {
+    uint8_t ihl = (uint8_t)((l3[0] & 0x0f) * 4);
+    if (ihl < 20 || ((size_t)ihl + 20U) > l3_len) return false;
+    if (l3[9] != 6) return false;
+    return (l3[ihl + 13] & 0x02U) != 0;
+  }
+  if (v == 6) {
+    if (l3_len < 60) return false;
+    if (l3[6] != 6) return false;
+    return (l3[40 + 13] & 0x02U) != 0;
+  }
+  return false;
+}
