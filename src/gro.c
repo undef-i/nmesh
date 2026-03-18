@@ -1,10 +1,10 @@
 #include "gro.h"
 #include "utils.h"
-#include <string.h>
-#include <unistd.h>
-#include <sys/uio.h>
 #include <arpa/inet.h>
 #include <linux/virtio_net.h>
+#include <string.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #define GRO_MAX_SZ 65535
 #define GRO_SLOTS 16

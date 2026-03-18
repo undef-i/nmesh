@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -17,6 +18,7 @@
 #include <linux/errqueue.h>
 #include <linux/udp.h>
 #endif
+
 static UdpEmsgsizeCallback g_emsg_cb = NULL;
 static UdpUnreachCallback g_unr_cb = NULL;
 
@@ -95,7 +97,6 @@ udp_pend_fls (Udp *s)
               s->pend_cnt--;
               continue;
             }
-          fprintf (stderr, "udp: sendto pending drop errno=%d\n", errno);
           s->pend_head = (s->pend_head + 1) % UDP_PND_MAX;
           s->pend_cnt--;
           continue;
@@ -123,7 +124,6 @@ udp_init (Udp *s, uint16_t *port)
     {
       if (write (fd, v16m, strlen (v16m)) < 0)
         {
-          perror ("udp: failed to set rmem_max");
         }
       close (fd);
     }
@@ -131,7 +131,6 @@ udp_init (Udp *s, uint16_t *port)
     {
       if (write (fd, v16m, strlen (v16m)) < 0)
         {
-          perror ("udp: failed to set wmem_max");
         }
       close (fd);
     }
@@ -447,12 +446,39 @@ udp_w_hnd (Udp *s)
 uint16_t
 udp_mtu_get (const Udp *s)
 {
-  static const uint8_t v6_pub_dns[16]
-      = { 0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88 };
-  if (!s || s->fd < 0)
+  (void)s;
+  struct ifaddrs *ifaddr, *ifa;
+  if (getifaddrs (&ifaddr) != 0)
     return 1500;
-  return udp_ep_mtu_get (v6_pub_dns);
+  int max_mtu = 1280;
+  int fd = socket (AF_INET, SOCK_DGRAM, 0);
+  if (fd >= 0)
+    {
+      for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+        {
+          if (!ifa->ifa_addr)
+            continue;
+          if ((ifa->ifa_flags & IFF_UP) == 0)
+            continue;
+          if ((ifa->ifa_flags & IFF_LOOPBACK) != 0)
+            continue;
+          if (ifa->ifa_addr->sa_family == AF_INET
+              || ifa->ifa_addr->sa_family == AF_INET6)
+            {
+              struct ifreq ifr;
+              memset (&ifr, 0, sizeof (ifr));
+              strncpy (ifr.ifr_name, ifa->ifa_name, IFNAMSIZ - 1);
+              if (ioctl (fd, SIOCGIFMTU, &ifr) == 0)
+                {
+                  if (ifr.ifr_mtu > max_mtu)
+                    max_mtu = ifr.ifr_mtu;
+                }
+            }
+        }
+      close (fd);
+    }
+  freeifaddrs (ifaddr);
+  return (uint16_t)max_mtu;
 }
 
 uint16_t
