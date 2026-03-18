@@ -114,6 +114,7 @@ udp_init (Udp *s, uint16_t *port)
   s->fd = socket (AF_INET6, SOCK_DGRAM, 0);
   if (s->fd < 0)
     return -1;
+  /*
   const char *rmem = "/proc/sys/net/core/rmem_max";
   const char *wmem = "/proc/sys/net/core/wmem_max";
   const char *v16m = "16777216\n";
@@ -122,6 +123,7 @@ udp_init (Udp *s, uint16_t *port)
     {
       if (write (fd, v16m, strlen (v16m)) < 0)
         {
+          perror ("udp: failed to set rmem_max");
         }
       close (fd);
     }
@@ -129,9 +131,11 @@ udp_init (Udp *s, uint16_t *port)
     {
       if (write (fd, v16m, strlen (v16m)) < 0)
         {
+          perror ("udp: failed to set wmem_max");
         }
       close (fd);
     }
+  */
   int rx_buf = 8388608;
   int sndbuf = 8388608;
   if (setsockopt (s->fd, SOL_SOCKET, SO_RCVBUF, &rx_buf, sizeof (rx_buf)) < 0)

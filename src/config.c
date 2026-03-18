@@ -231,25 +231,21 @@ static int
 psk_prs (const char *s, uint8_t out[32])
 {
   size_t s_len = strlen (s);
+  if (s_len == 0)
+    return -1;
   if (s_len == 64)
     {
-      int is_hex = 1;
       for (int idx = 0; idx < 32; idx++)
         {
           int h_nib = char_to_hex (s[idx * 2]);
           int l_nib = char_to_hex (s[idx * 2 + 1]);
           if (h_nib < 0 || l_nib < 0)
-            {
-              is_hex = 0;
-              break;
-            }
+            return -1;
           out[idx] = (uint8_t)(h_nib * 16 + l_nib);
         }
-      if (is_hex)
-        return 0;
+      return 0;
     }
-  crypto_generichash (out, 32, (const uint8_t *)s, s_len, NULL, 0);
-  return 0;
+  return crypto_generichash (out, 32, (const uint8_t *)s, s_len, NULL, 0);
 }
 
 int
