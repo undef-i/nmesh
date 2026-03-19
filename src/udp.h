@@ -42,7 +42,6 @@ int udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
                 uint16_t src_ports[], size_t len_arr[], int m_cnt);
 int udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,
             const uint8_t *data, size_t data_len);
-bool udp_gso_set (Udp *s, uint16_t seg_sz);
 void udp_emsg_cb_set (UdpEmsgsizeCallback cb);
 void udp_unr_cb_set (UdpUnreachCallback cb);
 bool udp_w_want (const Udp *s);

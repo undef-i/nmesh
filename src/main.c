@@ -136,10 +136,6 @@ main (int argc, char **argv)
   udp_emsg_cb_set (on_udp_emsg);
   udp_unr_cb_set (on_udp_unr);
   printf ("main: udp bound to port %u\n", act_port);
-  if (udp_gso_set (&udp, 1200))
-    {
-      printf ("main: udp gso reserve enabled (segment=1200)\n");
-    }
   {
     uint16_t hw_mtu = udp_mtu_get (&udp);
     rt_pmtu_ub_set (&rt, hw_mtu);
