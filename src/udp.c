@@ -402,21 +402,6 @@ udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,
   return udp_tx_arr (s, &msg, 1);
 }
 
-bool
-udp_gso_set (Udp *s, uint16_t seg_sz)
-{
-#if defined(__linux__) && defined(UDP_SEGMENT)
-  if (setsockopt (s->fd, IPPROTO_UDP, UDP_SEGMENT, &seg_sz, sizeof (seg_sz))
-      == 0)
-    return true;
-  return false;
-#else
-  (void)s;
-  (void)seg_sz;
-  return false;
-#endif
-}
-
 void
 udp_emsg_cb_set (UdpEmsgsizeCallback cb)
 {
