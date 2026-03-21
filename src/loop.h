@@ -23,3 +23,4 @@ void on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool);
 void tty_raw (void);
 void cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
                        const char *cfg_path, uint64_t ts);
+void gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg);

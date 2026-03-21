@@ -642,6 +642,8 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
       trg_mark (t, ne.lla);
+      if (!is_rel && IS_LLA_VAL (ne.lla) && ne.is_act && ne.state == RT_ACT)
+        rt_gsp_dirty_set (t);
     }
 }
 
@@ -724,6 +726,16 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
       t->re_arr[i].lat = rtt_ms;
       re_rx_ack (&t->re_arr[i], sys_ts);
       t->re_arr[i].ver = sys_ts;
+      
+      if (t->re_arr[i].sm_m > 0 && t->re_arr[i].sm_m < RT_M_INF && t->re_arr[i].rttvar > 0)
+        {
+          uint32_t diff = (rtt_ms > t->re_arr[i].sm_m) ? 
+                          (rtt_ms - t->re_arr[i].sm_m) : 
+                          (t->re_arr[i].sm_m - rtt_ms);
+          if (diff > (t->re_arr[i].rttvar << 2))
+            rt_gsp_dirty_set (t);
+        }
+
       re_rto_upd (&t->re_arr[i], rtt_ms);
       if (t->re_arr[i].sm_m == 0 || t->re_arr[i].sm_m >= RT_M_INF)
         {
@@ -859,7 +871,10 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
       trg_mark (t, re->lla);
     }
   if (is_mod)
-    rt_map_mark (t);
+    {
+      rt_map_mark (t);
+      rt_gsp_dirty_set (t);
+    }
 }
 
 void
@@ -922,6 +937,13 @@ rt_dad_stl (Rt *t, uint64_t sys_ts, PPool *pool, const char *peers_path)
   (void)sys_ts;
   (void)pool;
   (void)peers_path;
+}
+
+void
+rt_gsp_dirty_set (Rt *t)
+{
+  if (t)
+    t->gsp_dirty = true;
 }
 
 RtDec
@@ -1488,6 +1510,7 @@ void
 rt_prn_st (Rt *t, uint64_t sys_ts)
 {
   uint32_t wr_idx = 0;
+  bool any_ded = false;
   for (uint32_t rd_idx = 0; rd_idx < t->cnt; rd_idx++)
     {
       Re *re = &t->re_arr[rd_idx];
@@ -1500,9 +1523,17 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
           uint64_t age = sys_ts - re->rx_ts;
           if (age > stl_ts && re->rx_bmp == 0)
             {
-              re->is_act = false;
-              re->state = RT_DED;
-              re->rt_m = RT_M_INF;
+              if (re->is_act || re->state != RT_DED)
+                {
+                  re->is_act = false;
+                  re->state = RT_DED;
+                  re->rt_m = RT_M_INF;
+                  any_ded = true;
+              else
+                {
+                  re->state = RT_DED;
+                  re->rt_m = RT_M_INF;
+                }
             }
           if (!re->is_static)
             {
@@ -1516,6 +1547,8 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
     }
   t->cnt = wr_idx;
   rt_map_mark (t);
+  if (any_ded)
+    rt_gsp_dirty_set (t);
 }
 
 void
