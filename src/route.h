@@ -135,15 +135,6 @@ typedef struct RtMap
   UT_hash_handle hh;
 } RtMap;
 
-typedef struct EpIdx
-{
-  uint8_t key[18];
-  uint8_t ep_ip[16];
-  uint16_t ep_port;
-  uint32_t b_dir_m;
-  UT_hash_handle hh;
-} EpIdx;
-
 typedef struct
 {
   uint8_t rt_id[16];
@@ -170,7 +161,6 @@ typedef struct
 typedef struct
 {
   RtMap *map;
-  EpIdx *dir_m_idx;
   Re *re_arr;
   uint32_t cnt;
   uint32_t cap;

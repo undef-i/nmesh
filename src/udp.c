@@ -25,13 +25,7 @@ static UdpUnreachCallback g_unr_cb = NULL;
 static void
 ip_to_v6m (const uint8_t ip[16], uint8_t out[16])
 {
-  int is_v4m
-      = (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 && ip[4] == 0
-         && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 && ip[8] == 0 && ip[9] == 0
-         && ip[10] == 0xff && ip[11] == 0xff);
   memcpy (out, ip, 16);
-  if (!is_v4m)
-    return;
 }
 
 static bool
