@@ -215,6 +215,7 @@ main (int argc, char **argv)
   fflush (stdout);
   on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, &gsp_off, cfg_path, act_port,
           sid, &pool);
+  rt_gsp_dirty_set (&rt);
   udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
   while (1)
     {
@@ -299,6 +300,8 @@ main (int argc, char **argv)
                 }
             }
         }
+      gsp_dirty_flush (&udp, &cry_ctx, &rt, &cfg);
+      udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
     }
   return 0;
 }

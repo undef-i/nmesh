@@ -83,9 +83,15 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   uint8_t tx_ip[16] = { 0 };
   uint16_t tx_port = 0;
   if (!rt_nh_get (rt, cfg, dest_lla, &dec, tx_ip, &tx_port))
-    return false;
+    {
+      rt_gsp_dirty_set (rt);
+      return false;
+    }
   if (src_ip && memcmp (tx_ip, src_ip, 16) == 0 && tx_port == src_port)
-    return false;
+    {
+      rt_gsp_dirty_set (rt);
+      return false;
+    }
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
     {
@@ -215,9 +221,15 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   uint8_t tx_ip[16] = { 0 };
   uint16_t tx_port = 0;
   if (!rt_nh_get (rt, cfg, dest_lla, &dec, tx_ip, &tx_port))
-    return false;
+    {
+      rt_gsp_dirty_set (rt);
+      return false;
+    }
   if (s_ip && memcmp (tx_ip, s_ip, 16) == 0 && tx_port == s_port)
-    return false;
+    {
+      rt_gsp_dirty_set (rt);
+      return false;
+    }
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
     {

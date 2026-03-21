@@ -995,6 +995,10 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 uint8_t seq_tgt[16] = { 0 };
                 on_gsp (pt, pt_len, src_ip, src_port, cfg->addr, rt, pool, ts,
                         &is_mod, &req_seq, seq_tgt);
+                if (is_mod)
+                  {
+                    rt_gsp_dirty_set (rt);
+                  }
                 if (req_seq)
                   {
                     static uint8_t req_buf[UDP_PL_MAX];
@@ -1038,6 +1042,58 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 }
 
 void
+gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
+{
+  if (!rt->gsp_dirty)
+    return;
+  if (cfg->p2p != P2P_EN)
+    {
+      rt->gsp_dirty = false;
+      return;
+    }
+  uint64_t now = sys_ts ();
+  if (rt->gsp_last_ts > 0 && now < rt->gsp_last_ts + 100ULL)
+    return;
+  static uint8_t g_buf[UDP_PL_MAX];
+  size_t gsp_len = 0;
+  gsp_bld (cry_ctx, rt->re_arr, (int)rt->cnt, 0, cfg->addr, g_buf, &gsp_len);
+  if (gsp_len == 0)
+    {
+      rt->gsp_dirty = false;
+      rt->gsp_last_ts = now;
+      return;
+    }
+  static UdpMsg batch_arr[BATCH_MAX];
+  int bc = 0;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (!re->is_act || re->state == RT_DED)
+        continue;
+      if (memcmp (re->lla, cfg->addr, 16) == 0)
+        continue;
+      if (re->ep_port == 0)
+        continue;
+      if (bc >= BATCH_MAX)
+        {
+          udp_tx_arr (udp, batch_arr, bc);
+          bc = 0;
+        }
+      memcpy (batch_arr[bc].dst_ip, re->ep_ip, 16);
+      batch_arr[bc].dst_port = re->ep_port;
+      batch_arr[bc].data = g_buf;
+      batch_arr[bc].data_len = gsp_len;
+      bc++;
+    }
+  if (bc > 0)
+    udp_tx_arr (udp, batch_arr, bc);
+  rt->gsp_dirty = false;
+  rt->gsp_last_ts = now;
+}
+
+void
 on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         int *gsp_off, const char *peers_path, uint16_t act_port, uint64_t sid,
         PPool *pool)
@@ -1051,6 +1107,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
     }
   (void)peers_path;
+  (void)gsp_off;
   uint64_t ts = sys_ts ();
   rt_mtu_tk (rt, ts);
   rt_loc_add (rt, cfg->addr, act_port, ts);
@@ -1086,24 +1143,6 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   if (is_idle)
     {
       keep_bld (cry_ctx, ka_buf, &ka_len);
-    }
-  bool is_gsp = ((tk_cnt % UPD_TK) == 0);
-  static uint8_t g_buf[UDP_PL_MAX];
-  size_t gsp_len = 0;
-  if (is_gsp)
-    {
-      gsp_bld (cry_ctx, rt->re_arr, (int)rt->cnt, *gsp_off, cfg->addr, g_buf,
-               &gsp_len);
-    }
-  bool has_dt = false;
-  uint8_t dt_lla[16] = { 0 };
-  static uint8_t dt_buf[UDP_PL_MAX];
-  size_t dt_len = 0;
-  if (cfg->p2p == P2P_EN && rt_trg_pop (rt, dt_lla))
-    {
-      gsp_dt_bld (cry_ctx, rt->re_arr, (int)rt->cnt, dt_lla, cfg->addr, dt_buf,
-                  &dt_len);
-      has_dt = (dt_len > 0);
     }
   static UdpMsg batch_arr[BATCH_MAX];
   int bc = 0;
@@ -1141,32 +1180,6 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           batch_arr[bc].data_len = ping_len;
           bc++;
           rt_tx_ack (rt, rt->re_arr[i].ep_ip, rt->re_arr[i].ep_port, ts);
-          if (bc == BATCH_MAX)
-            {
-              udp_tx_arr (udp, batch_arr, bc);
-              bc = 0;
-            }
-        }
-      if (cfg->p2p == P2P_EN && is_gsp)
-        {
-          memcpy (batch_arr[bc].dst_ip, rt->re_arr[i].ep_ip, 16);
-          batch_arr[bc].dst_port = rt->re_arr[i].ep_port;
-          batch_arr[bc].data = g_buf;
-          batch_arr[bc].data_len = gsp_len;
-          bc++;
-          if (bc == BATCH_MAX)
-            {
-              udp_tx_arr (udp, batch_arr, bc);
-              bc = 0;
-            }
-        }
-      if (cfg->p2p == P2P_EN && has_dt)
-        {
-          memcpy (batch_arr[bc].dst_ip, rt->re_arr[i].ep_ip, 16);
-          batch_arr[bc].dst_port = rt->re_arr[i].ep_port;
-          batch_arr[bc].data = dt_buf;
-          batch_arr[bc].data_len = dt_len;
-          bc++;
           if (bc == BATCH_MAX)
             {
               udp_tx_arr (udp, batch_arr, bc);
@@ -1223,10 +1236,6 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           hp_bld (cry_ctx, cfg->addr, dec->lla, hp_buf, &hp_len);
           udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
         }
-    }
-  if (is_gsp)
-    {
-      *gsp_off = (*gsp_off + GSP_MAX) % (rt->cnt > 0 ? rt->cnt : 1);
     }
 }
 

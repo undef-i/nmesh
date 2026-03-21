@@ -173,6 +173,8 @@ typedef struct
   bool map_dirty;
   bool has_trg;
   uint8_t trg_lla[16];
+  bool gsp_dirty;
+  uint64_t gsp_last_ts;
 } Rt;
 
 typedef enum
@@ -244,3 +246,4 @@ bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
 void rt_dad_stl (Rt *t, uint64_t sys_ts, PPool *pool, const char *peers_path);
 void pp_init (PPool *p, const char *persist_path);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
+void rt_gsp_dirty_set (Rt *t);
