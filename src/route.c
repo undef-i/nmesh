@@ -25,9 +25,6 @@
 #define RT_MTU_EPS 10U
 #define RT_PRB_BST 3U
 
-static uint32_t nh_m (Rt *t, const uint8_t relay_lla[16],
-                      const uint8_t relay_ip[16], uint16_t relay_port);
-
 static bool
 seq_gt (uint32_t a, uint32_t b)
 {
@@ -179,13 +176,7 @@ is_z16 (const uint8_t lla[16])
   return memcmp (lla, z_lla, 16) == 0;
 }
 
-static void
-ep_key_bld (const uint8_t ip[16], uint16_t port, uint8_t key[18])
-{
-  memcpy (key, ip, 16);
-  key[16] = (uint8_t)(port >> 8);
-  key[17] = (uint8_t)(port & 0xff);
-}
+
 
 static void
 rt_map_fre (RtMap *map)
@@ -207,29 +198,7 @@ rt_map_fre (RtMap *map)
   }
 }
 
-static void
-rt_idx_fre (EpIdx *idx)
-{
-  EpIdx *ep_iter, *tmp;
-  HASH_ITER (hh, idx, ep_iter, tmp)
-  {
-    HASH_DEL (idx, ep_iter);
-    free (ep_iter);
-  }
-}
 
-static bool
-is_m_sw (uint32_t old_ms, uint32_t n_ms, uint32_t rttvar_fixed)
-{
-  if (old_ms == 0 || old_ms >= RT_M_INF)
-    return true;
-  if (n_ms == 0 || n_ms >= RT_M_INF)
-    return false;
-  uint32_t margin = (rttvar_fixed >> 2);
-  if (margin == 0)
-    margin = 1;
-  return (n_ms + margin < old_ms);
-}
 
 static void
 re_to_pth (const Re *re, Pth *pth)
@@ -362,11 +331,6 @@ rt_map_rbd (Rt *t)
   }
 
   rt_map_fre (t->map);
-  if (t->dir_m_idx)
-    {
-      rt_idx_fre (t->dir_m_idx);
-      t->dir_m_idx = NULL;
-    }
   t->map = n_map;
 }
 
@@ -453,30 +417,7 @@ src_fnd (Rt *t, const uint8_t rt_id[16])
   return NULL;
 }
 
-static uint32_t
-nh_m (Rt *t, const uint8_t relay_lla[16], const uint8_t relay_ip[16],
-      uint16_t relay_port)
-{
-  (void)relay_ip;
-  (void)relay_port;
 
-  if (!t || !relay_lla)
-    return UINT32_MAX;
-  if (is_z16 (relay_lla))
-    return UINT32_MAX;
-
-  rt_map_ens (t);
-
-  if (!t->map)
-    return UINT32_MAX;
-
-  RtMap *nh = NULL;
-  HASH_FIND (hh, t->map, relay_lla, 16, nh);
-  if (!nh || !nh->sel_dir_pth)
-    return UINT32_MAX;
-
-  return nh->sel_dir_m;
-}
 
 static void
 rt_zero_ep_rm (Rt *t, const uint8_t ip[16], uint16_t port, bool match_port)
@@ -716,8 +657,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
     return false;
 
   Pth *selected = re->sel_dir_pth;
-  if (!selected || !selected->is_act || selected->state == RT_DED
-      || selected->r2d != 0)
+  if (!selected)
     return false;
 
   re->sel_pth = selected;
@@ -1343,16 +1283,15 @@ rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
       if (re->ep_port != port)
         continue;
       re->mtu_lkg = pmtu;
-      re->mtu_ukb = pmtu;
       re->mtu = pmtu;
-      re->mtu_st = MTU_ST_F;
+      re->mtu_st = MTU_ST_S;
       re->prb_mtu = 0;
       re->prb_id = 0;
       re->prb_tx = 0;
       re->prb_ddl = 0;
       re->ack_ts = sys_ts;
       re->vfy_ts = 0;
-      re->hld_ts = sys_ts + RT_MTU_HLD;
+      re->hld_ts = 0;
       re_mtu_sync (t, re);
     }
 }

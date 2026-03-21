@@ -170,9 +170,7 @@ is_ip_bgn (const uint8_t ip[16])
     is_v4m = false;
   if (is_v4m)
     {
-      uint8_t a = ip[12], b = ip[13], c = ip[14], dec = ip[15];
-      (void)c;
-      (void)dec;
+      uint8_t a = ip[12], b = ip[13], c = ip[14];
       if (a == 0)
         return true;
       if (a == 10)

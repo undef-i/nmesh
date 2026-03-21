@@ -210,7 +210,7 @@ main (int argc, char **argv)
                    cfg_file);
         }
     }
-  printf ("main: mesh running; entering epoll loop\n");
+  printf ("main: nmesh running; entering epoll loop\n");
   printf ("main: type 's' and press enter to view routing table\n");
   fflush (stdout);
   on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, &gsp_off, cfg_path, act_port,
