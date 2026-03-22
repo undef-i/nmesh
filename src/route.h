@@ -123,6 +123,7 @@ typedef struct RtMap
   uint32_t sel_rel_m;
   bool has_pnd_dir;
   UT_hash_handle hh;
+  struct RtMap *pool_next;
 } RtMap;
 
 typedef struct
@@ -163,6 +164,8 @@ typedef struct
   bool map_dirty;
   bool gsp_dirty;
   uint64_t gsp_last_ts;
+  Pth *pth_pool;
+  RtMap *rtm_pool;
 } Rt;
 
 typedef enum
