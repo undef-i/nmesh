@@ -161,7 +161,6 @@ main (int argc, char **argv)
   ev.data.u64 = ID_TMR;
   epoll_ctl (epfd, EPOLL_CTL_ADD, timer_fd, &ev);
   struct epoll_event ev_arr[EV_MAX];
-  int gsp_off = 0;
   tty_raw ();
   int stdin_flg = fcntl (STDIN_FILENO, F_GETFL, 0);
   if (stdin_flg >= 0)
@@ -213,8 +212,7 @@ main (int argc, char **argv)
   printf ("main: nmesh running; entering epoll loop\n");
   printf ("main: type 's' and press enter to view routing table\n");
   fflush (stdout);
-  on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, &gsp_off, cfg_path, act_port,
-          sid, &pool);
+  on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool);
   rt_gsp_dirty_set (&rt);
   udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
   while (1)
@@ -258,7 +256,7 @@ main (int argc, char **argv)
             }
           else if (tok == ID_TMR)
             {
-              on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, &gsp_off, cfg_path,
+              on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg,
                       act_port, sid, &pool);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }

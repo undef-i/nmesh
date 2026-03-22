@@ -17,8 +17,7 @@ void on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 void on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
              uint64_t sid, PPool *pool);
 void on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-             int *gsp_off, const char *peers_path, uint16_t act_port,
-             uint64_t sid, PPool *pool);
+             uint16_t act_port, uint64_t sid, PPool *pool);
 void on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool);
 void tty_raw (void);
 void cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,

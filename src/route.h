@@ -60,8 +60,6 @@ typedef struct
   uint16_t mtu_ukb;
   MtuSt mtu_st;
   uint64_t prb_i_ts;
-  uint16_t mtu_flr;
-  uint16_t mtu_cel;
   uint16_t prb_mtu;
   uint32_t prb_id;
   uint8_t prb_tx;
@@ -71,9 +69,6 @@ typedef struct
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
-  uint8_t tnt_ip[16];
-  uint16_t tnt_port;
-  uint64_t tnt_sid;
 } Re;
 
 typedef struct Pth
@@ -105,8 +100,6 @@ typedef struct Pth
   uint16_t mtu_ukb;
   MtuSt mtu_st;
   uint64_t prb_i_ts;
-  uint16_t mtu_flr;
-  uint16_t mtu_cel;
   uint16_t prb_mtu;
   uint32_t prb_id;
   uint8_t prb_tx;
@@ -116,9 +109,6 @@ typedef struct Pth
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
-  uint8_t tnt_ip[16];
-  uint16_t tnt_port;
-  uint64_t tnt_sid;
   struct Pth *next;
 } Pth;
 
@@ -171,8 +161,6 @@ typedef struct
   uint32_t prb_nxt_id;
   uint16_t mtu_ub;
   bool map_dirty;
-  bool has_trg;
-  uint8_t trg_lla[16];
   bool gsp_dirty;
   uint64_t gsp_last_ts;
 } Rt;
@@ -215,7 +203,6 @@ void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
                 uint16_t port, uint64_t sys_ts);
 void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 void rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
-bool rt_trg_pop (Rt *t, uint8_t out_lla[16]);
 RtDec rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p);
 uint16_t rt_mtu (const Rt *t, const RtDec *sel);
 bool rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
@@ -243,7 +230,6 @@ void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
                  uint64_t ver, uint64_t sys_ts);
 bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
                    uint64_t sys_ts);
-void rt_dad_stl (Rt *t, uint64_t sys_ts, PPool *pool, const char *peers_path);
 void pp_init (PPool *p, const char *persist_path);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
 void rt_gsp_dirty_set (Rt *t);
