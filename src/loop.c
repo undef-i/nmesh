@@ -912,7 +912,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               }
             uint16_t full_len = 0;
             uint8_t *full_l3
-                = frag_asm (msg_id, frag_off, mf, chunk, chunk_len, &full_len);
+                = frag_asm (src_ip, msg_id, frag_off, mf, chunk, chunk_len, &full_len);
             if (!full_l3)
               break;
             if (full_len < VNET_HL + ETH_HLEN)
