@@ -1095,8 +1095,7 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
 
 void
 on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-        int *gsp_off, const char *peers_path, uint16_t act_port, uint64_t sid,
-        PPool *pool)
+        uint16_t act_port, uint64_t sid, PPool *pool)
 {
   uint8_t exp_buf[8];
   if (read (timer_fd, exp_buf, sizeof (exp_buf)) < 0)
@@ -1106,12 +1105,9 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           perror ("loop: read(timer_fd) failed");
         }
     }
-  (void)peers_path;
-  (void)gsp_off;
   uint64_t ts = sys_ts ();
   rt_mtu_tk (rt, ts);
   rt_loc_add (rt, cfg->addr, act_port, ts);
-  rt_dad_stl (rt, ts, pool, peers_path);
   rt_prn_st (rt, ts);
   rt_src_gc (rt, ts);
   {
