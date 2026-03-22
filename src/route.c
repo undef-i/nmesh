@@ -174,8 +174,6 @@ is_z16 (const uint8_t lla[16])
   return memcmp (lla, z_lla, 16) == 0;
 }
 
-
-
 static Pth *
 pth_alloc (Rt *t)
 {
@@ -239,8 +237,6 @@ rt_map_fre (Rt *t, RtMap *map)
     rtm_free (t, rtm);
   }
 }
-
-
 
 static void
 re_to_pth (const Re *re, Pth *pth)
@@ -441,8 +437,6 @@ src_fnd (Rt *t, const uint8_t rt_id[16])
     }
   return NULL;
 }
-
-
 
 static void
 rt_zero_ep_rm (Rt *t, const uint8_t ip[16], uint16_t port, bool match_port)
@@ -739,12 +733,13 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
       t->re_arr[i].lat = rtt_ms;
       re_rx_ack (&t->re_arr[i], sys_ts);
       t->re_arr[i].ver = sys_ts;
-      
-      if (t->re_arr[i].sm_m > 0 && t->re_arr[i].sm_m < RT_M_INF && t->re_arr[i].rttvar > 0)
+
+      if (t->re_arr[i].sm_m > 0 && t->re_arr[i].sm_m < RT_M_INF
+          && t->re_arr[i].rttvar > 0)
         {
-          uint32_t diff = (rtt_ms > t->re_arr[i].sm_m) ? 
-                          (rtt_ms - t->re_arr[i].sm_m) : 
-                          (t->re_arr[i].sm_m - rtt_ms);
+          uint32_t diff = (rtt_ms > t->re_arr[i].sm_m)
+                              ? (rtt_ms - t->re_arr[i].sm_m)
+                              : (t->re_arr[i].sm_m - rtt_ms);
           if (diff > (t->re_arr[i].rttvar << 2))
             rt_gsp_dirty_set (t);
         }

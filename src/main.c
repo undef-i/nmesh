@@ -256,8 +256,8 @@ main (int argc, char **argv)
             }
           else if (tok == ID_TMR)
             {
-              on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg,
-                      act_port, sid, &pool);
+              on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
+                      &pool);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
           else if (tok == ID_STD)
