@@ -176,8 +176,52 @@ is_z16 (const uint8_t lla[16])
 
 
 
+static Pth *
+pth_alloc (Rt *t)
+{
+  if (t->pth_pool)
+    {
+      Pth *p = t->pth_pool;
+      t->pth_pool = p->next;
+      memset (p, 0, sizeof (*p));
+      return p;
+    }
+  return calloc (1, sizeof (Pth));
+}
+
 static void
-rt_map_fre (RtMap *map)
+pth_free (Rt *t, Pth *p)
+{
+  if (!p)
+    return;
+  p->next = t->pth_pool;
+  t->pth_pool = p;
+}
+
+static RtMap *
+rtm_alloc (Rt *t)
+{
+  if (t->rtm_pool)
+    {
+      RtMap *m = t->rtm_pool;
+      t->rtm_pool = m->pool_next;
+      memset (m, 0, sizeof (*m));
+      return m;
+    }
+  return calloc (1, sizeof (RtMap));
+}
+
+static void
+rtm_free (Rt *t, RtMap *m)
+{
+  if (!m)
+    return;
+  m->pool_next = t->rtm_pool;
+  t->rtm_pool = m;
+}
+
+static void
+rt_map_fre (Rt *t, RtMap *map)
 {
   RtMap *rtm, *tmp;
   HASH_ITER (hh, map, rtm, tmp)
@@ -187,12 +231,12 @@ rt_map_fre (RtMap *map)
     while (pth)
       {
         Pth *nxt_path = pth->next;
-        free (pth);
+        pth_free (t, pth);
         pth = nxt_path;
       }
     rtm->paths = NULL;
     HASH_DEL (map, rtm);
-    free (rtm);
+    rtm_free (t, rtm);
   }
 }
 
@@ -253,7 +297,7 @@ rt_map_rbd (Rt *t)
       HASH_FIND (hh, n_map, re->lla, 16, rtm);
       if (!rtm)
         {
-          rtm = (RtMap *)calloc (1, sizeof (*rtm));
+          rtm = rtm_alloc (t);
           if (!rtm)
             continue;
           memcpy (rtm->lla, re->lla, 16);
@@ -262,7 +306,7 @@ rt_map_rbd (Rt *t)
           HASH_ADD (hh, n_map, lla, 16, rtm);
         }
 
-      Pth *pth = (Pth *)calloc (1, sizeof (*pth));
+      Pth *pth = pth_alloc (t);
       if (!pth)
         continue;
       re_to_pth (re, pth);
@@ -323,7 +367,7 @@ rt_map_rbd (Rt *t)
       }
   }
 
-  rt_map_fre (t->map);
+  rt_map_fre (t, t->map);
   t->map = n_map;
 }
 
