@@ -806,7 +806,18 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   if (rc <= 0)
     return;
   uint64_t ts = sys_ts ();
-  frag_reap_tk (ts);
+
+  static uint64_t l_reap_ts = 0;
+  if (ts >= l_reap_ts + 50ULL)
+    {
+      frag_reap_tk (ts);
+      l_reap_ts = ts;
+    }
+
+  uint8_t last_src_ip[16] = { 0 };
+  uint16_t last_src_port = 0;
+  bool has_last_src = false;
+
   for (int i = 0; i < rc; i++)
     {
       uint8_t *raw_buf = buf_arr[i];
@@ -828,7 +839,16 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         continue;
       if (!rx_rp_chk (src_ip, src_port, raw_buf + PKT_CH_SZ))
         continue;
-      rt_rx_ack (rt, src_ip, src_port, ts);
+
+      if (!has_last_src || src_port != last_src_port
+          || memcmp (src_ip, last_src_ip, 16) != 0)
+        {
+          rt_rx_ack (rt, src_ip, src_port, ts);
+          memcpy (last_src_ip, src_ip, 16);
+          last_src_port = src_port;
+          has_last_src = true;
+        }
+
       switch (hdr.pkt_type)
         {
         case PT_DATA:
@@ -911,8 +931,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 break;
               }
             uint16_t full_len = 0;
-            uint8_t *full_l3
-                = frag_asm (src_ip, msg_id, frag_off, mf, chunk, chunk_len, &full_len);
+            uint8_t *full_l3 = frag_asm (src_ip, msg_id, frag_off, mf, chunk,
+                                         chunk_len, &full_len);
             if (!full_l3)
               break;
             if (full_len < VNET_HL + ETH_HLEN)
