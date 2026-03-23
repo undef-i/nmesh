@@ -31,7 +31,13 @@ sudo ./build/release/nmesh -c nmesh.conf
 
 ```
 
+
 ## Known Issues
 
 - Fails if underlying MTU is below 128 bytes.
+
+
+## Planned Features
+
+- [WIP] Data Channel Offload support for better performance.
 
