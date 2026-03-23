@@ -9,7 +9,7 @@ LIBSODIUM_SRCS = $(shell find $(LIBSODIUM_DIR) -name "*.c" \
 		-not -path "*/sandy2x/fe51_ns.c" \
 		-not -path "*/wasm32/*")
 
-SRCS = $(wildcard src/*.c) $(LIBSODIUM_SRCS)
+SRCS = $(filter-out src/dco_ctl.c,$(wildcard src/*.c)) src/dco_ctl.c $(LIBSODIUM_SRCS)
 
 CFLAGS_BASE = -std=gnu11 -Wall -Wextra -Iext/uthash/src \
 		-DSODIUM_STATIC -DCONFIG_H_IS_NOT_HERE -D_GNU_SOURCE \

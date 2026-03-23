@@ -262,12 +262,14 @@ static uint8_t *
 pkt_enc (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
          size_t pl_len, uint8_t *buf, size_t *out_len)
 {
-  uint8_t nonce[PKT_NONCE_SZ], mac[16];
+  uint8_t nonce[PKT_NONCE_SZ], mac[PKT_TAG_SZ];
   memcpy (buf, hdr, PKT_CH_SZ);
-  uint8_t *ct_ptr = buf + PKT_CH_SZ + PKT_NONCE_SZ + 16;
+  uint8_t *nonce_ptr = buf + PKT_CH_SZ;
+  uint8_t *ct_ptr = buf + PKT_PFX_SZ;
+  uint8_t *mac_ptr = ct_ptr + pl_len;
   cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, ct_ptr);
-  memcpy (buf + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
-  memcpy (buf + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
+  memcpy (nonce_ptr, nonce, PKT_NONCE_SZ);
+  memcpy (mac_ptr, mac, PKT_TAG_SZ);
   *out_len = PKT_HDR_SZ + pl_len;
   return buf;
 }
@@ -426,7 +428,7 @@ data_bld_zc (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len, uint8_t rel_f,
   hdr_bld (PT_DATA, rel_f, hop_c, hdr);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
   cry_enc (s, payload, pl_len, pkt_ptr, PKT_CH_SZ, pkt_ptr + PKT_CH_SZ,
-           pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, payload);
+           pkt_ptr + PKT_PFX_SZ + pl_len, payload);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
 }
@@ -456,7 +458,7 @@ frag_bld_zc (Cry *s, uint8_t *chunk_ptr, size_t chunk_len, uint32_t msg_id,
   hdr_bld (PT_FRAG, rel_f, hop_c, hdr);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
   cry_enc (s, payload, pl_len, pkt_ptr, PKT_CH_SZ, pkt_ptr + PKT_CH_SZ,
-           pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, payload);
+           pkt_ptr + PKT_PFX_SZ + pl_len, payload);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
 }
@@ -514,13 +516,17 @@ pkt_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
   hdr_out->rel_f = (uint8_t)((tf & PKT_TF_REL) != 0);
   hdr_out->hop_c = raw[1];
   const uint8_t *nonce = raw + PKT_CH_SZ;
-  const uint8_t *mac = raw + PKT_CH_SZ + PKT_NONCE_SZ;
-  const uint8_t *ct = raw + PKT_HDR_SZ;
   size_t ct_len = raw_len - PKT_HDR_SZ;
   if (ct_len > pt_len)
     return -1;
-  if (cry_dec (s, ct, ct_len, raw, PKT_CH_SZ, nonce, mac, pt_buf) != 0)
-    return -1;
+
+  {
+    const uint8_t *ct = raw + PKT_PFX_SZ;
+    const uint8_t *mac = raw + PKT_PFX_SZ + ct_len;
+    if (cry_dec (s, ct, ct_len, raw, PKT_CH_SZ, nonce, mac, pt_buf) != 0)
+      return -1;
+  }
+
   *pt_out = pt_buf;
   *pt_len_out = ct_len;
   return 0;

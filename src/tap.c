@@ -56,6 +56,33 @@ tap_txq_set (const char *name)
   close (sock);
 }
 
+int
+tap_nmesh_add (const char *name)
+{
+  if (!name || !name[0])
+    return -1;
+  char cmd[256];
+  snprintf (cmd, sizeof (cmd), "ip link add dev %s type nmesh", name);
+  int rc = system (cmd);
+  if (rc == 0)
+    {
+      snprintf (cmd, sizeof (cmd), "ip link set dev %s up", name);
+      (void)system (cmd);
+      return 0;
+    }
+  return -1;
+}
+
+void
+tap_link_del (const char *name)
+{
+  if (!name || !name[0])
+    return;
+  char cmd[256];
+  snprintf (cmd, sizeof (cmd), "ip link del dev %s >/dev/null 2>&1", name);
+  (void)system (cmd);
+}
+
 void
 tap_stl_rm (const char *name)
 {

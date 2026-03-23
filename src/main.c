@@ -102,54 +102,131 @@ main (int argc, char **argv)
   Cry cry_ctx;
   cry_init (&cry_ctx, cfg.psk);
   tap_stl_rm (cfg.ifname);
-  int tap_fd = tap_init (cfg.ifname);
-  if (tap_fd < 0)
-    {
-      fprintf (stderr, "main: failed to create tap\n");
-      return 1;
-    }
-  tap_addr_set (cfg.ifname, cfg.addr);
-  tap_mtu_set (cfg.ifname, cfg.mtu);
-  printf ("main: tap device %s created (mtu=%u).\n", cfg.ifname,
-          (unsigned)cfg.mtu);
+  int tap_fd = -1;
   static Udp udp;
   uint16_t act_port = cfg.port;
-  if (udp_init (&udp, &act_port) != 0)
-    {
-      if (!cfg.l_exp)
-        {
-          act_port = 0;
-          if (udp_init (&udp, &act_port) != 0)
-            {
-              fprintf (stderr, "main: failed to bind udp port\n");
-              return 1;
-            }
-        }
-      else
-        {
-          fprintf (stderr, "main: failed to bind explicit udp port %u\n",
-                   cfg.port);
-          return 1;
-        }
-    }
-  g_rt = &rt;
-  udp_emsg_cb_set (on_udp_emsg);
-  udp_unr_cb_set (on_udp_unr);
-  printf ("main: udp bound to port %u\n", act_port);
-  {
-    uint16_t hw_mtu = udp_mtu_get (&udp);
-    rt_pmtu_ub_set (&rt, hw_mtu);
-  }
-  rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
   int epfd = epoll_create1 (0);
   struct epoll_event ev;
-  ev.events = EPOLLIN;
-  ev.data.u64 = ID_TAP;
-  epoll_ctl (epfd, EPOLL_CTL_ADD, tap_fd, &ev);
-  ev.events = EPOLLIN | EPOLLERR;
-  ev.data.u64 = ID_UDP;
-  epoll_ctl (epfd, EPOLL_CTL_ADD, udp.fd, &ev);
   bool u_w_watch = false;
+  bool dco_dp_active = false;
+  bool udp_ready = false;
+
+  {
+    bool dco_netdev_ready = false;
+
+    tap_link_del (cfg.ifname);
+    if (tap_nmesh_add (cfg.ifname) == 0)
+      {
+        tap_addr_set (cfg.ifname, cfg.addr);
+        tap_mtu_set (cfg.ifname, cfg.mtu);
+        printf ("main: dco netdev %s created (mtu=%u).\n", cfg.ifname,
+                (unsigned)cfg.mtu);
+        dco_netdev_ready = true;
+      }
+
+    g_rt = &rt;
+
+    if (dco_netdev_ready)
+      {
+        (void)dco_ctl_cleanup_stale (&cfg);
+        act_port = cfg.port;
+        if (udp_init (&udp, &act_port) != 0)
+          {
+            fprintf (
+                stderr,
+                "main: failed to bind shared udp port %u for DCO; fallback to userspace datapath\n",
+                cfg.port);
+            tap_link_del (cfg.ifname);
+          }
+        else
+          {
+            udp_ready = true;
+            udp_emsg_cb_set (on_udp_emsg);
+            udp_unr_cb_set (on_udp_unr);
+            printf ("main: udp bound to shared port %u\n", act_port);
+            rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
+            {
+              uint16_t hw_mtu = udp_mtu_get (&udp);
+              rt_pmtu_ub_set (&rt, hw_mtu);
+            }
+
+            ev.events = EPOLLIN | EPOLLERR;
+            ev.data.u64 = ID_UDP;
+            epoll_ctl (epfd, EPOLL_CTL_ADD, udp.fd, &ev);
+
+            if (dco_ctl_apply_cfg (&cfg, cfg_path, udp.fd) == 0)
+              {
+                dco_dp_active = true;
+                (void)dco_ctl_sync_fib (&cfg, &rt);
+                fprintf (
+                    stderr,
+                    "main: dco peer apply succeeded; kernel DCO datapath active on %s udp/%u (shared socket)\n",
+                    cfg.ifname, (unsigned)cfg.port);
+              }
+            else
+              {
+                fprintf (
+                    stderr,
+                    "main: dco peer apply failed on shared socket; fallback to userspace UDP datapath\n");
+                tap_link_del (cfg.ifname);
+              }
+          }
+      }
+
+    if (!dco_dp_active)
+      {
+        tap_fd = tap_init (cfg.ifname);
+        if (tap_fd < 0)
+          {
+            fprintf (stderr, "main: failed to create tap\n");
+            return 1;
+          }
+        tap_addr_set (cfg.ifname, cfg.addr);
+        tap_mtu_set (cfg.ifname, cfg.mtu);
+        printf ("main: tap device %s created (mtu=%u).\n", cfg.ifname,
+                (unsigned)cfg.mtu);
+
+        ev.events = EPOLLIN;
+        ev.data.u64 = ID_TAP;
+        epoll_ctl (epfd, EPOLL_CTL_ADD, tap_fd, &ev);
+
+        if (!udp_ready && udp_init (&udp, &act_port) != 0)
+          {
+            if (!cfg.l_exp)
+              {
+                act_port = 0;
+                if (udp_init (&udp, &act_port) != 0)
+                  {
+                    fprintf (stderr, "main: failed to bind udp port\n");
+                    return 1;
+                  }
+              }
+            else
+              {
+                fprintf (stderr, "main: failed to bind explicit udp port %u\n",
+                         cfg.port);
+                return 1;
+              }
+          }
+
+        if (!udp_ready)
+          {
+            udp_ready = true;
+            udp_emsg_cb_set (on_udp_emsg);
+            udp_unr_cb_set (on_udp_unr);
+            printf ("main: udp bound to port %u\n", act_port);
+            rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
+            {
+              uint16_t hw_mtu = udp_mtu_get (&udp);
+              rt_pmtu_ub_set (&rt, hw_mtu);
+            }
+
+            ev.events = EPOLLIN | EPOLLERR;
+            ev.data.u64 = ID_UDP;
+            epoll_ctl (epfd, EPOLL_CTL_ADD, udp.fd, &ev);
+          }
+      }
+  }
   int timer_fd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK);
   struct itimerspec its;
   its.it_value.tv_sec = 0;
@@ -229,8 +306,11 @@ main (int argc, char **argv)
           uint64_t tok = ev_arr[i].data.u64;
           if (tok == ID_TAP)
             {
-              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, sys_ts ());
-              udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+              if (!dco_dp_active && tap_fd >= 0)
+                {
+                  on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, sys_ts ());
+                  udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+                }
             }
           else if (tok == ID_UDP)
             {
@@ -258,6 +338,8 @@ main (int argc, char **argv)
             {
               on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
                       &pool);
+              if (dco_dp_active)
+                (void)dco_ctl_sync_fib (&cfg, &rt);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
           else if (tok == ID_STD)
@@ -293,6 +375,15 @@ main (int argc, char **argv)
                         {
                           cfg_reload_apply (&cfg, &cry_ctx, &rt, &pool,
                                             cfg_path, sys_ts ());
+                          if (dco_ctl_apply_cfg (&cfg, cfg_path, udp.fd) != 0)
+                            {
+                              fprintf (stderr,
+                                       "main: dco peer apply failed after config reload\n");
+                            }
+                          else if (dco_dp_active)
+                            {
+                              (void)dco_ctl_sync_fib (&cfg, &rt);
+                            }
                         }
                     }
                 }

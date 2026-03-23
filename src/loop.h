@@ -3,6 +3,11 @@
 #include "crypto.h"
 #include "route.h"
 #include "udp.h"
+#include "utils.h"
+
+int dco_ctl_apply_cfg (const Cfg *cfg, const char *cfg_path, int udp_fd);
+int dco_ctl_sync_fib (const Cfg *cfg, Rt *rt);
+int dco_ctl_cleanup_stale (const Cfg *cfg);
 #include <stdbool.h>
 #include <stdint.h>
 
