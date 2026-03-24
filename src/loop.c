@@ -57,6 +57,8 @@ udp_ep_upd (int epfd, int udp_fd, bool w_want, bool *w_watch)
     }
 }
 
+static uint64_t um_prb_intv (uint64_t age_ms);
+
 static bool
 p_is_me (const Rt *rt, const uint8_t our_lla[16], const uint8_t ip[16],
          uint16_t port)
@@ -75,6 +77,84 @@ p_is_me (const Rt *rt, const uint8_t our_lla[16], const uint8_t ip[16],
       return true;
     }
   return false;
+}
+
+static bool
+lla_is_z (const uint8_t lla[16])
+{
+  static const uint8_t z_lla[16] = { 0 };
+  return memcmp (lla, z_lla, 16) == 0;
+}
+
+static Re *
+rt_re_fnd (Rt *rt, const uint8_t lla[16])
+{
+  if (!rt || !lla)
+    return NULL;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      Re *re = &rt->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (memcmp (re->lla, lla, 16) != 0)
+        continue;
+      return re;
+    }
+  return NULL;
+}
+
+static bool
+re_is_stdby (Rt *rt, const Re *re, bool is_p2p)
+{
+  if (!rt || !re || re->r2d != 0 || lla_is_z (re->lla))
+    return false;
+  RtDec dec = rt_sel (rt, re->lla, is_p2p);
+  if (dec.type == RT_DIR)
+    {
+      if (memcmp (re->ep_ip, dec.dir.ip, 16) == 0 && re->ep_port == dec.dir.port)
+        return false;
+      return true;
+    }
+  if (dec.type == RT_REL)
+    return true;
+  return false;
+}
+
+static void
+pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
+          uint64_t sid, bool may_rel)
+{
+  if (!udp || !cry_ctx || !rt || !cfg || !re)
+    return;
+  if (!lla_is_z (re->lla) && may_rel && cfg->p2p == P2P_EN)
+    {
+      RtDec rd = rt_sel (rt, re->lla, true);
+      if (rd.type == RT_REL)
+        {
+          uint64_t intv = (re->state == RT_ACT && re->rt_m < RT_M_INF)
+                              ? KA_TMO
+                              : um_prb_intv ((re->tx_ts > re->rx_ts
+                                                  && ts > re->tx_ts)
+                                                 ? (ts - re->tx_ts)
+                                             : (ts > re->rx_ts)
+                                                 ? (ts - re->rx_ts)
+                                                 : 0);
+          if (re->hp_ts != 0 && ts > re->hp_ts && (ts - re->hp_ts) < intv)
+            return;
+          uint8_t hp_buf[UDP_PL_MAX];
+          size_t hp_len = 0;
+          hp_bld (cry_ctx, cfg->addr, re->lla, hp_buf, &hp_len);
+          udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
+          re->hp_ts = ts;
+          return;
+        }
+    }
+  uint8_t p_buf[UDP_PL_MAX];
+  size_t p_len = 0;
+  ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &p_len);
+  udp_tx (udp, re->ep_ip, re->ep_port, p_buf, p_len);
+  rt->ping_tx_cnt++;
+  rt_tx_ack (rt, re->ep_ip, re->ep_port, ts);
 }
 
 static struct termios g_tty_old;
@@ -760,12 +840,11 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               off += chunk_len;
             }
         }
-      if (dec.type == RT_REL && cfg->p2p == P2P_EN && bc < BATCH_MAX)
+      if (dec.type == RT_REL && cfg->p2p == P2P_EN)
         {
-          static uint8_t hp_buf[UDP_PL_MAX];
-          size_t hp_len;
-          hp_bld (cry_ctx, cfg->addr, rt_key, hp_buf, &hp_len);
-          udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
+          Re *pulse_re = rt_re_fnd (rt, rt_key);
+          if (pulse_re)
+            pulse_tx (udp, cry_ctx, rt, cfg, pulse_re, now, sid, true);
         }
       if (bc >= BATCH_MAX - 2)
         {
@@ -997,6 +1076,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 if (hdr.rel_f == 0)
                   rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
                 uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
+                if (rtt == 0)
+                  rtt = 1;
                 rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
                 if (hdr.rel_f == 0 && !is_ip_bgn (src_ip)
                     && !p_is_me (rt, cfg->addr, src_ip, src_port))
@@ -1017,7 +1098,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                         &is_mod, &req_seq, seq_tgt);
                 if (is_mod)
                   {
-                    rt_gsp_dirty_set (rt);
+                    rt_gsp_dirty_set (rt, "on_gsp (is_mod)");
                   }
                 if (req_seq)
                   {
@@ -1037,11 +1118,25 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               {
                 if (memcmp (tgt_lla, cfg->addr, 16) == 0)
                   {
+                    bool is_bump = false;
                     for (uint32_t j = 0; j < rt->cnt; j++)
                       {
                         if (memcmp (rt->re_arr[j].lla, cfg->addr, 16) == 0)
                           {
                             rt->re_arr[j].seq++;
+                            is_bump = true;
+                          }
+                      }
+                    if (is_bump)
+                      {
+                        static uint8_t dt_buf[UDP_PL_MAX];
+                        size_t dt_len = 0;
+                        gsp_dt_bld (cry_ctx, rt->re_arr, (int)rt->cnt, tgt_lla,
+                                    cfg->addr, dt_buf, &dt_len);
+                        if (dt_len > 0)
+                          {
+                            udp_tx (udp, src_ip, src_port, dt_buf, dt_len);
+                            rt_tx_ack (rt, src_ip, src_port, ts);
                           }
                       }
                   }
@@ -1069,11 +1164,34 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
   if (cfg->p2p != P2P_EN)
     {
       rt->gsp_dirty = false;
+      printf ("gsp: flush: p2p disabled, clearing dirty\n");
       return;
     }
   uint64_t now = sys_ts ();
-  if (rt->gsp_last_ts > 0 && now < rt->gsp_last_ts + 100ULL)
+  if (rt->gsp_last_ts > 0 && now < rt->gsp_last_ts + 3000ULL)
     return;
+  int peer_cnt = 0;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (!re->is_act || re->state == RT_DED)
+        continue;
+      if (memcmp (re->lla, cfg->addr, 16) == 0)
+        continue;
+      if (re->ep_port == 0)
+        continue;
+      peer_cnt++;
+    }
+  if (peer_cnt == 0)
+    {
+      rt->gsp_dirty = false;
+      rt->gsp_last_ts = now;
+      return;
+    }
+  /* printf ("gsp: flush: start (last %lu ms ago)\n",
+             (unsigned long)(now - rt->gsp_last_ts)); */
   static uint8_t g_buf[UDP_PL_MAX];
   size_t gsp_len = 0;
   gsp_bld (cry_ctx, rt->re_arr, (int)rt->cnt, 0, cfg->addr, g_buf, &gsp_len);
@@ -1099,6 +1217,7 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
       if (bc >= BATCH_MAX)
         {
           udp_tx_arr (udp, batch_arr, bc);
+          rt->gsp_tx_cnt += (uint64_t)bc;
           bc = 0;
         }
       memcpy (batch_arr[bc].dst_ip, re->ep_ip, 16);
@@ -1108,9 +1227,30 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
       bc++;
     }
   if (bc > 0)
-    udp_tx_arr (udp, batch_arr, bc);
+    {
+      udp_tx_arr (udp, batch_arr, bc);
+      rt->gsp_tx_cnt += (uint64_t)bc;
+    }
   rt->gsp_dirty = false;
   rt->gsp_last_ts = now;
+}
+
+static uint64_t
+um_prb_intv (uint64_t age_ms)
+{
+  if (age_ms < UM_PRB_A1)
+    return UM_PRB_I1;
+  if (age_ms < UM_PRB_A2)
+    return UM_PRB_I2;
+  if (age_ms < UM_PRB_A3)
+    return UM_PRB_I3;
+  if (age_ms < UM_PRB_A4)
+    return UM_PRB_I4;
+  if (age_ms < UM_PRB_A5)
+    return UM_PRB_I5;
+  if (age_ms < UM_PRB_A6)
+    return UM_PRB_I6;
+  return UM_PRB_IMAX;
 }
 
 void
@@ -1141,70 +1281,37 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   }
   if (pool->is_dirty)
     pool->is_dirty = false;
-  static uint32_t tk_cnt = 0;
-  tk_cnt++;
-  bool is_idle = false;
-  uint64_t l_act = g_tx_ts > g_rx_ts ? g_tx_ts : g_rx_ts;
-  if (l_act > 0 && ts > l_act && (ts - l_act) >= KA_TMO)
-    is_idle = true;
-  bool is_prb = ((tk_cnt % UPD_TK) == 0);
-  static uint8_t p_buf[UDP_PL_MAX];
-  size_t ping_len = 0;
-  if (is_prb)
-    {
-      ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &ping_len);
-    }
-  static uint8_t ka_buf[UDP_PL_MAX];
-  size_t ka_len = 0;
-  if (is_idle)
-    {
-      keep_bld (cry_ctx, ka_buf, &ka_len);
-    }
-  static UdpMsg batch_arr[BATCH_MAX];
-  int bc = 0;
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
-      if (!rt->re_arr[i].is_act && !rt->re_arr[i].is_static
-          && rt->re_arr[i].state != RT_PND)
+      Re *re = &rt->re_arr[i];
+      if (re->r2d != 0)
         continue;
-      if (rt->re_arr[i].r2d != 0)
+      if (re_is_stdby (rt, re, cfg->p2p == P2P_EN))
         continue;
-      if (is_idle)
+
+      bool is_unmapped = lla_is_z (re->lla);
+      bool needs_probe = is_unmapped || re->state == RT_PND
+                         || re->rt_m >= RT_M_INF;
+      if (needs_probe)
         {
-          memcpy (batch_arr[bc].dst_ip, rt->re_arr[i].ep_ip, 16);
-          batch_arr[bc].dst_port = rt->re_arr[i].ep_port;
-          batch_arr[bc].data = ka_buf;
-          batch_arr[bc].data_len = ka_len;
-          bc++;
-          rt_tx_ack (rt, rt->re_arr[i].ep_ip, rt->re_arr[i].ep_port, ts);
-          g_tx_ts = ts;
-          if (bc == BATCH_MAX)
-            {
-              udp_tx_arr (udp, batch_arr, bc);
-              bc = 0;
-            }
+          uint64_t base_ts = re->rx_ts;
+          if (re->tx_ts > base_ts)
+            base_ts = re->tx_ts;
+          uint64_t age_ms = (base_ts > 0 && ts > base_ts) ? (ts - base_ts) : 0;
+          uint64_t intv = um_prb_intv (age_ms);
+          if (re->pnd_ts > 0 && ts > re->pnd_ts && (ts - re->pnd_ts) < intv)
+            continue;
+          pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, true);
+          re->pnd_ts = ts;
+          continue;
         }
-      else if (is_prb || rt->re_arr[i].state == RT_PND)
-        {
-          if (ping_len == 0)
-            {
-              ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &ping_len);
-            }
-          memcpy (batch_arr[bc].dst_ip, rt->re_arr[i].ep_ip, 16);
-          batch_arr[bc].dst_port = rt->re_arr[i].ep_port;
-          batch_arr[bc].data = p_buf;
-          batch_arr[bc].data_len = ping_len;
-          bc++;
-          rt_tx_ack (rt, rt->re_arr[i].ep_ip, rt->re_arr[i].ep_port, ts);
-          if (bc == BATCH_MAX)
-            {
-              udp_tx_arr (udp, batch_arr, bc);
-              bc = 0;
-            }
-        }
+
+      if (!re->is_act || re->state != RT_ACT)
+        continue;
+      if (re->tx_ts == 0 || ts <= re->tx_ts || (ts - re->tx_ts) < KA_TMO)
+        continue;
+      pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
     }
-  if (bc > 0)
-    udp_tx_arr (udp, batch_arr, bc);
   {
     for (int burst = 0; burst < 3; burst++)
       {
@@ -1213,6 +1320,8 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint32_t probe_id = 0;
         if (!rt_mprb_rdy (rt, ts, &prb_re, &prb_mtu, &probe_id))
           break;
+        if (prb_re.state != RT_ACT)
+          continue;
         static uint8_t prb_buf[UDP_PL_MAX];
         size_t probe_len = 0;
         uint16_t prb_o_oh = is_ip_v4m (prb_re.ep_ip) ? 20U : 40U;
@@ -1222,37 +1331,9 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         mtu_prb_bld (cry_ctx, probe_id, prb_mtu, t_pl_len, prb_buf,
                      &probe_len);
         udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_buf, probe_len);
-        {
-          static uint8_t prb_ping_buf[UDP_PL_MAX];
-          size_t prb_ping_len = 0;
-          ping_bld (cry_ctx, cfg->addr, ts, sid, prb_ping_buf, &prb_ping_len);
-          udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_ping_buf,
-                  prb_ping_len);
-        }
         rt_tx_ack (rt, prb_re.ep_ip, prb_re.ep_port, ts);
       }
   }
-  if (cfg->p2p == P2P_EN)
-    {
-      uint8_t z_lla[16] = { 0 };
-      for (uint32_t i = 0; i < rt->cnt; i++)
-        {
-          Re *dec = &rt->re_arr[i];
-          if (dec->r2d != 0)
-            continue;
-          if (dec->state != RT_PND)
-            continue;
-          if (memcmp (dec->lla, z_lla, 16) == 0)
-            continue;
-          RtDec rd = rt_sel (rt, dec->lla, true);
-          if (rd.type != RT_REL)
-            continue;
-          static uint8_t hp_buf[UDP_PL_MAX];
-          size_t hp_len = 0;
-          hp_bld (cry_ctx, cfg->addr, dec->lla, hp_buf, &hp_len);
-          udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
-        }
-    }
 }
 
 void
@@ -1474,6 +1555,9 @@ on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool)
 
   printf ("fib: active: %d/%u, static: %d, unmapped: %d\n", act_map_cnt,
           (uint32_t)rt->cnt, pool->cnt, um_cnt);
+  printf ("ctrl: gossip_tx=%llu ping_tx=%llu\n",
+          (unsigned long long)rt->gsp_tx_cnt,
+          (unsigned long long)rt->ping_tx_cnt);
   if (r_cnt > 0)
     {
       printf ("  %-*s  %-*s  %-*s  %-*s  rtt\n", m_dst, "dst", m_nh, "nexthop",

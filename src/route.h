@@ -69,6 +69,8 @@ typedef struct
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
+  uint64_t pnd_ts;
+  uint64_t hp_ts;
 } Re;
 
 typedef struct Pth
@@ -109,6 +111,8 @@ typedef struct Pth
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
+  uint64_t pnd_ts;
+  uint64_t hp_ts;
   struct Pth *next;
 } Pth;
 
@@ -149,7 +153,7 @@ typedef struct
   bool is_dirty;
 } PPool;
 
-typedef struct
+typedef struct Rt
 {
   RtMap *map;
   Re *re_arr;
@@ -164,6 +168,8 @@ typedef struct
   bool map_dirty;
   bool gsp_dirty;
   uint64_t gsp_last_ts;
+  uint64_t gsp_tx_cnt;
+  uint64_t ping_tx_cnt;
   Pth *pth_pool;
   RtMap *rtm_pool;
 } Rt;
@@ -235,4 +241,4 @@ bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
                    uint64_t sys_ts);
 void pp_init (PPool *p, const char *persist_path);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
-void rt_gsp_dirty_set (Rt *t);
+void rt_gsp_dirty_set (Rt *t, const char *r);

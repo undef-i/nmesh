@@ -22,7 +22,6 @@ uint8_t *frag_bld_zc (Cry *s, uint8_t *chunk_ptr, size_t chunk_len,
                       uint32_t msg_id, uint16_t off, bool mf, uint8_t rel_f,
                       const uint8_t dest_tail[4], uint8_t hop_c,
                       size_t *out_len);
-uint8_t *keep_bld (Cry *s, uint8_t *buf, size_t *out_len);
 uint8_t *mtu_prb_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,
                       size_t t_pl_len, uint8_t *buf, size_t *out_len);
 uint8_t *mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,

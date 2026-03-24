@@ -12,10 +12,23 @@
 #define ID_TMR 3
 #define ID_STD 4
 #define ID_CFG 5
-#define GSP_INTV 4
-#define UPD_TK 4
+#define GSP_INTV 1
+#define UPD_TK 30
 #define PEER_FLS_TK 5
-#define KA_TMO 25000ULL
+#define KA_TMO 20000ULL
+#define UM_PRB_A1 15000ULL
+#define UM_PRB_A2 45000ULL
+#define UM_PRB_A3 105000ULL
+#define UM_PRB_A4 225000ULL
+#define UM_PRB_A5 465000ULL
+#define UM_PRB_A6 945000ULL
+#define UM_PRB_I1 2000ULL
+#define UM_PRB_I2 4000ULL
+#define UM_PRB_I3 8000ULL
+#define UM_PRB_I4 16000ULL
+#define UM_PRB_I5 32000ULL
+#define UM_PRB_I6 64000ULL
+#define UM_PRB_IMAX 120000ULL
 
 extern uint64_t g_tx_ts;
 extern uint64_t g_rx_ts;

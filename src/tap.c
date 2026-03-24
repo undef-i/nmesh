@@ -92,6 +92,7 @@ tap_init (const char *name)
   ifr.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
   if (ioctl (fd, TUNSETIFF, &ifr) < 0)
     {
+      perror ("tap: ioctl(TUNSETIFF) failed");
       close (fd);
       return -1;
     }

@@ -1,4 +1,5 @@
 #include "route.h"
+#include "utils.h"
 #include "packet.h"
 #include <arpa/inet.h>
 #include <stdint.h>
@@ -6,10 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#define RT_HL_INTV 4000ULL
-#define RT_STL_HL 3ULL
-#define RT_DED_HL 16ULL
-#define RT_GHS_HL 5ULL
+#define RT_HL_INTV 10000ULL
+#define RT_STL_HL 6ULL
+#define RT_DED_HL 30ULL
+#define RT_GHS_HL 30ULL
 #define RT_UPD_INTV (RT_HL_INTV * 4ULL)
 #define RT_REL_STL (RT_UPD_INTV * 3ULL)
 #define RT_REL_DED (RT_UPD_INTV * 6ULL)
@@ -55,15 +56,7 @@ rt_mtu_ub (const Rt *t)
   return (uint16_t)upper;
 }
 
-static bool
-is_ip_v4m (const uint8_t ip[16])
-{
-  if (!ip)
-    return false;
-  return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 && ip[4] == 0
-         && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 && ip[8] == 0 && ip[9] == 0
-         && ip[10] == 0xff && ip[11] == 0xff;
-}
+
 
 static void
 re_mtu_sync (Rt *t, Re *re)
@@ -385,6 +378,28 @@ rt_map_ens (Rt *t)
 }
 
 static bool
+pth_is_re (const Pth *pth, const Re *re)
+{
+  return pth && re && memcmp (pth->ep_ip, re->ep_ip, 16) == 0
+         && pth->ep_port == re->ep_port && pth->r2d == re->r2d;
+}
+
+static bool
+rt_gsp_affects_dir (Rt *t, const Re *re)
+{
+  if (!t || !re)
+    return false;
+  if (re->r2d != 0 || is_z16 (re->lla))
+    return false;
+  rt_map_ens (t);
+  RtMap *rtm = NULL;
+  HASH_FIND (hh, t->map, re->lla, 16, rtm);
+  if (!rtm || !rtm->sel_dir_pth)
+    return false;
+  return pth_is_re (rtm->sel_dir_pth, re);
+}
+
+static bool
 rt_cap_chk (Rt *t, uint32_t extra)
 {
   if (t->cnt + extra <= t->cap)
@@ -479,13 +494,14 @@ pp_add (PPool *p, const uint8_t ip[16], uint16_t port)
     return;
   int is_v4 = (ip[0] == 0 && ip[1] == 0 && ip[10] == 0xff && ip[11] == 0xff);
   if (is_v4)
-    fprintf (stderr, "pool: discovered peer %u.%u.%u.%u:%u\n", ip[12], ip[13],
-             ip[14], ip[15], port);
+    /* fprintf (stderr, "pool: discovered peer %u.%u.%u.%u:%u\n", ip[12],
+                ip[13], ip[14], ip[15], port); */
+    ;
   else
     {
       char ip_str[INET6_ADDRSTRLEN];
       inet_ntop (AF_INET6, ip, ip_str, sizeof (ip_str));
-      fprintf (stderr, "pool: discovered peer [%s]:%u\n", ip_str, port);
+      /* fprintf (stderr, "pool: discovered peer [%s]:%u\n", ip_str, port); */
     }
   memcpy (p->re_arr[p->cnt].ip, ip, 16);
   p->re_arr[p->cnt].port = port;
@@ -654,8 +670,6 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         ne.state = RT_ACT;
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
-      if (!is_rel && IS_LLA_VAL (ne.lla) && ne.is_act && ne.state == RT_ACT)
-        rt_gsp_dirty_set (t);
     }
 }
 
@@ -672,6 +686,8 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
 
   Pth *selected = re->sel_dir_pth;
   if (!selected)
+    return false;
+  if (re->sel_dir_m >= RT_M_INF)
     return false;
 
   re->sel_pth = selected;
@@ -720,6 +736,8 @@ void
 rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
             uint16_t port, uint32_t rtt_ms, uint64_t sys_ts)
 {
+  if (rtt_ms == 0)
+    rtt_ms = 1;
   for (uint32_t i = 0; i < t->cnt; i++)
     {
       if (t->re_arr[i].r2d != 0)
@@ -732,18 +750,6 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
         continue;
       t->re_arr[i].lat = rtt_ms;
       re_rx_ack (&t->re_arr[i], sys_ts);
-      t->re_arr[i].ver = sys_ts;
-
-      if (t->re_arr[i].sm_m > 0 && t->re_arr[i].sm_m < RT_M_INF
-          && t->re_arr[i].rttvar > 0)
-        {
-          uint32_t diff = (rtt_ms > t->re_arr[i].sm_m)
-                              ? (rtt_ms - t->re_arr[i].sm_m)
-                              : (t->re_arr[i].sm_m - rtt_ms);
-          if (diff > (t->re_arr[i].rttvar << 2))
-            rt_gsp_dirty_set (t);
-        }
-
       re_rto_upd (&t->re_arr[i], rtt_ms);
       if (t->re_arr[i].sm_m == 0 || t->re_arr[i].sm_m >= RT_M_INF)
         {
@@ -752,8 +758,22 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
       else
         {
           t->re_arr[i].sm_m = (t->re_arr[i].sm_m * 7U + rtt_ms) / 8U;
+          if (t->re_arr[i].sm_m == 0)
+            t->re_arr[i].sm_m = 1;
         }
       t->re_arr[i].rt_m = t->re_arr[i].sm_m;
+      {
+        char lla_str[INET6_ADDRSTRLEN] = { 0 };
+        char ip_str[INET6_ADDRSTRLEN] = { 0 };
+        inet_ntop (AF_INET6, peer_lla, lla_str, sizeof (lla_str));
+        if (is_ip_v4m (ip))
+          inet_ntop (AF_INET, ip + 12, ip_str, sizeof (ip_str));
+        else
+          inet_ntop (AF_INET6, ip, ip_str, sizeof (ip_str));
+        /* fprintf (stderr,
+                    "route: rtt update lla=%s ep=%s:%u rtt=%u sm=%u\n",
+                    lla_str, ip_str, port, rtt_ms, t->re_arr[i].sm_m); */
+      }
       rt_map_mark (t);
       return;
     }
@@ -794,6 +814,19 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
         continue;
       if (t->re_arr[i].ep_port != port)
         continue;
+      {
+        char lla_str[INET6_ADDRSTRLEN] = { 0 };
+        char ip_str[INET6_ADDRSTRLEN] = { 0 };
+        inet_ntop (AF_INET6, lla, lla_str, sizeof (lla_str));
+        if (is_ip_v4m (ip))
+          inet_ntop (AF_INET, ip + 12, ip_str, sizeof (ip_str));
+        else
+          inet_ntop (AF_INET6, ip, ip_str, sizeof (ip_str));
+        /* fprintf (stderr,
+                    "route: ep refresh lla=%s ep=%s:%u state=%d rt_m=%u\n",
+                    lla_str, ip_str, port, (int)t->re_arr[i].state,
+                    t->re_arr[i].rt_m); */
+      }
       re_rx_ack (&t->re_arr[i], sys_ts);
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
@@ -843,6 +876,18 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.prb_i_ts = 0;
       re_mtu_sync (t, &ne);
       memcpy (ne.nhop_lla, lla, 16);
+      {
+        char lla_str[INET6_ADDRSTRLEN] = { 0 };
+        char ip_str[INET6_ADDRSTRLEN] = { 0 };
+        inet_ntop (AF_INET6, lla, lla_str, sizeof (lla_str));
+        if (is_ip_v4m (ip))
+          inet_ntop (AF_INET, ip + 12, ip_str, sizeof (ip_str));
+        else
+          inet_ntop (AF_INET6, ip, ip_str, sizeof (ip_str));
+        /* fprintf (stderr,
+                    "route: ep create lla=%s ep=%s:%u state=%d rt_m=%u\n",
+                    lla_str, ip_str, port, (int)ne.state, ne.rt_m); */
+      }
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
       if (!is_z16)
@@ -869,13 +914,16 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
       if (re->ep_port != port)
         continue;
       if (!re->is_act || re->state != RT_ACT)
-        is_mod = true;
+        {
+          if (rt_gsp_affects_dir (t, re))
+            is_mod = true;
+        }
       re_rx_ack (re, sys_ts);
     }
   if (is_mod)
     {
       rt_map_mark (t);
-      rt_gsp_dirty_set (t);
+      rt_gsp_dirty_set (t, "rx_ack (state mod)");
     }
 }
 
@@ -893,8 +941,9 @@ rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
     }
 }
 void
-rt_gsp_dirty_set (Rt *t)
+rt_gsp_dirty_set (Rt *t, const char *r)
 {
+  (void)r;
   if (t)
     t->gsp_dirty = true;
 }
@@ -933,27 +982,39 @@ rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
 
   Pth *b_dir_pth = re->sel_dir_pth;
   Pth *b_rel_pth = re->sel_rel_pth;
+  bool dir_ok = (b_dir_pth != NULL && re->sel_dir_m < RT_M_INF);
+  bool rel_ok = (b_rel_pth != NULL && re->sel_rel_m < RT_M_INF);
 
-  if (b_dir_pth && b_rel_pth)
+  if (dir_ok && rel_ok)
     {
-      dec.type = RT_DIR;
-      memcpy (dec.dir.ip, b_dir_pth->ep_ip, 16);
-      dec.dir.port = b_dir_pth->ep_port;
+      if (re->sel_dir_m <= re->sel_rel_m)
+        {
+          dec.type = RT_DIR;
+          memcpy (dec.dir.ip, b_dir_pth->ep_ip, 16);
+          dec.dir.port = b_dir_pth->ep_port;
+        }
+      else
+        {
+          dec.type = RT_REL;
+          memcpy (dec.rel.relay_ip, b_rel_pth->ep_ip, 16);
+          dec.rel.relay_port = b_rel_pth->ep_port;
+          memcpy (dec.rel.relay_lla, b_rel_pth->nhop_lla, 16);
+        }
       return dec;
     }
-  if (re->has_pnd_dir && !b_rel_pth)
+  if (re->has_pnd_dir && !rel_ok)
     {
       dec.type = RT_VP;
       return dec;
     }
-  if (b_dir_pth)
+  if (dir_ok)
     {
       dec.type = RT_DIR;
       memcpy (dec.dir.ip, b_dir_pth->ep_ip, 16);
       dec.dir.port = b_dir_pth->ep_port;
       return dec;
     }
-  if (b_rel_pth)
+  if (rel_ok)
     {
       dec.type = RT_REL;
       memcpy (dec.rel.relay_ip, b_rel_pth->ep_ip, 16);
@@ -1118,7 +1179,7 @@ rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
       Re *re = &t->re_arr[i];
       if (re->r2d != 0)
         continue;
-      if (!re->is_act || re->state == RT_DED)
+      if (re->state != RT_ACT)
         continue;
       if (memcmp (re->lla, t->our_lla, 16) == 0)
         continue;
@@ -1133,9 +1194,7 @@ rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
         continue;
       if (re->prb_mtu != 0)
         {
-          if (sys_ts >= re->prb_ddl)
-            continue;
-          if (re->prb_tx >= RT_PRB_BST)
+          if (sys_ts < re->prb_tx_ts + 1000ULL)
             continue;
           re->prb_tx++;
           re->prb_tx_ts = sys_ts;
@@ -1257,8 +1316,10 @@ rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
         continue;
       if (re->ep_port != port)
         continue;
-      re->mtu_lkg = pmtu;
-      re->mtu = pmtu;
+      re->mtu_ukb = pmtu;
+      if (re->mtu_lkg > pmtu)
+        re->mtu_lkg = pmtu;
+      re->mtu = re->mtu_lkg;
       re->mtu_st = MTU_ST_S;
       re->prb_mtu = 0;
       re->prb_id = 0;
@@ -1336,6 +1397,19 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
         continue;
       if (re->ep_port != port)
         continue;
+      {
+        char lla_str[INET6_ADDRSTRLEN] = { 0 };
+        char ip_str[INET6_ADDRSTRLEN] = { 0 };
+        inet_ntop (AF_INET6, re->lla, lla_str, sizeof (lla_str));
+        if (is_ip_v4m (ip))
+          inet_ntop (AF_INET, ip + 12, ip_str, sizeof (ip_str));
+        else
+          inet_ntop (AF_INET6, ip, ip_str, sizeof (ip_str));
+        /* fprintf (stderr,
+                    "route: unreachable -> pending lla=%s ep=%s:%u "
+                    "old_state=%d old_rt_m=%u\n",
+                    lla_str, ip_str, port, (int)re->state, re->rt_m); */
+      }
       re->is_act = false;
       re->state = RT_PND;
       re->rt_m = RT_M_INF;
@@ -1461,6 +1535,7 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
 {
   uint32_t wr_idx = 0;
   bool any_ded = false;
+  rt_map_ens (t);
   for (uint32_t rd_idx = 0; rd_idx < t->cnt; rd_idx++)
     {
       Re *re = &t->re_arr[rd_idx];
@@ -1475,10 +1550,15 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
             {
               if (re->is_act || re->state != RT_DED)
                 {
+                  char lla_str[64];
+                  inet_ntop (AF_INET6, re->lla, lla_str, sizeof (lla_str));
+                  printf ("prn_st: node %s DIED (age=%llu ms, state=%d)\n",
+                          lla_str, (unsigned long long)age, (int)re->state);
+                  if (rt_gsp_affects_dir (t, re))
+                    any_ded = true;
                   re->is_act = false;
                   re->state = RT_DED;
                   re->rt_m = RT_M_INF;
-                  any_ded = true;
                 }
               else
                 {
@@ -1499,7 +1579,7 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
   t->cnt = wr_idx;
   rt_map_mark (t);
   if (any_ded)
-    rt_gsp_dirty_set (t);
+    rt_gsp_dirty_set (t, "prn_st (node ded)");
 }
 
 void
@@ -1599,6 +1679,13 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
     }
   if (!is_rbt)
     return false;
+  {
+    char lla_str[INET6_ADDRSTRLEN] = { 0 };
+    inet_ntop (AF_INET6, rt_id, lla_str, sizeof (lla_str));
+    /* fprintf (stderr,
+                "route: peer session reset lla=%s new_sid=%016llx\n",
+                lla_str, (unsigned long long)peer_sid); */
+  }
   for (uint32_t re_idx = 0; re_idx < t->cnt; re_idx++)
     {
       Re *re = &t->re_arr[re_idx];

@@ -213,7 +213,7 @@ main (int argc, char **argv)
   printf ("main: type 's' and press enter to view routing table\n");
   fflush (stdout);
   on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool);
-  rt_gsp_dirty_set (&rt);
+  rt_gsp_dirty_set (&rt, "initial");
   udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
   while (1)
     {

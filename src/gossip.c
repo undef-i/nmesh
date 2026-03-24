@@ -462,14 +462,6 @@ frag_bld_zc (Cry *s, uint8_t *chunk_ptr, size_t chunk_len, uint32_t msg_id,
 }
 
 uint8_t *
-keep_bld (Cry *s, uint8_t *buf, size_t *out_len)
-{
-  uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_DATA, 0, 32, hdr);
-  return pkt_enc (s, hdr, NULL, 0, buf, out_len);
-}
-
-uint8_t *
 mtu_prb_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu, size_t t_pl_len,
              uint8_t *buf, size_t *out_len)
 {
@@ -706,7 +698,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           }
       }
     }
-  if (rt->cnt != rt_c_old)
+  if (rt->cnt != rt_c_old || rt->gsp_dirty)
     *is_mod = true;
   return 0;
 }
