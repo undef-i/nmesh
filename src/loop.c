@@ -1308,7 +1308,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       if (!re->is_act || re->state != RT_ACT)
         continue;
-      if (re->tx_ts == 0 || ts <= re->tx_ts || (ts - re->tx_ts) < KA_TMO)
+      if (re->tx_ts > 0 && ts > re->tx_ts && (ts - re->tx_ts) < KA_TMO)
         continue;
       pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
     }

@@ -22,11 +22,13 @@ ep_mtu_get (const Rt *rt, const uint8_t ip[16], uint16_t port)
         continue;
       if (re->ep_port != port)
         continue;
-      uint16_t mtu = (re->mtu > 0) ? re->mtu : RT_MTU_DEF;
+      uint16_t mtu
+          = (re->mtu > 0) ? re->mtu
+                          : ((re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_MIN);
       if (best == 0 || mtu < best)
         best = mtu;
     }
-  return (best > 0) ? best : RT_MTU_DEF;
+  return (best > 0) ? best : RT_MTU_MIN;
 }
 
 static bool
