@@ -24,7 +24,7 @@
 #define IFF_TAP 0x0002
 #define IFF_NO_PI 0x1000
 #define IFF_VNET_HDR 0x4000
-#define TAP_TXQ_LEN 10000
+#define TAP_TXQ_LEN 50000
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86ddU
 #endif
@@ -102,7 +102,8 @@ tap_init (const char *name)
       {
         perror ("tap: ioctl(TUNSETVNETHDRSZ) failed");
       }
-    int offload = TUN_F_CSUM;
+    int offload = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_TSO_ECN
+                  | TUN_F_UFO | TUN_F_USO4 | TUN_F_USO6;
     if (ioctl (fd, TUNSETOFFLOAD, offload) < 0)
       {
         perror ("tap: ioctl(TUNSETOFFLOAD) failed");

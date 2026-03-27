@@ -21,6 +21,8 @@ typedef struct
   UdpPMsg pend[UDP_PND_MAX];
   uint32_t pend_head;
   uint32_t pend_cnt;
+  bool gso_en;
+  bool gro_en;
 } Udp;
 
 typedef struct
@@ -46,6 +48,7 @@ void udp_emsg_cb_set (UdpEmsgsizeCallback cb);
 void udp_unr_cb_set (UdpUnreachCallback cb);
 bool udp_w_want (const Udp *s);
 int udp_w_hnd (Udp *s);
+bool udp_rx_pending (void);
 uint64_t udp_bp_ev (void);
 uint16_t udp_mtu_get (const Udp *s);
 uint16_t udp_ep_mtu_get (const uint8_t dst_ip[16]);

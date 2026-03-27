@@ -26,7 +26,7 @@ uint8_t *mtu_prb_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,
                       size_t t_pl_len, uint8_t *buf, size_t *out_len);
 uint8_t *mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,
                       uint8_t *buf, size_t *out_len);
-int pkt_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
+int pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
              size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out,
              size_t *pt_len_out);
 int gsp_prs_mtu_prb (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,

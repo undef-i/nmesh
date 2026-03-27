@@ -496,7 +496,7 @@ mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu, uint8_t *buf,
 }
 
 int
-pkt_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
+pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
          size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out, size_t *pt_len_out)
 {
   if (raw_len < PKT_HDR_SZ)
@@ -509,11 +509,13 @@ pkt_dec (Cry *s, const uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
   const uint8_t *mac = raw + PKT_CH_SZ + PKT_NONCE_SZ;
   const uint8_t *ct = raw + PKT_HDR_SZ;
   size_t ct_len = raw_len - PKT_HDR_SZ;
-  if (ct_len > pt_len)
+  uint8_t *pt = pt_buf ? pt_buf : (raw + PKT_HDR_SZ);
+  size_t pt_cap = pt_buf ? pt_len : ct_len;
+  if (ct_len > pt_cap)
     return -1;
-  if (cry_dec (s, ct, ct_len, raw, PKT_CH_SZ, nonce, mac, pt_buf) != 0)
+  if (cry_dec (s, ct, ct_len, raw, PKT_CH_SZ, nonce, mac, pt) != 0)
     return -1;
-  *pt_out = pt_buf;
+  *pt_out = pt;
   *pt_len_out = ct_len;
   return 0;
 }

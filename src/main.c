@@ -236,7 +236,11 @@ main (int argc, char **argv)
             {
               if ((ev_arr[i].events & EPOLLIN) != 0)
                 {
-                  on_udp (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, &pool);
+                  do
+                    {
+                      on_udp (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, &pool);
+                    }
+                  while (udp_rx_pending ());
                 }
               if ((ev_arr[i].events & EPOLLERR) != 0)
                 {

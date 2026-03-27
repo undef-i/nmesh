@@ -2,6 +2,7 @@
 #define _GNU_SOURCE 1
 #endif
 #include "udp.h"
+#include "utils.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,6 +22,32 @@
 
 static UdpEmsgsizeCallback g_emsg_cb = NULL;
 static UdpUnreachCallback g_unr_cb = NULL;
+#if defined(__linux__) && defined(UDP_SEGMENT)
+#define UDP_GSO_MAX_SEGS 8
+#define UDP_GSO_MAX_BYTES 65535U
+#ifndef SOL_UDP
+#define SOL_UDP IPPROTO_UDP
+#endif
+#else
+#define UDP_GSO_MAX_SEGS 8
+#endif
+#define UDP_RX_BUF_MAX 65535U
+#define UDP_RX_SPLIT_MAX (BATCH_MAX * 64)
+
+static void ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN]);
+static bool udp_pend_add (Udp *s, const UdpMsg *m);
+
+typedef struct
+{
+  uint8_t src_ip[16];
+  uint16_t src_port;
+  size_t data_len;
+  uint8_t data[UDP_PL_MAX];
+} UdpRxSeg;
+
+static UdpRxSeg g_rx_split_arr[UDP_RX_SPLIT_MAX];
+static uint32_t g_rx_split_head = 0;
+static uint32_t g_rx_split_cnt = 0;
 
 static void
 ip_to_v6m (const uint8_t ip[16], uint8_t out[16])
@@ -37,8 +64,242 @@ is_err_tns (int re)
 static bool
 is_err_unr (int re)
 {
-  return (re == ENETUNREACH || re == EHOSTUNREACH);
+  return (re == ENETUNREACH || re == EHOSTUNREACH || re == ECONNREFUSED);
 }
+
+static int
+udp_tx_1 (Udp *s, const UdpMsg *m)
+{
+  struct sockaddr_in6 addr;
+  memset (&addr, 0, sizeof (addr));
+  addr.sin6_family = AF_INET6;
+  addr.sin6_port = htons (m->dst_port);
+  ip_to_v6m (m->dst_ip, addr.sin6_addr.s6_addr);
+  ssize_t tx1 = sendto (s->fd, m->data, m->data_len, 0,
+                        (struct sockaddr *)&addr, sizeof (addr));
+  if (tx1 >= 0)
+    return 1;
+  if (is_err_tns (errno))
+    {
+      if (udp_pend_add (s, m))
+        return 1;
+      fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
+      return 0;
+    }
+  if (errno == EMSGSIZE)
+    {
+      if (g_emsg_cb)
+        g_emsg_cb (m->dst_ip, m->dst_port, m->data_len);
+      return 0;
+    }
+  if (is_err_unr (errno))
+    {
+      char ip_str[INET6_ADDRSTRLEN] = { 0 };
+      ip_fmt (m->dst_ip, ip_str);
+      fprintf (stderr,
+               "udp: unreachable on sendto errno=%d dst=%s:%u "
+               "len=%zu\n",
+               errno, ip_str, m->dst_port, m->data_len);
+      if (g_unr_cb)
+        g_unr_cb (m->dst_ip, m->dst_port);
+      return 0;
+    }
+  fprintf (stderr, "udp: sendto fallback drop errno=%d\n", errno);
+  return 0;
+}
+
+static bool
+udp_rx_split_add (const uint8_t src_ip[16], uint16_t src_port,
+                  const uint8_t *data, size_t data_len)
+{
+  static uint64_t ovf_log_ts = 0;
+  if (!src_ip || !data || data_len > UDP_PL_MAX || g_rx_split_cnt >= UDP_RX_SPLIT_MAX)
+    {
+      uint64_t now = sys_ts ();
+      if (now - ovf_log_ts >= 1000ULL)
+        {
+          fprintf (stderr,
+                   "udp: rx split backlog overflow cnt=%u max=%u len=%zu\n",
+                   (unsigned)g_rx_split_cnt, (unsigned)UDP_RX_SPLIT_MAX,
+                   data_len);
+          ovf_log_ts = now;
+        }
+      return false;
+    }
+  uint32_t idx = (g_rx_split_head + g_rx_split_cnt) % UDP_RX_SPLIT_MAX;
+  memcpy (g_rx_split_arr[idx].src_ip, src_ip, 16);
+  g_rx_split_arr[idx].src_port = src_port;
+  g_rx_split_arr[idx].data_len = data_len;
+  memcpy (g_rx_split_arr[idx].data, data, data_len);
+  g_rx_split_cnt++;
+  return true;
+}
+
+static int
+udp_rx_split_drn (uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
+                  uint16_t src_ports[], size_t len_arr[], int max_cnt)
+{
+  int out_cnt = 0;
+  while (out_cnt < max_cnt && g_rx_split_cnt > 0)
+    {
+      UdpRxSeg *seg = &g_rx_split_arr[g_rx_split_head];
+      memcpy (buf_arr[out_cnt], seg->data, seg->data_len);
+      memcpy (src_ips[out_cnt], seg->src_ip, 16);
+      src_ports[out_cnt] = seg->src_port;
+      len_arr[out_cnt] = seg->data_len;
+      g_rx_split_head = (g_rx_split_head + 1) % UDP_RX_SPLIT_MAX;
+      g_rx_split_cnt--;
+      out_cnt++;
+    }
+  return out_cnt;
+}
+
+#if defined(__linux__) && defined(UDP_SEGMENT)
+static bool
+udp_gso_grp_fit (const UdpMsg *head, const UdpMsg *msg, size_t seg_len,
+                 size_t tot_len, int seg_cnt)
+{
+  if (!head || !msg || seg_len == 0 || seg_cnt >= UDP_GSO_MAX_SEGS)
+    return false;
+  if (msg->data_len != seg_len)
+    return false;
+  if (msg->dst_port != head->dst_port)
+    return false;
+  if (memcmp (msg->dst_ip, head->dst_ip, 16) != 0)
+    return false;
+  if (tot_len + msg->data_len > UDP_GSO_MAX_BYTES)
+    return false;
+  return true;
+}
+
+static bool
+udp_gso_has_run (UdpMsg *msgs, int cnt)
+{
+  for (int i = 1; i < cnt; i++)
+    {
+      if (msgs[i].data_len == msgs[i - 1].data_len
+          && msgs[i].dst_port == msgs[i - 1].dst_port
+          && memcmp (msgs[i].dst_ip, msgs[i - 1].dst_ip, 16) == 0)
+        return true;
+    }
+  return false;
+}
+
+static int
+udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
+{
+  static uint8_t gso_buf[UDP_GSO_MAX_BYTES];
+  int acc_cnt = 0;
+  for (int i = 0; i < cnt;)
+    {
+      int grp_cnt = 1;
+      size_t seg_len = msgs[i].data_len;
+      size_t tot_len = seg_len;
+      while ((i + grp_cnt) < cnt
+             && udp_gso_grp_fit (&msgs[i], &msgs[i + grp_cnt], seg_len,
+                                 tot_len, grp_cnt))
+        {
+          tot_len += msgs[i + grp_cnt].data_len;
+          grp_cnt++;
+        }
+      if (grp_cnt < 2 || seg_len == 0)
+        {
+          int rc = udp_tx_1 (s, &msgs[i]);
+          acc_cnt += rc;
+          i++;
+          continue;
+        }
+
+      size_t off = 0;
+      for (int j = 0; j < grp_cnt; j++)
+        {
+          memcpy (gso_buf + off, msgs[i + j].data, msgs[i + j].data_len);
+          off += msgs[i + j].data_len;
+        }
+
+      struct sockaddr_in6 addr;
+      memset (&addr, 0, sizeof (addr));
+      addr.sin6_family = AF_INET6;
+      addr.sin6_port = htons (msgs[i].dst_port);
+      ip_to_v6m (msgs[i].dst_ip, addr.sin6_addr.s6_addr);
+
+      struct iovec iov = { .iov_base = gso_buf, .iov_len = off };
+      char cmsg_buf[CMSG_SPACE (sizeof (uint16_t))];
+      memset (cmsg_buf, 0, sizeof (cmsg_buf));
+      struct msghdr msg;
+      memset (&msg, 0, sizeof (msg));
+      msg.msg_name = &addr;
+      msg.msg_namelen = sizeof (addr);
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = cmsg_buf;
+      msg.msg_controllen = sizeof (cmsg_buf);
+
+      struct cmsghdr *cmsg = CMSG_FIRSTHDR (&msg);
+      cmsg->cmsg_level = SOL_UDP;
+      cmsg->cmsg_type = UDP_SEGMENT;
+      cmsg->cmsg_len = CMSG_LEN (sizeof (uint16_t));
+      *((uint16_t *)CMSG_DATA (cmsg)) = (uint16_t)seg_len;
+      msg.msg_controllen = CMSG_SPACE (sizeof (uint16_t));
+
+      ssize_t rc = sendmsg (s->fd, &msg, 0);
+      if (rc >= 0)
+        {
+          acc_cnt += grp_cnt;
+          i += grp_cnt;
+          continue;
+        }
+
+      if (errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP
+          || errno == ENOTSUP)
+        {
+          s->gso_en = false;
+          for (int j = 0; j < grp_cnt; j++)
+            acc_cnt += udp_tx_1 (s, &msgs[i + j]);
+          i += grp_cnt;
+          continue;
+        }
+      if (is_err_tns (errno))
+        {
+          for (int j = 0; j < grp_cnt; j++)
+            {
+              if (udp_pend_add (s, &msgs[i + j]))
+                acc_cnt++;
+              else
+                fprintf (stderr,
+                         "udp: pending queue full, drop outgoing packet\n");
+            }
+          i += grp_cnt;
+          continue;
+        }
+      if (errno == EMSGSIZE)
+        {
+          if (g_emsg_cb)
+            g_emsg_cb (msgs[i].dst_ip, msgs[i].dst_port, seg_len);
+          i += grp_cnt;
+          continue;
+        }
+      if (is_err_unr (errno))
+        {
+          char ip_str[INET6_ADDRSTRLEN] = { 0 };
+          ip_fmt (msgs[i].dst_ip, ip_str);
+          fprintf (stderr,
+                   "udp: unreachable on gso send errno=%d dst=%s:%u "
+                   "seg=%zu cnt=%d\n",
+                   errno, ip_str, msgs[i].dst_port, seg_len, grp_cnt);
+          if (g_unr_cb)
+            g_unr_cb (msgs[i].dst_ip, msgs[i].dst_port);
+        }
+      else
+        {
+          fprintf (stderr, "udp: gso send drop errno=%d seg=%zu cnt=%d\n",
+                   errno, seg_len, grp_cnt);
+        }
+      i += grp_cnt;
+    }
+  return acc_cnt;
+}
+#endif
 
 static void
 ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN])
@@ -125,6 +386,8 @@ int
 udp_init (Udp *s, uint16_t *port)
 {
   memset (s, 0, sizeof (*s));
+  s->gso_en = true;
+  s->gro_en = false;
   s->fd = socket (AF_INET6, SOCK_DGRAM, 0);
   if (s->fd < 0)
     return -1;
@@ -148,8 +411,8 @@ udp_init (Udp *s, uint16_t *port)
       close (fd);
     }
   */
-  int rx_buf = 8388608;
-  int sndbuf = 8388608;
+  int rx_buf = 67108864;
+  int sndbuf = 67108864;
   if (setsockopt (s->fd, SOL_SOCKET, SO_RCVBUF, &rx_buf, sizeof (rx_buf)) < 0)
     {
       perror ("udp: setsockopt so_rcvbuf 8mb failed");
@@ -211,6 +474,13 @@ udp_init (Udp *s, uint16_t *port)
       }
   }
 #endif
+#if defined(__linux__) && defined(UDP_GRO)
+  {
+    int gro = 1;
+    if (setsockopt (s->fd, IPPROTO_UDP, UDP_GRO, &gro, sizeof (gro)) == 0)
+      s->gro_en = true;
+  }
+#endif
   struct sockaddr_in6 addr;
   memset (&addr, 0, sizeof (addr));
   addr.sin6_family = AF_INET6;
@@ -266,6 +536,10 @@ udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
         }
       return acc_cnt;
     }
+#if defined(__linux__) && defined(UDP_SEGMENT)
+  if (s->gso_en && udp_gso_has_run (msgs, cnt))
+    return udp_gso_tx (s, msgs, cnt);
+#endif
   static struct mmsghdr msg_arr[BATCH_MAX];
   static struct sockaddr_in6 addr_arr[BATCH_MAX];
   static struct iovec iovs[BATCH_MAX];
@@ -294,55 +568,7 @@ udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
           int acc_cnt = tx_cnt;
           for (int i = tx_cnt; i < cnt; i++)
             {
-              struct sockaddr_in6 addr;
-              memset (&addr, 0, sizeof (addr));
-              addr.sin6_family = AF_INET6;
-              addr.sin6_port = htons (msgs[i].dst_port);
-              ip_to_v6m (msgs[i].dst_ip, addr.sin6_addr.s6_addr);
-              ssize_t tx1 = sendto (s->fd, msgs[i].data, msgs[i].data_len, 0,
-                                    (struct sockaddr *)&addr, sizeof (addr));
-              if (tx1 >= 0)
-                {
-                  acc_cnt++;
-                  continue;
-                }
-              if (is_err_tns (errno))
-                {
-                  if (udp_pend_add (s, &msgs[i]))
-                    {
-                      acc_cnt++;
-                    }
-                  else
-                    {
-                      fprintf (stderr, "udp: pending queue full, "
-                                       "drop outgoing packet\n");
-                    }
-                  continue;
-                }
-              if (errno == EMSGSIZE)
-                {
-                  if (g_emsg_cb)
-                    {
-                      g_emsg_cb (msgs[i].dst_ip, msgs[i].dst_port,
-                                 msgs[i].data_len);
-                    }
-                  continue;
-                }
-              if (is_err_unr (errno))
-                {
-                  char ip_str[INET6_ADDRSTRLEN] = { 0 };
-                  ip_fmt (msgs[i].dst_ip, ip_str);
-                  fprintf (stderr,
-                           "udp: unreachable on sendto errno=%d dst=%s:%u "
-                           "len=%zu\n",
-                           errno, ip_str, msgs[i].dst_port, msgs[i].data_len);
-                  if (g_unr_cb)
-                    {
-                      g_unr_cb (msgs[i].dst_ip, msgs[i].dst_port);
-                    }
-                  continue;
-                }
-              fprintf (stderr, "udp: sendto fallback drop errno=%d\n", errno);
+              acc_cnt += udp_tx_1 (s, &msgs[i]);
             }
           return acc_cnt;
         }
@@ -364,49 +590,158 @@ int
 udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
             uint16_t src_ports[], size_t len_arr[], int m_cnt)
 {
+  if (!s)
+    return -1;
   if (m_cnt <= 0)
     return 0;
   if (m_cnt > BATCH_MAX)
     m_cnt = BATCH_MAX;
-  static struct mmsghdr msg_arr[BATCH_MAX];
-  static struct sockaddr_in6 addr_arr[BATCH_MAX];
-  static struct iovec iovs[BATCH_MAX];
-  static bool is_init = false;
-  if (!is_init)
+  int out_cnt = udp_rx_split_drn (buf_arr, src_ips, src_ports, len_arr, m_cnt);
+  if (out_cnt >= m_cnt)
+    return out_cnt;
+  if (!s->gro_en)
+    {
+      static struct mmsghdr msg_arr[BATCH_MAX];
+      static struct sockaddr_in6 addr_arr[BATCH_MAX];
+      static struct iovec iovs[BATCH_MAX];
+      static bool is_init = false;
+      if (!is_init)
+        {
+          for (int i = 0; i < BATCH_MAX; i++)
+            {
+              memset (&addr_arr[i], 0, sizeof (addr_arr[i]));
+              memset (&msg_arr[i], 0, sizeof (msg_arr[i]));
+              msg_arr[i].msg_hdr.msg_name = &addr_arr[i];
+              msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
+              msg_arr[i].msg_hdr.msg_iov = &iovs[i];
+              msg_arr[i].msg_hdr.msg_iovlen = 1;
+            }
+          is_init = true;
+        }
+      for (int i = out_cnt; i < m_cnt; i++)
+        {
+          iovs[i].iov_base = buf_arr[i];
+          iovs[i].iov_len = UDP_PL_MAX;
+          msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
+          msg_arr[i].msg_hdr.msg_flags = 0;
+          msg_arr[i].msg_len = 0;
+        }
+      int rx_cnt = recvmmsg (s->fd, msg_arr + out_cnt, m_cnt - out_cnt,
+                             MSG_DONTWAIT, NULL);
+      if (rx_cnt < 0)
+        {
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return out_cnt;
+          return (out_cnt > 0) ? out_cnt : -1;
+        }
+      for (int i = 0; i < rx_cnt; i++)
+        {
+          int idx = out_cnt + i;
+          memcpy (src_ips[idx], addr_arr[idx].sin6_addr.s6_addr, 16);
+          src_ports[idx] = ntohs (addr_arr[idx].sin6_port);
+          len_arr[idx] = msg_arr[idx].msg_len;
+        }
+      return out_cnt + rx_cnt;
+    }
+
+  static struct mmsghdr gro_msg_arr[BATCH_MAX];
+  static struct sockaddr_in6 gro_addr_arr[BATCH_MAX];
+  static struct iovec gro_iovs[BATCH_MAX];
+  static uint8_t gro_buf_arr[BATCH_MAX][UDP_RX_BUF_MAX];
+  static char gro_cmsg_arr[BATCH_MAX][CMSG_SPACE (sizeof (uint16_t))];
+  static bool gro_init = false;
+  if (!gro_init)
     {
       for (int i = 0; i < BATCH_MAX; i++)
         {
-          memset (&addr_arr[i], 0, sizeof (addr_arr[i]));
-          memset (&msg_arr[i], 0, sizeof (msg_arr[i]));
-          msg_arr[i].msg_hdr.msg_name = &addr_arr[i];
-          msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
-          msg_arr[i].msg_hdr.msg_iov = &iovs[i];
-          msg_arr[i].msg_hdr.msg_iovlen = 1;
+          memset (&gro_addr_arr[i], 0, sizeof (gro_addr_arr[i]));
+          memset (&gro_msg_arr[i], 0, sizeof (gro_msg_arr[i]));
+          gro_msg_arr[i].msg_hdr.msg_name = &gro_addr_arr[i];
+          gro_msg_arr[i].msg_hdr.msg_namelen = sizeof (gro_addr_arr[i]);
+          gro_msg_arr[i].msg_hdr.msg_iov = &gro_iovs[i];
+          gro_msg_arr[i].msg_hdr.msg_iovlen = 1;
         }
-      is_init = true;
+      gro_init = true;
     }
-  for (int i = 0; i < m_cnt; i++)
+  for (int i = 0; i < (m_cnt - out_cnt); i++)
     {
-      iovs[i].iov_base = buf_arr[i];
-      iovs[i].iov_len = UDP_PL_MAX;
-      msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
-      msg_arr[i].msg_hdr.msg_flags = 0;
-      msg_arr[i].msg_len = 0;
+      gro_iovs[i].iov_base = gro_buf_arr[i];
+      gro_iovs[i].iov_len = sizeof (gro_buf_arr[i]);
+      gro_msg_arr[i].msg_hdr.msg_namelen = sizeof (gro_addr_arr[i]);
+      gro_msg_arr[i].msg_hdr.msg_flags = 0;
+      gro_msg_arr[i].msg_hdr.msg_control = gro_cmsg_arr[i];
+      gro_msg_arr[i].msg_hdr.msg_controllen = sizeof (gro_cmsg_arr[i]);
+      gro_msg_arr[i].msg_len = 0;
     }
-  int rx_cnt = recvmmsg (s->fd, msg_arr, m_cnt, MSG_DONTWAIT, NULL);
+  int rx_cnt = recvmmsg (s->fd, gro_msg_arr, m_cnt - out_cnt, MSG_DONTWAIT, NULL);
   if (rx_cnt < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return 0;
-      return -1;
+        return out_cnt;
+      return (out_cnt > 0) ? out_cnt : -1;
     }
   for (int i = 0; i < rx_cnt; i++)
     {
-      memcpy (src_ips[i], addr_arr[i].sin6_addr.s6_addr, 16);
-      src_ports[i] = ntohs (addr_arr[i].sin6_port);
-      len_arr[i] = msg_arr[i].msg_len;
+      size_t pkt_len = gro_msg_arr[i].msg_len;
+      uint16_t seg_len = 0;
+      for (struct cmsghdr *cmsg = CMSG_FIRSTHDR (&gro_msg_arr[i].msg_hdr);
+           cmsg != NULL; cmsg = CMSG_NXTHDR (&gro_msg_arr[i].msg_hdr, cmsg))
+        {
+#if defined(__linux__) && defined(UDP_GRO)
+          if (cmsg->cmsg_level == IPPROTO_UDP && cmsg->cmsg_type == UDP_GRO
+              && cmsg->cmsg_len >= CMSG_LEN (sizeof (uint16_t)))
+            {
+              seg_len = *((uint16_t *)CMSG_DATA (cmsg));
+            }
+#endif
+        }
+      uint8_t src_ip[16];
+      memcpy (src_ip, gro_addr_arr[i].sin6_addr.s6_addr, 16);
+      uint16_t src_port = ntohs (gro_addr_arr[i].sin6_port);
+      if (seg_len == 0)
+        {
+          if (pkt_len > UDP_PL_MAX)
+            continue;
+          if (out_cnt < m_cnt)
+            {
+              memcpy (buf_arr[out_cnt], gro_buf_arr[i], pkt_len);
+              memcpy (src_ips[out_cnt], src_ip, 16);
+              src_ports[out_cnt] = src_port;
+              len_arr[out_cnt] = pkt_len;
+              out_cnt++;
+            }
+          else
+            {
+              (void)udp_rx_split_add (src_ip, src_port, gro_buf_arr[i],
+                                      pkt_len);
+            }
+          continue;
+        }
+      if (seg_len > UDP_PL_MAX)
+        continue;
+      for (size_t off = 0; off < pkt_len;)
+        {
+          size_t chunk_len = pkt_len - off;
+          if (chunk_len > seg_len)
+            chunk_len = seg_len;
+          if (out_cnt < m_cnt)
+            {
+              memcpy (buf_arr[out_cnt], gro_buf_arr[i] + off, chunk_len);
+              memcpy (src_ips[out_cnt], src_ip, 16);
+              src_ports[out_cnt] = src_port;
+              len_arr[out_cnt] = chunk_len;
+              out_cnt++;
+            }
+          else
+            {
+              if (!udp_rx_split_add (src_ip, src_port, gro_buf_arr[i] + off,
+                                     chunk_len))
+                break;
+            }
+          off += chunk_len;
+        }
     }
-  return rx_cnt;
+  return out_cnt;
 }
 
 int
@@ -437,6 +772,12 @@ bool
 udp_w_want (const Udp *s)
 {
   return s && s->pend_cnt > 0;
+}
+
+bool
+udp_rx_pending (void)
+{
+  return g_rx_split_cnt > 0;
 }
 
 int
