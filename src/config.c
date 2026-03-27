@@ -248,12 +248,31 @@ psk_prs (const char *s, uint8_t out[32])
   return crypto_generichash (out, 32, (const uint8_t *)s, s_len, NULL, 0);
 }
 
+static int
+bool_prs (const char *s, bool *out)
+{
+  if (!s || !out)
+    return -1;
+  if (strcmp (s, "enable") == 0)
+    {
+      *out = true;
+      return 0;
+    }
+  if (strcmp (s, "disable") == 0)
+    {
+      *out = false;
+      return 0;
+    }
+  return -1;
+}
+
 int
 cfg_load (const char *path, Cfg *cfg)
 {
   memset (cfg, 0, sizeof (*cfg));
   cfg->port = 50000;
   cfg->mtu = 1280;
+  cfg->frag = false;
   cfg->p2p = P2P_EN;
   strcpy (cfg->ifname, "nmesh");
   FILE *fp = fopen (path, "r");
@@ -297,6 +316,14 @@ cfg_load (const char *path, Cfg *cfg)
       else if (strcmp (k, "p2p") == 0)
         {
           cfg->p2p = (strcmp (v, "enable") == 0) ? P2P_EN : P2P_DIS;
+        }
+      else if (strcmp (k, "frag") == 0)
+        {
+          if (bool_prs (v, &cfg->frag) != 0)
+            {
+              fclose (fp);
+              return -1;
+            }
         }
       else if (strcmp (k, "ifname") == 0)
         {

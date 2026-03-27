@@ -849,6 +849,8 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
                     lla_str, ip_str, port, (int)t->re_arr[i].state,
                     t->re_arr[i].rt_m); */
       }
+      bool was_act = t->re_arr[i].is_act;
+      RtSt was_state = t->re_arr[i].state;
       re_rx_ack (&t->re_arr[i], sys_ts);
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
@@ -870,6 +872,10 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
                     : RT_M_INF;
         }
       rt_map_mark (t);
+      if (!is_z16 && (!was_act || was_state != RT_ACT))
+        {
+          rt_gsp_dirty_set (t, "ep_upd (direct active)");
+        }
       return;
     }
   if (rt_cap_chk (t, 1))
@@ -913,6 +919,10 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       }
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
+      if (!is_z16)
+        {
+          rt_gsp_dirty_set (t, "ep_upd (direct new)");
+        }
       if (!is_z16)
         {
           char lla_str[INET6_ADDRSTRLEN] = { 0 };
@@ -1146,23 +1156,24 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
       if (re->prb_tx >= 2)
         {
           uint16_t fail_mtu = re->prb_mtu;
-          if (fail_mtu <= re->mtu_lkg)
-            {
-              re->mtu_ukb = fail_mtu;
-              re->mtu_lkg = RT_MTU_MIN;
-              re->mtu = RT_MTU_MIN;
-            }
-          else if (fail_mtu > RT_MTU_MIN
+          if (fail_mtu > re->mtu_lkg && fail_mtu > RT_MTU_MIN
                    && (uint16_t)(fail_mtu - 1U) < re->mtu_ukb)
             {
               re->mtu_ukb = (uint16_t)(fail_mtu - 1U);
+              if (re->mtu_ukb < re->mtu_lkg)
+                re->mtu_ukb = re->mtu_lkg;
+              if (re->mtu > re->mtu_lkg)
+                re->mtu = re->mtu_lkg;
+              re->vfy_ts = 0;
+              re->mtu_st = MTU_ST_S;
             }
-          if (re->mtu_ukb < re->mtu_lkg)
-            re->mtu_ukb = re->mtu_lkg;
-          if (re->mtu > re->mtu_lkg)
-            re->mtu = re->mtu_lkg;
-          re->vfy_ts = 0;
-          re->mtu_st = MTU_ST_S;
+          else
+            {
+              re->mtu_st
+                  = (re->mtu_ukb <= (uint16_t)(re->mtu_lkg + RT_MTU_EPS))
+                        ? MTU_ST_F
+                        : MTU_ST_S;
+            }
         }
       else
         {
@@ -1176,6 +1187,25 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
       re->prb_tx = 0;
       re->prb_ddl = 0;
       re_mtu_sync (t, re);
+    }
+}
+
+void
+rt_mtu_probe_idle (Rt *t)
+{
+  if (!t)
+    return;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      Re *re = &t->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      re->prb_i_ts = 0;
+      re->prb_mtu = 0;
+      re->prb_id = 0;
+      re->prb_tx = 0;
+      re->prb_tx_ts = 0;
+      re->prb_ddl = 0;
     }
 }
 
@@ -1280,6 +1310,7 @@ rt_pmtu_ack_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint32_t probe_id,
         continue;
       if (re->prb_mtu != probe_mtu)
         continue;
+      uint16_t old_mtu = re->mtu;
       uint16_t mtu_ub = rt_mtu_ub (t);
       if (probe_mtu > mtu_ub)
         probe_mtu = mtu_ub;
@@ -1308,6 +1339,11 @@ rt_pmtu_ack_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint32_t probe_id,
           re->mtu_st = MTU_ST_S;
         }
       re_mtu_sync (t, re);
+      if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) != 0
+          && re->mtu != old_mtu)
+        {
+          rt_gsp_dirty_set (t, "pmtu_ack (direct mtu)");
+        }
       return;
     }
 }
@@ -1332,6 +1368,7 @@ rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
         continue;
       if (re->ep_port != port)
         continue;
+      uint16_t old_mtu = re->mtu;
       re->mtu_ukb = pmtu;
       if (re->mtu_lkg > pmtu)
         re->mtu_lkg = pmtu;
@@ -1345,6 +1382,11 @@ rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
       re->vfy_ts = 0;
       re->hld_ts = 0;
       re_mtu_sync (t, re);
+      if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) != 0
+          && re->mtu != old_mtu)
+        {
+          rt_gsp_dirty_set (t, "pmtu_ptb (direct mtu)");
+        }
     }
 }
 
@@ -1374,6 +1416,7 @@ rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port, size_t atmpt_plen,
         continue;
       if (re->ep_port != port)
         continue;
+      uint16_t old_mtu = re->mtu;
       if (fail_ukb < RT_MTU_DEF)
         {
           re->mtu_lkg = RT_MTU_MIN;
@@ -1397,6 +1440,11 @@ rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port, size_t atmpt_plen,
       re->vfy_ts = 0;
       re->hld_ts = 0;
       re_mtu_sync (t, re);
+      if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) != 0
+          && re->mtu != old_mtu)
+        {
+          rt_gsp_dirty_set (t, "emsg_hnd (direct mtu)");
+        }
     }
 }
 

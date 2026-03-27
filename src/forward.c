@@ -92,6 +92,41 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
+  if (!cfg->frag)
+    {
+      static uint8_t rel_nf_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
+      uint8_t *vnet_pkt = rel_nf_buf + TAP_HR + PKT_HDR_SZ;
+      memcpy (vnet_pkt, vnet_frame, vnet_len);
+      uint8_t *frame_pkt = vnet_pkt + VNET_HL;
+      size_t l3_off = ETH_HLEN;
+      uint16_t eth_type
+          = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
+      if ((eth_type == 0x8100U || eth_type == 0x88A8U)
+          && frame_len >= ETH_HLEN + 4 + 20)
+        {
+          eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
+          l3_off = ETH_HLEN + 4;
+        }
+      if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off
+          && cfg->mtu >= 88U)
+        {
+          mss_clp (frame_pkt + l3_off, frame_len - l3_off, cfg->mtu);
+        }
+      size_t out_len = 0;
+      uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_pkt, vnet_len,
+                                      1, hop_c, &out_len);
+      udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
+      rt_tx_ack (rt, tx_ip, tx_port, ts);
+      g_tx_ts = ts;
+      if (dec.type == RT_REL && cfg->p2p == P2P_EN)
+        {
+          static uint8_t hp_buf[UDP_PL_MAX];
+          size_t hp_len = 0;
+          hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
+          udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
+        }
+      return true;
+    }
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
     {
@@ -227,6 +262,32 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   if (s_ip && memcmp (tx_ip, s_ip, 16) == 0 && tx_port == s_port)
     {
       return false;
+    }
+  if (!cfg->frag)
+    {
+      uint8_t dst_tail[4];
+      memcpy (dst_tail, dest_lla + 12, 4);
+      static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR];
+      uint8_t *chunk_dst
+          = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
+      memcpy (chunk_dst, chunk, chunk_len);
+      size_t out_len = 0;
+      uint8_t *out_ptr
+          = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, frag_off, mf_in,
+                         1, dst_tail, hop_c, &out_len);
+      if (!out_ptr || out_len == 0)
+        return false;
+      udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
+      rt_tx_ack (rt, tx_ip, tx_port, ts);
+      g_tx_ts = ts;
+      if (dec.type == RT_REL && cfg->p2p == P2P_EN)
+        {
+          static uint8_t hp_buf[UDP_PL_MAX];
+          size_t hp_len = 0;
+          hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
+          udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
+        }
+      return true;
     }
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
