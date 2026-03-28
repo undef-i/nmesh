@@ -8,6 +8,7 @@
 
 typedef struct
 {
+  uint8_t alg;
   uint8_t key[32];
   uint8_t n_sid[CRY_NONCE_SID_SZ];
   uint64_t cnt;

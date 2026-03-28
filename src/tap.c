@@ -12,6 +12,9 @@
 #ifndef TUNSETIFF
 #define TUNSETIFF 0x400454caU
 #endif
+#ifndef TUNSETSNDBUF
+#define TUNSETSNDBUF 0x400454d4U
+#endif
 #ifndef SIOCSIFFLAGS
 #define SIOCSIFFLAGS 0x8914U
 #endif
@@ -24,7 +27,8 @@
 #define IFF_TAP 0x0002
 #define IFF_NO_PI 0x1000
 #define IFF_VNET_HDR 0x4000
-#define TAP_TXQ_LEN 50000
+#define TAP_TXQ_LEN 500000
+#define TAP_SND_BUF (256 * 1024 * 1024)
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86ddU
 #endif
@@ -38,6 +42,8 @@
 #define NA_F_SOL 0x40
 #define NA_F_OVR 0x20
 #define ICMP6_OPT_TLL 2
+
+static bool g_tap_udp_gso = false;
 
 static void
 tap_txq_set (const char *name)
@@ -54,6 +60,12 @@ tap_txq_set (const char *name)
       perror ("tap: ioctl(SIOCSIFTXQLEN) failed");
     }
   close (sock);
+}
+
+bool
+tap_udp_gso_ok (void)
+{
+  return g_tap_udp_gso;
 }
 
 void
@@ -102,11 +114,30 @@ tap_init (const char *name)
       {
         perror ("tap: ioctl(TUNSETVNETHDRSZ) failed");
       }
-    int offload = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_TSO_ECN
-                  | TUN_F_UFO | TUN_F_USO4 | TUN_F_USO6;
-    if (ioctl (fd, TUNSETOFFLOAD, offload) < 0)
+    int tcp_offload = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_TSO_ECN;
+    int udp_offload = TUN_F_UFO | TUN_F_USO4 | TUN_F_USO6;
+    int offload = tcp_offload | udp_offload;
+    g_tap_udp_gso = false;
+    if (ioctl (fd, TUNSETOFFLOAD, offload) == 0)
+      {
+        g_tap_udp_gso = true;
+      }
+    else if (ioctl (fd, TUNSETOFFLOAD, tcp_offload) < 0)
       {
         perror ("tap: ioctl(TUNSETOFFLOAD) failed");
+      }
+    else
+      {
+        fprintf (stderr,
+                 "tap: UDP segmentation offload unavailable; "
+                 "falling back to plain UDP delivery\n");
+      }
+  }
+  {
+    int sndbuf = TAP_SND_BUF;
+    if (ioctl (fd, TUNSETSNDBUF, &sndbuf) < 0)
+      {
+        perror ("tap: ioctl(TUNSETSNDBUF) failed");
       }
   }
   tap_txq_set (name);

@@ -321,7 +321,7 @@ gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
       gsp_ent.ep_port = re->ep_port;
       gsp_ent.flags = 0;
       gsp_ent.state = (uint8_t)re->state;
-      gsp_ent.mtu = re->mtu;
+      gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
       if (memcmp (re->lla, our_lla, 16) == 0
@@ -372,7 +372,7 @@ gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt, const uint8_t tgt_lla[16],
       gsp_ent.ep_port = re->ep_port;
       gsp_ent.flags = 0;
       gsp_ent.state = (uint8_t)re->state;
-      gsp_ent.mtu = re->mtu;
+      gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
       if (memcmp (re->lla, our_lla, 16) == 0

@@ -36,6 +36,8 @@ static UdpUnreachCallback g_unr_cb = NULL;
 
 static void ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN]);
 static bool udp_pend_add (Udp *s, const UdpMsg *m);
+static void udp_sock_buf_set (int fd, int opt, int force_opt, int want,
+                              const char *name);
 
 typedef struct
 {
@@ -147,6 +149,24 @@ udp_rx_split_drn (uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
       memcpy (src_ips[out_cnt], seg->src_ip, 16);
       src_ports[out_cnt] = seg->src_port;
       len_arr[out_cnt] = seg->data_len;
+      g_rx_split_head = (g_rx_split_head + 1) % UDP_RX_SPLIT_MAX;
+      g_rx_split_cnt--;
+      out_cnt++;
+    }
+  return out_cnt;
+}
+
+static int
+udp_rx_split_pkt_drn (UdpRxPkt pkt_arr[], int max_cnt)
+{
+  int out_cnt = 0;
+  while (out_cnt < max_cnt && g_rx_split_cnt > 0)
+    {
+      UdpRxSeg *seg = &g_rx_split_arr[g_rx_split_head];
+      pkt_arr[out_cnt].data = seg->data;
+      pkt_arr[out_cnt].data_len = seg->data_len;
+      memcpy (pkt_arr[out_cnt].src_ip, seg->src_ip, 16);
+      pkt_arr[out_cnt].src_port = seg->src_port;
       g_rx_split_head = (g_rx_split_head + 1) % UDP_RX_SPLIT_MAX;
       g_rx_split_cnt--;
       out_cnt++;
@@ -314,6 +334,30 @@ ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN])
     inet_ntop (AF_INET6, ip, out, INET6_ADDRSTRLEN);
 }
 
+static void
+udp_sock_buf_set (int fd, int opt, int force_opt, int want, const char *name)
+{
+  bool is_ok = false;
+#ifdef SO_RCVBUFFORCE
+  if (force_opt >= 0
+      && setsockopt (fd, SOL_SOCKET, force_opt, &want, sizeof (want)) == 0)
+    is_ok = true;
+#endif
+  if (!is_ok && setsockopt (fd, SOL_SOCKET, opt, &want, sizeof (want)) == 0)
+    is_ok = true;
+  if (!is_ok)
+    {
+      fprintf (stderr, "udp: setsockopt %s failed errno=%d\n", name, errno);
+      return;
+    }
+  int got = 0;
+  socklen_t got_len = sizeof (got);
+  if (getsockopt (fd, SOL_SOCKET, opt, &got, &got_len) == 0)
+    {
+      fprintf (stderr, "udp: %s actual=%d requested=%d\n", name, got, want);
+    }
+}
+
 static bool
 udp_pend_add (Udp *s, const UdpMsg *m)
 {
@@ -413,14 +457,20 @@ udp_init (Udp *s, uint16_t *port)
   */
   int rx_buf = 67108864;
   int sndbuf = 67108864;
-  if (setsockopt (s->fd, SOL_SOCKET, SO_RCVBUF, &rx_buf, sizeof (rx_buf)) < 0)
-    {
-      perror ("udp: setsockopt so_rcvbuf 8mb failed");
-    }
-  if (setsockopt (s->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof (sndbuf)) < 0)
-    {
-      perror ("udp: setsockopt so_sndbuf 8mb failed");
-    }
+  udp_sock_buf_set (s->fd, SO_RCVBUF,
+#ifdef SO_RCVBUFFORCE
+                    SO_RCVBUFFORCE,
+#else
+                    -1,
+#endif
+                    rx_buf, "so_rcvbuf");
+  udp_sock_buf_set (s->fd, SO_SNDBUF,
+#ifdef SO_SNDBUFFORCE
+                    SO_SNDBUFFORCE,
+#else
+                    -1,
+#endif
+                    sndbuf, "so_sndbuf");
   int off = 0;
   if (setsockopt (s->fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof (off)) < 0)
     {
@@ -587,8 +637,7 @@ udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
 }
 
 int
-udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
-            uint16_t src_ports[], size_t len_arr[], int m_cnt)
+udp_rx_pkt_arr (Udp *s, UdpRxPkt pkt_arr[], int m_cnt)
 {
   if (!s)
     return -1;
@@ -596,7 +645,7 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
     return 0;
   if (m_cnt > BATCH_MAX)
     m_cnt = BATCH_MAX;
-  int out_cnt = udp_rx_split_drn (buf_arr, src_ips, src_ports, len_arr, m_cnt);
+  int out_cnt = udp_rx_split_pkt_drn (pkt_arr, m_cnt);
   if (out_cnt >= m_cnt)
     return out_cnt;
   if (!s->gro_en)
@@ -604,6 +653,7 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
       static struct mmsghdr msg_arr[BATCH_MAX];
       static struct sockaddr_in6 addr_arr[BATCH_MAX];
       static struct iovec iovs[BATCH_MAX];
+      static uint8_t rx_buf_arr[BATCH_MAX][UDP_PL_MAX];
       static bool is_init = false;
       if (!is_init)
         {
@@ -620,7 +670,7 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
         }
       for (int i = out_cnt; i < m_cnt; i++)
         {
-          iovs[i].iov_base = buf_arr[i];
+          iovs[i].iov_base = rx_buf_arr[i];
           iovs[i].iov_len = UDP_PL_MAX;
           msg_arr[i].msg_hdr.msg_namelen = sizeof (addr_arr[i]);
           msg_arr[i].msg_hdr.msg_flags = 0;
@@ -637,9 +687,10 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
       for (int i = 0; i < rx_cnt; i++)
         {
           int idx = out_cnt + i;
-          memcpy (src_ips[idx], addr_arr[idx].sin6_addr.s6_addr, 16);
-          src_ports[idx] = ntohs (addr_arr[idx].sin6_port);
-          len_arr[idx] = msg_arr[idx].msg_len;
+          pkt_arr[idx].data = rx_buf_arr[idx];
+          pkt_arr[idx].data_len = msg_arr[idx].msg_len;
+          memcpy (pkt_arr[idx].src_ip, addr_arr[idx].sin6_addr.s6_addr, 16);
+          pkt_arr[idx].src_port = ntohs (addr_arr[idx].sin6_port);
         }
       return out_cnt + rx_cnt;
     }
@@ -704,10 +755,10 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
             continue;
           if (out_cnt < m_cnt)
             {
-              memcpy (buf_arr[out_cnt], gro_buf_arr[i], pkt_len);
-              memcpy (src_ips[out_cnt], src_ip, 16);
-              src_ports[out_cnt] = src_port;
-              len_arr[out_cnt] = pkt_len;
+              pkt_arr[out_cnt].data = gro_buf_arr[i];
+              pkt_arr[out_cnt].data_len = pkt_len;
+              memcpy (pkt_arr[out_cnt].src_ip, src_ip, 16);
+              pkt_arr[out_cnt].src_port = src_port;
               out_cnt++;
             }
           else
@@ -726,10 +777,10 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
             chunk_len = seg_len;
           if (out_cnt < m_cnt)
             {
-              memcpy (buf_arr[out_cnt], gro_buf_arr[i] + off, chunk_len);
-              memcpy (src_ips[out_cnt], src_ip, 16);
-              src_ports[out_cnt] = src_port;
-              len_arr[out_cnt] = chunk_len;
+              pkt_arr[out_cnt].data = gro_buf_arr[i] + off;
+              pkt_arr[out_cnt].data_len = chunk_len;
+              memcpy (pkt_arr[out_cnt].src_ip, src_ip, 16);
+              pkt_arr[out_cnt].src_port = src_port;
               out_cnt++;
             }
           else
@@ -742,6 +793,24 @@ udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
         }
     }
   return out_cnt;
+}
+
+int
+udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
+            uint16_t src_ports[], size_t len_arr[], int m_cnt)
+{
+  static UdpRxPkt pkt_arr[BATCH_MAX];
+  int rx_cnt = udp_rx_pkt_arr (s, pkt_arr, m_cnt);
+  if (rx_cnt <= 0)
+    return rx_cnt;
+  for (int i = 0; i < rx_cnt; i++)
+    {
+      memcpy (buf_arr[i], pkt_arr[i].data, pkt_arr[i].data_len);
+      memcpy (src_ips[i], pkt_arr[i].src_ip, 16);
+      src_ports[i] = pkt_arr[i].src_port;
+      len_arr[i] = pkt_arr[i].data_len;
+    }
+  return rx_cnt;
 }
 
 int

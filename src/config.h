@@ -15,7 +15,7 @@ typedef struct
   uint8_t addr[16];
   uint16_t port;
   uint16_t mtu;
-  bool frag;
+  bool mtu_probe;
   bool l_exp;
   P2pMode p2p;
   uint8_t psk[32];

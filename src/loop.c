@@ -377,12 +377,13 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       tap_mtu_set (cfg->ifname, cfg->mtu);
       fprintf (stderr, "main: reloaded tap mtu to %u\n", (unsigned)cfg->mtu);
     }
-  if (cfg->frag != new_cfg.frag)
+  if (cfg->mtu_probe != new_cfg.mtu_probe)
     {
-      cfg->frag = new_cfg.frag;
-      if (!cfg->frag)
+      cfg->mtu_probe = new_cfg.mtu_probe;
+      rt_mtu_probe_set (rt, cfg->mtu_probe);
+      if (!cfg->mtu_probe)
         rt_mtu_probe_idle (rt);
-      fprintf (stderr, "main: reloaded frag mode\n");
+      fprintf (stderr, "main: reloaded mtu_probe mode\n");
     }
   if (cfg->p2p != new_cfg.p2p)
     {
@@ -961,8 +962,7 @@ tap_tx_path_fit (Rt *rt, const Cfg *cfg, uint64_t now, const uint8_t *frame_pkt,
       tx_path->type = RT_NONE;
       return true;
     }
-  if (cfg->frag)
-    tx_path->pmtu = rt_mtu (rt, &dec);
+  tx_path->pmtu = rt_mtu (rt, &dec);
   return true;
 }
 
@@ -1117,10 +1117,11 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   uint8_t rel_f = tx_path_lcl.rel_f;
   const uint8_t *rel_dst_lla = (rel_f != 0) ? tx_path_lcl.rt_key : NULL;
 
-  if (!cfg->frag)
+  if (!cfg->mtu_probe)
     {
       size_t l3_off = ETH_HLEN;
-      uint16_t eth_type = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
+      uint16_t eth_type
+          = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
       if ((eth_type == 0x8100U || eth_type == 0x88A8U)
           && frame_len >= ETH_HLEN + 4 + 20)
         {
@@ -1128,13 +1129,13 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
           l3_off = ETH_HLEN + 4;
         }
       if (mss_apply && (eth_type == 0x0800U || eth_type == 0x86DDU)
-          && frame_len > l3_off
-          && cfg->mtu >= 88U)
+          && frame_len > l3_off && cfg->mtu >= 88U)
         {
           mss_clp (frame_pkt + l3_off, frame_len - l3_off, cfg->mtu);
         }
       size_t out_len;
-      uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f, 32, &out_len);
+      uint8_t *out_ptr
+          = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f, 32, &out_len);
       if (*bc >= BATCH_MAX
           && !tap_batch_fls (udp, batch_arr, bc,
                              "udp: batch send failed before enqueue data"))
@@ -1155,7 +1156,6 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
         return false;
       return true;
     }
-
   uint16_t pmtu = tx_path_lcl.pmtu;
   uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
   const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
@@ -1842,7 +1842,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
     }
   uint64_t ts = sys_ts ();
-  if (cfg->frag)
+  if (cfg->mtu_probe)
     rt_mtu_tk (rt, ts);
   else
     rt_mtu_probe_idle (rt);
@@ -1891,7 +1891,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         continue;
       pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
     }
-  if (cfg->frag)
+  if (cfg->mtu_probe)
     {
       for (int burst = 0; burst < 3; burst++)
         {
@@ -2070,36 +2070,31 @@ on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool)
             strcpy (row->rtt, "-");
           else
             snprintf (row->rtt, sizeof (row->rtt), "%ums", show_m);
-          if (cfg->frag)
-            {
-              uint16_t pmtu = rt_mtu (rt, &sel);
-              uint16_t prb_mtu = 0, lkg = pmtu, ukb = pmtu;
-              bool is_srch = false, is_fixed = true;
-              MtuSt mtu_st = MTU_ST_B;
-              rt_pmtu_st (rt, &sel, &pmtu, &prb_mtu, &is_srch, &is_fixed);
-              rt_pmtu_lims (rt, &sel, &lkg, &ukb, &mtu_st);
-              if (is_srch)
-                {
-                  if (prb_mtu > 0)
-                    snprintf (row->mtu, sizeof (row->mtu), "%u (%u-%u, %u)",
-                              pmtu, lkg, ukb, prb_mtu);
-                  else
-                    snprintf (row->mtu, sizeof (row->mtu), "%u (%u-%u)", pmtu,
-                              lkg, ukb);
-                }
-              else
-                {
-                  if (mtu_st == MTU_ST_F || is_fixed)
-                    snprintf (row->mtu, sizeof (row->mtu), "%u", pmtu);
-                  else
-                    snprintf (row->mtu, sizeof (row->mtu),
-                              "%u (LKG:%u, UKB:%u, base)", pmtu, lkg, ukb);
-                }
-            }
-          else
-            {
-              row->mtu[0] = '\0';
-            }
+          {
+            uint16_t pmtu = rt_mtu (rt, &sel);
+            uint16_t prb_mtu = 0, lkg = pmtu, ukb = pmtu;
+            bool is_srch = false, is_fixed = true;
+            MtuSt mtu_st = MTU_ST_B;
+            rt_pmtu_st (rt, &sel, &pmtu, &prb_mtu, &is_srch, &is_fixed);
+            rt_pmtu_lims (rt, &sel, &lkg, &ukb, &mtu_st);
+            if (is_srch)
+              {
+                if (prb_mtu > 0)
+                  snprintf (row->mtu, sizeof (row->mtu), "%u (%u-%u, %u)",
+                            pmtu, lkg, ukb, prb_mtu);
+                else
+                  snprintf (row->mtu, sizeof (row->mtu), "%u (%u-%u)", pmtu,
+                            lkg, ukb);
+              }
+            else
+              {
+                if (mtu_st == MTU_ST_F || is_fixed)
+                  snprintf (row->mtu, sizeof (row->mtu), "%u", pmtu);
+                else
+                  snprintf (row->mtu, sizeof (row->mtu),
+                            "%u (LKG:%u, UKB:%u, base)", pmtu, lkg, ukb);
+              }
+          }
           strcpy (row->st, show_m >= RT_M_INF ? "pending" : "active");
         }
       if ((int)strlen (row->nh) > m_nh)
@@ -2110,7 +2105,7 @@ on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool)
         act_map_cnt++;
       if ((int)strlen (row->st) > m_st)
         m_st = (int)strlen (row->st);
-      if (cfg->frag && (int)strlen (row->mtu) > m_mtu)
+      if ((int)strlen (row->mtu) > m_mtu)
         m_mtu = (int)strlen (row->mtu);
     }
 
@@ -2136,7 +2131,7 @@ on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool)
         m_nh = (int)strlen (row->nh);
       if ((int)strlen (row->st) > m_st)
         m_st = (int)strlen (row->st);
-      if (cfg->frag && (int)strlen (row->mtu) > m_mtu)
+      if ((int)strlen (row->mtu) > m_mtu)
         m_mtu = (int)strlen (row->mtu);
     }
 
@@ -2147,26 +2142,13 @@ on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool)
           (unsigned long long)rt->ping_tx_cnt);
   if (r_cnt > 0)
     {
-      if (cfg->frag)
+      printf ("  %-*s  %-*s  %-*s  %-*s  rtt\n", m_dst, "dst", m_nh,
+              "nexthop", m_st, "state", m_mtu, "mtu");
+      for (int k = 0; k < r_cnt; k++)
         {
-          printf ("  %-*s  %-*s  %-*s  %-*s  rtt\n", m_dst, "dst", m_nh,
-                  "nexthop", m_st, "state", m_mtu, "mtu");
-          for (int k = 0; k < r_cnt; k++)
-            {
-              printf ("  %-*s  %-*s  %-*s  %-*s  %s\n", m_dst, rows[k].dst,
-                      m_nh, rows[k].nh, m_st, rows[k].st, m_mtu, rows[k].mtu,
-                      rows[k].rtt);
-            }
-        }
-      else
-        {
-          printf ("  %-*s  %-*s  %-*s  rtt\n", m_dst, "dst", m_nh, "nexthop",
-                  m_st, "state");
-          for (int k = 0; k < r_cnt; k++)
-            {
-              printf ("  %-*s  %-*s  %-*s  %s\n", m_dst, rows[k].dst, m_nh,
-                      rows[k].nh, m_st, rows[k].st, rows[k].rtt);
-            }
+          printf ("  %-*s  %-*s  %-*s  %-*s  %s\n", m_dst, rows[k].dst, m_nh,
+                  rows[k].nh, m_st, rows[k].st, m_mtu, rows[k].mtu,
+                  rows[k].rtt);
         }
     }
 }

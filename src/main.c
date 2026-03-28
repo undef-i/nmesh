@@ -67,6 +67,7 @@ main (int argc, char **argv)
   pp_init (&pool, cfg_path);
   Rt rt;
   rt_init (&rt);
+  rt_mtu_probe_set (&rt, cfg.mtu_probe);
   memcpy (rt.our_lla, cfg.addr, 16);
   P peers[RT_MAX];
   int peer_cnt = p_arr_ld (cfg_path, peers, RT_MAX);

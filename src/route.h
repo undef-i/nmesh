@@ -165,6 +165,7 @@ typedef struct Rt
   uint8_t our_lla[16];
   uint32_t prb_nxt_id;
   uint16_t mtu_ub;
+  bool mtu_probe;
   bool map_dirty;
   bool gsp_dirty;
   uint64_t gsp_last_ts;
@@ -214,6 +215,7 @@ void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 void rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 RtDec rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p);
 uint16_t rt_mtu (const Rt *t, const RtDec *sel);
+void rt_mtu_probe_set (Rt *t, bool is_on);
 void rt_mtu_probe_idle (Rt *t);
 bool rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
                   uint32_t *prb_id);

@@ -2,7 +2,7 @@
 #include <string.h>
 
 #define RX_RP_MAX 512
-#define RX_RP_W 16
+#define RX_RP_W 256
 #define RX_RP_B (RX_RP_W * 64)
 
 typedef struct
@@ -39,50 +39,26 @@ rx_rp_map_rst (uint64_t map[RX_RP_W])
 }
 
 static void
-rx_rp_map_shl (uint64_t map[RX_RP_W], uint64_t sh)
+rx_rp_map_clr (uint64_t map[RX_RP_W], uint64_t cnt)
 {
-  if (sh == 0)
-    return;
-  if (sh >= RX_RP_B)
-    {
-      rx_rp_map_rst (map);
-      return;
-    }
-  uint64_t tmp[RX_RP_W] = { 0 };
-  size_t w_sh = (size_t)(sh / 64);
-  size_t b_sh = (size_t)(sh % 64);
-  for (int i = RX_RP_W - 1; i >= 0; i--)
-    {
-      if ((size_t)i < w_sh)
-        continue;
-      size_t src = (size_t)i - w_sh;
-      uint64_t v = map[src] << b_sh;
-      if (b_sh != 0 && src > 0)
-        {
-          v |= (map[src - 1] >> (64 - b_sh));
-        }
-      tmp[i] = v;
-    }
-  memcpy (map, tmp, sizeof (tmp));
+  size_t wi = (size_t)((cnt % RX_RP_B) / 64U);
+  size_t bi = (size_t)(cnt & 63U);
+  map[wi] &= ~(1ULL << bi);
 }
 
 static bool
-rx_rp_map_tst (const uint64_t map[RX_RP_W], uint64_t df)
+rx_rp_map_tst (const uint64_t map[RX_RP_W], uint64_t cnt)
 {
-  if (df >= RX_RP_B)
-    return false;
-  size_t wi = (size_t)(df / 64);
-  size_t bi = (size_t)(df % 64);
+  size_t wi = (size_t)((cnt % RX_RP_B) / 64U);
+  size_t bi = (size_t)(cnt & 63U);
   return (map[wi] & (1ULL << bi)) != 0;
 }
 
 static void
-rx_rp_map_set (uint64_t map[RX_RP_W], uint64_t df)
+rx_rp_map_set (uint64_t map[RX_RP_W], uint64_t cnt)
 {
-  if (df >= RX_RP_B)
-    return;
-  size_t wi = (size_t)(df / 64);
-  size_t bi = (size_t)(df % 64);
+  size_t wi = (size_t)((cnt % RX_RP_B) / 64U);
+  size_t bi = (size_t)(cnt & 63U);
   map[wi] |= (1ULL << bi);
 }
 
@@ -139,7 +115,7 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
       memcpy (slot->sid, sid, sizeof (sid));
       slot->max_cnt = cnt;
       rx_rp_map_rst (slot->map);
-      rx_rp_map_set (slot->map, 0);
+      rx_rp_map_set (slot->map, cnt);
       return true;
     }
   if (memcmp (slot->sid, sid, sizeof (sid)) != 0)
@@ -147,23 +123,31 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
       memcpy (slot->sid, sid, sizeof (sid));
       slot->max_cnt = cnt;
       rx_rp_map_rst (slot->map);
-      rx_rp_map_set (slot->map, 0);
+      rx_rp_map_set (slot->map, cnt);
       return true;
     }
   if (cnt > slot->max_cnt)
     {
       uint64_t sh = cnt - slot->max_cnt;
-      rx_rp_map_shl (slot->map, sh);
-      rx_rp_map_set (slot->map, 0);
+      if (sh >= RX_RP_B)
+        {
+          rx_rp_map_rst (slot->map);
+        }
+      else
+        {
+          for (uint64_t clr = slot->max_cnt + 1; clr <= cnt; clr++)
+            rx_rp_map_clr (slot->map, clr);
+        }
       slot->max_cnt = cnt;
+      rx_rp_map_set (slot->map, cnt);
       return true;
     }
   uint64_t df = slot->max_cnt - cnt;
   if (df >= RX_RP_B)
     return false;
-  if (rx_rp_map_tst (slot->map, df))
+  if (rx_rp_map_tst (slot->map, cnt))
     return false;
-  rx_rp_map_set (slot->map, df);
+  rx_rp_map_set (slot->map, cnt);
   return true;
 }
 

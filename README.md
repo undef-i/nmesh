@@ -18,7 +18,7 @@ ifname = nmesh
 address = fe80::1
 listen = 11451
 mtu = 1280
-frag = disable
+mtu_probe = disable
 psk = your_psk
 peer = 203.0.113.1:11451
 

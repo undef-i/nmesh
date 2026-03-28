@@ -2,9 +2,11 @@
 #include "tap.h"
 #include "utils.h"
 #include <arpa/inet.h>
+#include <errno.h>
 #include <linux/virtio_net.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -33,6 +35,7 @@ typedef struct
 } GroEnt;
 
 static GroEnt g_gro[GRO_SLOTS];
+static bool g_udp_gso_bad = false;
 
 static inline uint16_t
 u16_be_rd (const uint8_t *p)
@@ -170,6 +173,67 @@ gro_ent_fls (int tap_fd, GroEnt *gro)
 {
   if (!gro->act)
     return;
+  if (gro->proto == GRO_PROTO_UDP
+      && (!tap_udp_gso_ok () || g_udp_gso_bad))
+    {
+      static uint8_t seg_buf[GRO_MAX_SZ + 256];
+      static const uint8_t z_vnet[VNET_HL] = { 0 };
+      size_t hdr_len = gro->mac_hl + gro->ip_hl + 8U;
+      if (gro->gso_sz == 0 || gro->len < hdr_len)
+        {
+          fprintf (stderr, "gro: invalid udp gso frame, drop\n");
+          gro->act = false;
+          return;
+        }
+      size_t pl_len = gro->len - hdr_len;
+      for (size_t off = 0; off < pl_len;)
+        {
+          size_t seg_pl = pl_len - off;
+          if (seg_pl > gro->gso_sz)
+            seg_pl = gro->gso_sz;
+          memcpy (seg_buf, gro->buf, hdr_len);
+          memcpy (seg_buf + hdr_len, gro->buf + hdr_len + off, seg_pl);
+          uint8_t *l3 = seg_buf + gro->mac_hl;
+          uint8_t *udp = l3 + gro->ip_hl;
+          size_t l4_len = 8U + seg_pl;
+          if (gro->is_v6)
+            {
+              u16_be_wr (l3 + 4, (uint16_t)l4_len);
+              u16_be_wr (udp + 4, (uint16_t)l4_len);
+              udp[6] = 0;
+              udp[7] = 0;
+              u16_be_wr (udp + 6,
+                         l4_sum_v6 (l3, GRO_PROTO_UDP, udp, l4_len));
+            }
+          else
+            {
+              u16_be_wr (l3 + 2, (uint16_t)(gro->ip_hl + l4_len));
+              l3[10] = 0;
+              l3[11] = 0;
+              u16_be_wr (l3 + 10, ip4_hdr_sum (l3, gro->ip_hl));
+              u16_be_wr (udp + 4, (uint16_t)l4_len);
+              udp[6] = 0;
+              udp[7] = 0;
+              u16_be_wr (udp + 6,
+                         l4_sum_v4 (l3, GRO_PROTO_UDP, udp, l4_len));
+            }
+          struct iovec iov[2] = { { .iov_base = (void *)z_vnet,
+                                    .iov_len = sizeof (z_vnet) },
+                                  { .iov_base = seg_buf,
+                                    .iov_len = hdr_len + seg_pl } };
+          if (writev (tap_fd, iov, 2) < 0)
+            {
+              fprintf (stderr,
+                       "gro: udp plain write fallback failed errno=%d\n",
+                       errno);
+              gro->act = false;
+              return;
+            }
+          off += seg_pl;
+        }
+      gro->act = false;
+      return;
+    }
   gro_sum_prep (gro);
 
   struct virtio_net_hdr vh;
@@ -194,6 +258,17 @@ gro_ent_fls (int tap_fd, GroEnt *gro)
                           { .iov_base = gro->buf, .iov_len = gro->len } };
   if (writev (tap_fd, iov, 2) < 0)
     {
+      if (gro->proto == GRO_PROTO_UDP)
+        {
+          fprintf (stderr,
+                   "gro: udp gso write failed errno=%d; "
+                   "disabling udp gso to tap\n",
+                   errno);
+          g_udp_gso_bad = true;
+          gro_ent_fls (tap_fd, gro);
+          return;
+        }
+      fprintf (stderr, "gro: tcp gso write failed errno=%d\n", errno);
     }
   gro->act = false;
 }
@@ -287,6 +362,8 @@ static bool
 gro_udp_try (int tap_fd, const uint8_t *frm, size_t len, size_t mac_hl,
              bool is_v6)
 {
+  if (!tap_udp_gso_ok () || g_udp_gso_bad)
+    return false;
   size_t ip_hl = is_v6 ? 40U : (size_t)((frm[mac_hl] & 0x0fU) * 4U);
   if (ip_hl < (is_v6 ? 40U : 20U) || len < mac_hl + ip_hl + 8U)
     return false;

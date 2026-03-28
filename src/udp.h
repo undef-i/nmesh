@@ -33,6 +33,14 @@ typedef struct
   size_t data_len;
 } UdpMsg;
 
+typedef struct
+{
+  uint8_t *data;
+  size_t data_len;
+  uint8_t src_ip[16];
+  uint16_t src_port;
+} UdpRxPkt;
+
 typedef void (*UdpEmsgsizeCallback) (const uint8_t dst_ip[16],
                                      uint16_t dst_port, size_t atmpt_plen);
 typedef void (*UdpUnreachCallback) (const uint8_t dst_ip[16],
@@ -40,6 +48,7 @@ typedef void (*UdpUnreachCallback) (const uint8_t dst_ip[16],
 int udp_init (Udp *s, uint16_t *port);
 void udp_free (Udp *s);
 int udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt);
+int udp_rx_pkt_arr (Udp *s, UdpRxPkt pkt_arr[], int m_cnt);
 int udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
                 uint16_t src_ports[], size_t len_arr[], int m_cnt);
 int udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,

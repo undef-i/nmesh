@@ -21,6 +21,7 @@ typedef struct
 } FRes;
 
 int tap_init (const char *name);
+bool tap_udp_gso_ok (void);
 void tap_stl_rm (const char *name);
 void tap_addr_set (const char *name, const uint8_t lla[16]);
 void tap_mtu_set (const char *name, uint16_t mtu);

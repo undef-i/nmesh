@@ -92,12 +92,13 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
-  if (!cfg->frag)
+  if (!cfg->mtu_probe)
     {
-      static uint8_t rel_nf_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
-      uint8_t *vnet_pkt = rel_nf_buf + TAP_HR + PKT_HDR_SZ;
-      memcpy (vnet_pkt, vnet_frame, vnet_len);
-      uint8_t *frame_pkt = vnet_pkt + VNET_HL;
+      static uint8_t relay_frame_buf[UDP_PL_MAX + TAP_HR]
+          __attribute__ ((aligned (32)));
+      uint8_t *relay_vnet = relay_frame_buf + TAP_HR + PKT_HDR_SZ;
+      memcpy (relay_vnet, vnet_frame, vnet_len);
+      uint8_t *frame_pkt = relay_vnet + VNET_HL;
       size_t l3_off = ETH_HLEN;
       uint16_t eth_type
           = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
@@ -113,8 +114,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           mss_clp (frame_pkt + l3_off, frame_len - l3_off, cfg->mtu);
         }
       size_t out_len = 0;
-      uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_pkt, vnet_len,
-                                      1, hop_c, &out_len);
+      uint8_t *out_ptr
+          = data_bld_zc (cry_ctx, relay_vnet, vnet_len, 1, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
@@ -263,13 +264,13 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
-  if (!cfg->frag)
+  if (!cfg->mtu_probe)
     {
       uint8_t dst_tail[4];
       memcpy (dst_tail, dest_lla + 12, 4);
-      static uint8_t rel_fg_buf[UDP_PL_MAX + TAP_HR];
+      static uint8_t relay_frag_buf[UDP_PL_MAX + TAP_HR];
       uint8_t *chunk_dst
-          = rel_fg_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
+          = relay_frag_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
       memcpy (chunk_dst, chunk, chunk_len);
       size_t out_len = 0;
       uint8_t *out_ptr
