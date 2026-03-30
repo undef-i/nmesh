@@ -66,6 +66,25 @@ rt_nh_get (Rt *rt, const Cfg *cfg, const uint8_t dest_lla[16], RtDec *out_dec,
   return false;
 }
 
+static void
+frame_l3_info_get (const uint8_t *frame_pkt, size_t frame_len, size_t *l3_off,
+                   uint16_t *eth_type)
+{
+  if (!l3_off || !eth_type)
+    return;
+  *l3_off = ETH_HLEN;
+  *eth_type = 0;
+  if (!frame_pkt || frame_len < ETH_HLEN)
+    return;
+  *eth_type = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
+  if ((*eth_type == 0x8100U || *eth_type == 0x88A8U)
+      && frame_len >= ETH_HLEN + 4U + 20U)
+    {
+      *eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
+      *l3_off = ETH_HLEN + 4U;
+    }
+}
+
 bool
 rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
              const uint8_t dest_lla[16], const uint8_t *vnet_frame,
@@ -77,7 +96,6 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   if (vnet_len < VNET_HL + ETH_HLEN || vnet_len > TAP_F_MAX
       || vnet_len > UINT16_MAX)
     return false;
-  const uint8_t *frame = vnet_frame + VNET_HL;
   size_t frame_len = vnet_len - VNET_HL;
   if (hop_c == 0)
     return false;
@@ -92,42 +110,6 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
-  if (!cfg->mtu_probe)
-    {
-      static uint8_t relay_frame_buf[UDP_PL_MAX + TAP_HR]
-          __attribute__ ((aligned (32)));
-      uint8_t *relay_vnet = relay_frame_buf + TAP_HR + PKT_HDR_SZ;
-      memcpy (relay_vnet, vnet_frame, vnet_len);
-      uint8_t *frame_pkt = relay_vnet + VNET_HL;
-      size_t l3_off = ETH_HLEN;
-      uint16_t eth_type
-          = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
-      if ((eth_type == 0x8100U || eth_type == 0x88A8U)
-          && frame_len >= ETH_HLEN + 4 + 20)
-        {
-          eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
-          l3_off = ETH_HLEN + 4;
-        }
-      if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off
-          && cfg->mtu >= 88U)
-        {
-          mss_clp (frame_pkt + l3_off, frame_len - l3_off, cfg->mtu);
-        }
-      size_t out_len = 0;
-      uint8_t *out_ptr
-          = data_bld_zc (cry_ctx, relay_vnet, vnet_len, 1, hop_c, &out_len);
-      udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
-      rt_tx_ack (rt, tx_ip, tx_port, ts);
-      g_tx_ts = ts;
-      if (dec.type == RT_REL && cfg->p2p == P2P_EN)
-        {
-          static uint8_t hp_buf[UDP_PL_MAX];
-          size_t hp_len = 0;
-          hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
-          udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
-        }
-      return true;
-    }
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
     {
@@ -135,71 +117,40 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (mtu < pmtu)
         pmtu = mtu;
     }
-  uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
-  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
-  int32_t frag_cap
-      = (int32_t)pmtu - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr) + 4U);
-  if (frag_cap <= 0)
+  static uint8_t relay_vnet_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
+  uint8_t *relay_vnet = relay_vnet_buf + TAP_HR + PKT_HDR_SZ;
+  memcpy (relay_vnet, vnet_frame, vnet_len);
+  uint8_t *frame_pkt = relay_vnet + VNET_HL;
+  uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
+  size_t l3_off = ETH_HLEN;
+  uint16_t eth_type = 0;
+  frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
+  if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
+    {
+      uint16_t max_in_l3 = tnl_inner_l3_cap_get (max_vnet, l3_off);
+      if (max_in_l3 >= 88U)
+        mss_clp (frame_pkt + l3_off, frame_len - l3_off, max_in_l3);
+    }
+  size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, true);
+  if (chunk_max == 0)
     return false;
-  static uint8_t rel_p_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
-  uint8_t *frame_pkt = rel_p_buf + TAP_HR + PKT_HDR_SZ;
-  memcpy (frame_pkt, frame, frame_len);
-  uint16_t m_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
-  {
-    size_t l3_off = ETH_HLEN;
-    uint16_t eth_type
-        = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
-    if ((eth_type == 0x8100U || eth_type == 0x88A8U)
-        && frame_len >= ETH_HLEN + 4 + 20)
-      {
-        eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
-        l3_off = ETH_HLEN + 4;
-      }
-    if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
-      {
-        uint16_t m_in_l3 = (m_tap_f > l3_off + 20U)
-                               ? (uint16_t)(m_tap_f - l3_off - 20U)
-                               : 0;
-        if (m_in_l3 >= 88U)
-          {
-            mss_clp (frame_pkt + l3_off, frame_len - l3_off, m_in_l3);
-          }
-      }
-  }
   bool is_tiny = false;
-  {
-    size_t l3_off = ETH_HLEN;
-    uint16_t eth_type
-        = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
-    if ((eth_type == 0x8100U || eth_type == 0x88A8U)
-        && frame_len >= ETH_HLEN + 4 + 20)
-      {
-        eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
-        l3_off = ETH_HLEN + 4;
-      }
-    if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
-      {
-        is_tiny = (frag_cap < 64)
-                  && is_tcp_syn (frame_pkt + l3_off, frame_len - l3_off);
-      }
-  }
-  if (!is_tiny && ((size_t)vnet_len + (size_t)tnl_oh) <= (size_t)pmtu)
+  if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
+    {
+      is_tiny = (chunk_max < 64U)
+                && is_tcp_syn (frame_pkt + l3_off, frame_len - l3_off);
+    }
+  if (!is_tiny && (size_t)vnet_len <= (size_t)max_vnet)
     {
       size_t out_len = 0;
-      uint8_t *out_ptr = data_bld_zc (cry_ctx, (uint8_t *)vnet_frame, vnet_len,
-                                      1, hop_c, &out_len);
+      uint8_t *out_ptr
+          = data_bld_zc (cry_ctx, relay_vnet, vnet_len, 1, hop_c, &out_len);
       udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
       rt_tx_ack (rt, tx_ip, tx_port, ts);
       g_tx_ts = ts;
     }
   else
     {
-      size_t frag_pfx = sizeof (FragHdr) + 4U;
-      if (m_tap_f <= frag_pfx)
-        return false;
-      size_t chunk_max = m_tap_f - frag_pfx;
-      if (chunk_max == 0)
-        return false;
       uint32_t mid = g_frag_mid++;
       if (g_frag_mid == 0)
         g_frag_mid = 1;
@@ -212,8 +163,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           if (chunk_len > chunk_max)
             chunk_len = chunk_max;
           uint8_t *chunk_dst
-              = rel_p_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
-          memcpy (chunk_dst, vnet_frame + off, chunk_len);
+              = relay_vnet_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
+          memcpy (chunk_dst, relay_vnet + off, chunk_len);
           size_t out_len = 0;
           bool mf = (off + chunk_len) < vnet_len;
           if (off > 0x7fffU)
@@ -264,32 +215,6 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
-  if (!cfg->mtu_probe)
-    {
-      uint8_t dst_tail[4];
-      memcpy (dst_tail, dest_lla + 12, 4);
-      static uint8_t relay_frag_buf[UDP_PL_MAX + TAP_HR];
-      uint8_t *chunk_dst
-          = relay_frag_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
-      memcpy (chunk_dst, chunk, chunk_len);
-      size_t out_len = 0;
-      uint8_t *out_ptr
-          = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, frag_off, mf_in,
-                         1, dst_tail, hop_c, &out_len);
-      if (!out_ptr || out_len == 0)
-        return false;
-      udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
-      rt_tx_ack (rt, tx_ip, tx_port, ts);
-      g_tx_ts = ts;
-      if (dec.type == RT_REL && cfg->p2p == P2P_EN)
-        {
-          static uint8_t hp_buf[UDP_PL_MAX];
-          size_t hp_len = 0;
-          hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
-          udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
-        }
-      return true;
-    }
   uint16_t pmtu = ep_mtu_get (rt, tx_ip, tx_port);
   if (dec.type == RT_REL)
     {
@@ -297,13 +222,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (mtu < pmtu)
         pmtu = mtu;
     }
-  uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
-  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
-  uint16_t m_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
-  size_t frag_pfx = sizeof (FragHdr) + 4U;
-  if (m_tap_f <= frag_pfx)
-    return false;
-  size_t chunk_max = m_tap_f - frag_pfx;
+  uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
+  size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, true);
   if (chunk_max == 0)
     return false;
   uint8_t dst_tail[4];

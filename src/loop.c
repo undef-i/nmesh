@@ -868,6 +868,25 @@ tap_batch_fls (Udp *udp, UdpMsg batch_arr[BATCH_MAX], int *bc, const char *msg)
   return !(tx_rc < fl_bc || udp_w_want (udp));
 }
 
+static void
+frame_l3_info_get (const uint8_t *frame_pkt, size_t frame_len, size_t *l3_off,
+                   uint16_t *eth_type)
+{
+  if (!l3_off || !eth_type)
+    return;
+  *l3_off = ETH_HLEN;
+  *eth_type = 0;
+  if (!frame_pkt || frame_len < ETH_HLEN)
+    return;
+  *eth_type = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
+  if ((*eth_type == 0x8100U || *eth_type == 0x88A8U)
+      && frame_len >= ETH_HLEN + 4U + 20U)
+    {
+      *eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
+      *l3_off = ETH_HLEN + 4U;
+    }
+}
+
 static bool
 tap_tx_path_fit (Rt *rt, const Cfg *cfg, uint64_t now, const uint8_t *frame_pkt,
                  TapFast fast_path[256], uint64_t *l_nh_ts, TapTxPath *tx_path)
@@ -1116,102 +1135,41 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   uint16_t tx_port = tx_path_lcl.tx_port;
   uint8_t rel_f = tx_path_lcl.rel_f;
   const uint8_t *rel_dst_lla = (rel_f != 0) ? tx_path_lcl.rt_key : NULL;
-
-  if (!cfg->mtu_probe)
-    {
-      size_t l3_off = ETH_HLEN;
-      uint16_t eth_type
-          = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
-      if ((eth_type == 0x8100U || eth_type == 0x88A8U)
-          && frame_len >= ETH_HLEN + 4 + 20)
-        {
-          eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
-          l3_off = ETH_HLEN + 4;
-        }
-      if (mss_apply && (eth_type == 0x0800U || eth_type == 0x86DDU)
-          && frame_len > l3_off && cfg->mtu >= 88U)
-        {
-          mss_clp (frame_pkt + l3_off, frame_len - l3_off, cfg->mtu);
-        }
-      size_t out_len;
-      uint8_t *out_ptr
-          = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f, 32, &out_len);
-      if (*bc >= BATCH_MAX
-          && !tap_batch_fls (udp, batch_arr, bc,
-                             "udp: batch send failed before enqueue data"))
-        return false;
-      memcpy (batch_arr[*bc].dst_ip, tx_ip, 16);
-      batch_arr[*bc].dst_port = tx_port;
-      batch_arr[*bc].data = out_ptr;
-      batch_arr[*bc].data_len = out_len;
-      (*bc)++;
-      if (tx_ack_apply)
-        rt_tx_ack (rt, tx_ip, tx_port, now);
-      g_tx_ts = now;
-      if (pulse_apply)
-        tap_rel_pulse (udp, cry_ctx, rt, cfg, now, sid, &tx_path_lcl);
-      if (*bc >= BATCH_MAX - 2
-          && !tap_batch_fls (udp, batch_arr, bc,
-                             "udp: batch send failed during near-full flush"))
-        return false;
-      return true;
-    }
   uint16_t pmtu = tx_path_lcl.pmtu;
-  uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
-  const uint16_t tnl_oh = (uint16_t)(oip_oh + 8U + PKT_HDR_SZ);
-  int32_t frag_cap = (int32_t)pmtu
-                     - (int32_t)(tnl_oh + (uint16_t)sizeof (FragHdr)
-                                 + ((rel_f != 0) ? 4U : 0U));
-  if (frag_cap <= 0)
+  uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
+  size_t l3_off = ETH_HLEN;
+  uint16_t eth_type = 0;
+  frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
+  if (mss_apply && (eth_type == 0x0800U || eth_type == 0x86DDU)
+      && frame_len > l3_off)
+    {
+      uint16_t max_in_l3 = tnl_inner_l3_cap_get (max_vnet, l3_off);
+      if (max_in_l3 >= 88U)
+        mss_clp (frame_pkt + l3_off, frame_len - l3_off, max_in_l3);
+    }
+  size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, rel_f != 0);
+  if (chunk_max == 0)
     {
       static uint64_t l_cr_ts = 0;
+      uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
       if (now >= l_cr_ts + 1000ULL)
         {
           fprintf (stderr,
                    "main: physical mtu %u too small for tunnel overhead %u\n",
                    (unsigned)pmtu,
-                   (unsigned)(tnl_oh + (uint16_t)sizeof (FragHdr)
+                   (unsigned)(oip_oh + 8U + PKT_HDR_SZ + sizeof (FragHdr)
                               + ((rel_f != 0) ? 4U : 0U)));
           l_cr_ts = now;
         }
       return true;
     }
-  uint16_t max_tap_f = (pmtu > tnl_oh) ? (uint16_t)(pmtu - tnl_oh) : 0;
-  {
-    size_t l3_off = ETH_HLEN;
-    uint16_t eth_type = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
-    if ((eth_type == 0x8100U || eth_type == 0x88A8U)
-        && frame_len >= ETH_HLEN + 4 + 20)
-      {
-          eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
-          l3_off = ETH_HLEN + 4;
-        }
-    if (mss_apply && (eth_type == 0x0800U || eth_type == 0x86DDU)
-        && frame_len > l3_off)
-      {
-        uint16_t max_in_l3 = (max_tap_f > l3_off + 20U)
-                                 ? (uint16_t)(max_tap_f - l3_off - 20U)
-                                 : 0;
-        if (max_in_l3 >= 88U)
-          mss_clp (frame_pkt + l3_off, frame_len - l3_off, max_in_l3);
-      }
-  }
   bool is_tiny = false;
-  if (mss_apply)
+  if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
     {
-    size_t l3_off = ETH_HLEN;
-    uint16_t eth_type = (uint16_t)(((uint16_t)frame_pkt[12] << 8) | frame_pkt[13]);
-    if ((eth_type == 0x8100U || eth_type == 0x88A8U)
-        && frame_len >= ETH_HLEN + 4 + 20)
-      {
-        eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
-        l3_off = ETH_HLEN + 4;
-      }
-    if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
-      is_tiny = (frag_cap < 64)
+      is_tiny = (chunk_max < 64U)
                 && is_tcp_syn (frame_pkt + l3_off, frame_len - l3_off);
     }
-  if (!is_tiny && __builtin_expect (((size_t)vnet_len + (size_t)tnl_oh) <= (size_t)pmtu, 1))
+  if (!is_tiny && __builtin_expect ((size_t)vnet_len <= (size_t)max_vnet, 1))
     {
       size_t out_len;
       uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f, 32, &out_len);
@@ -1230,12 +1188,6 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
     }
   else
     {
-      size_t frag_pfx = sizeof (FragHdr) + ((rel_f != 0) ? 4U : 0U);
-      if (max_tap_f <= frag_pfx)
-        return true;
-      size_t chunk_max = max_tap_f - frag_pfx;
-      if (chunk_max == 0)
-        return true;
       uint32_t n_frags = (uint32_t)((vnet_len + chunk_max - 1) / chunk_max);
       if (n_frags == 0)
         n_frags = 1;

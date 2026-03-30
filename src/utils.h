@@ -1,4 +1,5 @@
 #pragma once
+#include "packet.h"
 #include "route.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -87,4 +88,26 @@ is_tcp_syn (const uint8_t *l3, size_t l3_len)
       return (l3[40 + 13] & 0x02U) != 0;
     }
   return false;
+}
+
+static inline uint16_t
+tnl_vnet_cap_get (uint16_t path_mtu, const uint8_t tx_ip[16])
+{
+  uint16_t oip_oh = is_ip_v4m (tx_ip) ? 20U : 40U;
+  uint32_t tnl_oh = (uint32_t)oip_oh + 8U + (uint32_t)PKT_HDR_SZ;
+  return (path_mtu > tnl_oh) ? (uint16_t)(path_mtu - tnl_oh) : 0;
+}
+
+static inline uint16_t
+tnl_inner_l3_cap_get (uint16_t vnet_cap, size_t frame_l3_off)
+{
+  size_t inner_oh = (size_t)VNET_HL + frame_l3_off;
+  return (vnet_cap > inner_oh) ? (uint16_t)(vnet_cap - inner_oh) : 0;
+}
+
+static inline size_t
+tnl_frag_pl_cap_get (uint16_t vnet_cap, bool is_relay)
+{
+  size_t frag_oh = sizeof (FragHdr) + (is_relay ? 4U : 0U);
+  return (vnet_cap > frag_oh) ? (size_t)(vnet_cap - frag_oh) : 0;
 }
