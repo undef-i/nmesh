@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/uio.h>
@@ -34,15 +35,127 @@
 #include <time.h>
 #include <unistd.h>
 
+static int
+status_query_run (const Cfg *cfg)
+{
+  if (!cfg)
+    return 1;
+  Cry cry_ctx;
+  if (cry_init (&cry_ctx, cfg->psk) != 0)
+    {
+      fprintf (stderr, "status: failed to init crypto\n");
+      return 1;
+    }
+  int fd = socket (AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    {
+      perror ("status: socket failed");
+      return 1;
+    }
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 250000;
+  setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
+  struct sockaddr_in6 src;
+  memset (&src, 0, sizeof (src));
+  src.sin6_family = AF_INET6;
+  src.sin6_addr = in6addr_loopback;
+  src.sin6_port = 0;
+  if (bind (fd, (struct sockaddr *)&src, sizeof (src)) < 0)
+    {
+      perror ("status: bind failed");
+      close (fd);
+      return 1;
+    }
+  struct sockaddr_in6 dst;
+  memset (&dst, 0, sizeof (dst));
+  dst.sin6_family = AF_INET6;
+  dst.sin6_addr = in6addr_loopback;
+  dst.sin6_port = htons (cfg->port);
+  uint32_t req_id = (uint32_t)(sys_ts () ^ (uint64_t)getpid ());
+  uint8_t req_buf[UDP_PL_MAX];
+  size_t req_len = 0;
+  stat_req_bld (&cry_ctx, req_id, req_buf, &req_len);
+  if (sendto (fd, req_buf, req_len, 0, (struct sockaddr *)&dst, sizeof (dst))
+      < 0)
+    {
+      perror ("status: send failed");
+      close (fd);
+      return 1;
+    }
+  char *text = NULL;
+  uint16_t total_len = 0;
+  size_t got_len = 0;
+  uint64_t ddl = sys_ts () + 2000ULL;
+  while (sys_ts () < ddl)
+    {
+      uint8_t raw[UDP_PL_MAX];
+      ssize_t n = recv (fd, raw, sizeof (raw), 0);
+      if (n < 0)
+        {
+          if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            continue;
+          perror ("status: recv failed");
+          break;
+        }
+      PktHdr hdr;
+      uint8_t *pt = NULL;
+      size_t pt_len = 0;
+      if (pkt_dec (&cry_ctx, raw, (size_t)n, NULL, 0, &hdr, &pt, &pt_len) != 0)
+        continue;
+      if (hdr.pkt_type != PT_STAT_RSP)
+        continue;
+      uint32_t pkt_req_id = 0;
+      uint16_t off = 0, pkt_total = 0;
+      const uint8_t *chunk = NULL;
+      size_t chunk_len = 0;
+      if (gsp_prs_stat_rsp (pt, pt_len, &pkt_req_id, &off, &pkt_total, &chunk,
+                            &chunk_len)
+          != 0)
+        continue;
+      if (pkt_req_id != req_id)
+        continue;
+      if (!text)
+        {
+          total_len = pkt_total;
+          text = calloc (1, (size_t)total_len + 1U);
+          if (!text)
+            break;
+        }
+      if (pkt_total != total_len || off != got_len
+          || (size_t)off + chunk_len > (size_t)total_len)
+        continue;
+      memcpy (text + off, chunk, chunk_len);
+      got_len += chunk_len;
+      if (got_len >= (size_t)total_len)
+        break;
+    }
+  close (fd);
+  if (!text || got_len == 0)
+    {
+      free (text);
+      fprintf (stderr, "status: no response from 127.0.0.1:%u\n", cfg->port);
+      return 1;
+    }
+  fwrite (text, 1, got_len, stdout);
+  free (text);
+  return 0;
+}
+
 int
 main (int argc, char **argv)
 {
   const char *cfg_path = "nmesh.conf";
+  bool is_status_cmd = false;
   for (int i = 1; i < argc; i++)
     {
       if (strcmp (argv[i], "-c") == 0 && i + 1 < argc)
         {
           cfg_path = argv[++i];
+        }
+      else if (strcmp (argv[i], "s") == 0)
+        {
+          is_status_cmd = true;
         }
     }
   Cfg cfg;
@@ -51,6 +164,8 @@ main (int argc, char **argv)
       fprintf (stderr, "main: failed to load config: %s\n", cfg_path);
       return 1;
     }
+  if (is_status_cmd)
+    return status_query_run (&cfg);
   printf ("main: loaded config from %s\n", cfg_path);
   uint64_t sid;
   {
@@ -142,11 +257,17 @@ main (int argc, char **argv)
     rt_pmtu_ub_set (&rt, hw_mtu);
   }
   rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
+  static TapPipe tap_pipe;
+  if (tap_pipe_init (&tap_pipe, tap_fd, &udp, &cry_ctx, sid) != 0)
+    {
+      fprintf (stderr, "main: failed to init tap pipeline\n");
+      return 1;
+    }
   int epfd = epoll_create1 (0);
   struct epoll_event ev;
   ev.events = EPOLLIN;
-  ev.data.u64 = ID_TAP;
-  epoll_ctl (epfd, EPOLL_CTL_ADD, tap_fd, &ev);
+  ev.data.u64 = ID_TAP_NOTE;
+  epoll_ctl (epfd, EPOLL_CTL_ADD, tap_pipe_note_fd_get (&tap_pipe), &ev);
   ev.events = EPOLLIN | EPOLLERR;
   ev.data.u64 = ID_UDP;
   epoll_ctl (epfd, EPOLL_CTL_ADD, udp.fd, &ev);
@@ -215,6 +336,12 @@ main (int argc, char **argv)
   fflush (stdout);
   on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool);
   rt_gsp_dirty_set (&rt, "initial");
+  tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
+  if (tap_pipe_start (&tap_pipe) != 0)
+    {
+      fprintf (stderr, "main: failed to start tap pipeline threads\n");
+      return 1;
+    }
   udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
   while (1)
     {
@@ -228,9 +355,9 @@ main (int argc, char **argv)
       for (int i = 0; i < nev; i++)
         {
           uint64_t tok = ev_arr[i].data.u64;
-          if (tok == ID_TAP)
+          if (tok == ID_TAP_NOTE)
             {
-              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, sys_ts ());
+              tap_pipe_note_hnd (&tap_pipe);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
           else if (tok == ID_UDP)
@@ -296,8 +423,10 @@ main (int argc, char **argv)
                         }
                       if (need_reload)
                         {
+                          uint64_t now = sys_ts ();
                           cfg_reload_apply (&cfg, &cry_ctx, &rt, &pool,
-                                            cfg_path, sys_ts ());
+                                            cfg_path, now);
+                          tap_pipe_sync (&tap_pipe, &rt, &cfg, now);
                         }
                     }
                 }
@@ -305,6 +434,9 @@ main (int argc, char **argv)
         }
       gsp_dirty_flush (&udp, &cry_ctx, &rt, &cfg);
       udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+      uint64_t now = sys_ts ();
+      if (tap_pipe_sync_due (&tap_pipe, now))
+        tap_pipe_sync (&tap_pipe, &rt, &cfg, now);
     }
   return 0;
 }

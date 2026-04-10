@@ -11,9 +11,9 @@ LIBSODIUM_SRCS = $(shell find $(LIBSODIUM_DIR) -name "*.c" \
 
 SRCS = $(wildcard src/*.c) $(LIBSODIUM_SRCS)
 
-CFLAGS_BASE = -std=gnu11 -Wall -Wextra -Iext/uthash/src \
+CFLAGS_BASE = -std=gnu11 -Wall -Wextra -pthread -Iext/uthash/src \
 		-DSODIUM_STATIC -DCONFIG_H_IS_NOT_HERE -D_GNU_SOURCE \
-		-march=x86-64 -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
+		-march=native -mtune=native -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
 		-DHAVE_CPUID -DHAVE_MMINTRIN_H -DHAVE_EMMINTRIN_H -DHAVE_PMMINTRIN_H \
 		-DHAVE_TMMINTRIN_H -DHAVE_SMMINTRIN_H -DHAVE_AVXINTRIN_H -DHAVE_AVX2INTRIN_H \
 		-DHAVE_WMMINTRIN_H -DHAVE_IMMINTRIN_H -DHAVE_TI_MODE -DHAVE_GETXBV \
@@ -22,7 +22,7 @@ CFLAGS_BASE = -std=gnu11 -Wall -Wextra -Iext/uthash/src \
 CFLAGS_APP = $(CFLAGS_BASE) -Isrc -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium
 CFLAGS_LIB = $(CFLAGS_BASE) -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium
 
-LDFLAGS_COMMON = -static
+LDFLAGS_COMMON = -static -pthread
 
 CFLAGS_RELEASE = -O3 -flto -ffunction-sections -fdata-sections \
 		 -fomit-frame-pointer -fno-asynchronous-unwind-tables \
@@ -67,4 +67,3 @@ $(BUILD_DIR)/debug/ext/%.o: ext/%.c
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all clean debug release

@@ -205,6 +205,8 @@ typedef struct
 } RtDec;
 
 void rt_init (Rt *t);
+void rt_free (Rt *t);
+int rt_cpy (Rt *dst, const Rt *src);
 void rt_upd (Rt *t, const Re *re, uint64_t sys_ts);
 bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],

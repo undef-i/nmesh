@@ -31,6 +31,18 @@ ep_mtu_get (const Rt *rt, const uint8_t ip[16], uint16_t port)
   return (best > 0) ? best : RT_MTU_MIN;
 }
 
+static uint16_t
+tx_path_pmtu_get (const Cfg *cfg, const uint8_t tx_ip[16], uint16_t path_mtu)
+{
+  uint16_t pmtu = (path_mtu >= RT_MTU_MIN) ? path_mtu : RT_MTU_MIN;
+  if (!cfg || cfg->mtu_probe)
+    return pmtu;
+  uint16_t local_mtu = udp_ep_mtu_get (tx_ip);
+  if (local_mtu >= RT_MTU_MIN && local_mtu < pmtu)
+    pmtu = local_mtu;
+  return pmtu;
+}
+
 static bool
 rt_nh_get (Rt *rt, const Cfg *cfg, const uint8_t dest_lla[16], RtDec *out_dec,
            uint8_t out_ip[16], uint16_t *out_port)
@@ -117,6 +129,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (mtu < pmtu)
         pmtu = mtu;
     }
+  pmtu = tx_path_pmtu_get (cfg, tx_ip, pmtu);
   static uint8_t relay_vnet_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
   uint8_t *relay_vnet = relay_vnet_buf + TAP_HR + PKT_HDR_SZ;
   memcpy (relay_vnet, vnet_frame, vnet_len);
@@ -222,6 +235,7 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (mtu < pmtu)
         pmtu = mtu;
     }
+  pmtu = tx_path_pmtu_get (cfg, tx_ip, pmtu);
   uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
   size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, true);
   if (chunk_max == 0)

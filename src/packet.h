@@ -10,6 +10,8 @@
 #define PT_FRAG 7
 #define PT_MTU_PRB 8
 #define PT_MTU_ACK 9
+#define PT_STAT_REQ 10
+#define PT_STAT_RSP 11
 
 typedef struct __attribute__ ((packed))
 {
@@ -55,10 +57,18 @@ typedef struct __attribute__ ((packed))
   uint16_t prb_mtu;
 } ProbeHdr;
 
+typedef struct __attribute__ ((packed))
+{
+  uint32_t req_id;
+  uint16_t off;
+  uint16_t total_len;
+} StatHdr;
+
 #define GSP_SZ sizeof (GspEnt)
 _Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
 _Static_assert (sizeof (GspEnt) == 70, "GspEnt size");
 _Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
+_Static_assert (sizeof (StatHdr) == 8, "StatHdr size");
 _Static_assert (PKT_HDR_SZ == 30, "PKT_HDR_SZ");
 _Static_assert (UDP_PL_MAX == (PKT_HDR_SZ + 16 + V6_PL_MAX), "UDP_PL_MAX");

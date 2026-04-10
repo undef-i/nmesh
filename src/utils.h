@@ -13,6 +13,7 @@
 #define ID_TMR 3
 #define ID_STD 4
 #define ID_CFG 5
+#define ID_TAP_NOTE 6
 #define GSP_INTV 1
 #define UPD_TK 30
 #define PEER_FLS_TK 5

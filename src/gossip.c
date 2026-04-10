@@ -416,8 +416,9 @@ hp_bld (Cry *s, const uint8_t req_lla[16], const uint8_t tgt_lla[16],
 }
 
 uint8_t *
-data_bld_zc (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len, uint8_t rel_f,
-             uint8_t hop_c, size_t *out_len)
+data_bld_zc_cnt (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len,
+                 uint8_t rel_f, uint8_t hop_c, uint64_t cnt,
+                 size_t *out_len)
 {
   uint8_t *payload = ipv6_ptr_start;
   size_t pl_len = ipv6_len;
@@ -425,10 +426,19 @@ data_bld_zc (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len, uint8_t rel_f,
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_DATA, rel_f, hop_c, hdr);
   memcpy (pkt_ptr, hdr, PKT_CH_SZ);
-  cry_enc (s, payload, pl_len, pkt_ptr, PKT_CH_SZ, pkt_ptr + PKT_CH_SZ,
-           pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ, payload);
+  cry_enc_cnt (s, cnt, payload, pl_len, pkt_ptr, PKT_CH_SZ,
+               pkt_ptr + PKT_CH_SZ, pkt_ptr + PKT_CH_SZ + PKT_NONCE_SZ,
+               payload);
   *out_len = PKT_HDR_SZ + pl_len;
   return pkt_ptr;
+}
+
+uint8_t *
+data_bld_zc (Cry *s, uint8_t *ipv6_ptr_start, size_t ipv6_len, uint8_t rel_f,
+             uint8_t hop_c, size_t *out_len)
+{
+  return data_bld_zc_cnt (s, ipv6_ptr_start, ipv6_len, rel_f, hop_c,
+                          cry_cnt_take (s, 1), out_len);
 }
 
 uint8_t *
@@ -495,6 +505,33 @@ mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu, uint8_t *buf,
   return pkt_enc (s, hdr, payload, sizeof (payload), buf, out_len);
 }
 
+uint8_t *
+stat_req_bld (Cry *s, uint32_t req_id, uint8_t *buf, size_t *out_len)
+{
+  uint8_t payload[4];
+  u32_wr (payload, req_id);
+  uint8_t hdr[PKT_CH_SZ];
+  hdr_bld (PT_STAT_REQ, 0, 32, hdr);
+  return pkt_enc (s, hdr, payload, sizeof (payload), buf, out_len);
+}
+
+uint8_t *
+stat_rsp_bld (Cry *s, uint32_t req_id, uint16_t total_len, uint16_t off,
+              const uint8_t *chunk, size_t chunk_len, uint8_t *buf,
+              size_t *out_len)
+{
+  if (!chunk || chunk_len > (UDP_PL_MAX - PKT_HDR_SZ - sizeof (StatHdr)))
+    return NULL;
+  uint8_t payload[UDP_PL_MAX - PKT_HDR_SZ];
+  u32_wr (payload, req_id);
+  u16_wr (payload + 4, off);
+  u16_wr (payload + 6, total_len);
+  memcpy (payload + sizeof (StatHdr), chunk, chunk_len);
+  uint8_t hdr[PKT_CH_SZ];
+  hdr_bld (PT_STAT_RSP, 0, 32, hdr);
+  return pkt_enc (s, hdr, payload, sizeof (StatHdr) + chunk_len, buf, out_len);
+}
+
 int
 pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
          size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out, size_t *pt_len_out)
@@ -536,6 +573,31 @@ gsp_prs_mtu_ack (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
                  uint16_t *probe_mtu)
 {
   return gsp_prs_mtu_prb (pt, pt_len, probe_id, probe_mtu);
+}
+
+int
+gsp_prs_stat_req (const uint8_t *pt, size_t pt_len, uint32_t *req_id)
+{
+  if (!pt || pt_len < 4 || !req_id)
+    return -1;
+  *req_id = u32_rd (pt);
+  return 0;
+}
+
+int
+gsp_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
+                  uint16_t *off, uint16_t *total_len, const uint8_t **chunk,
+                  size_t *chunk_len)
+{
+  if (!pt || pt_len < sizeof (StatHdr) || !req_id || !off || !total_len
+      || !chunk || !chunk_len)
+    return -1;
+  *req_id = u32_rd (pt);
+  *off = u16_rd (pt + 4);
+  *total_len = u16_rd (pt + 6);
+  *chunk = pt + sizeof (StatHdr);
+  *chunk_len = pt_len - sizeof (StatHdr);
+  return 0;
 }
 
 int

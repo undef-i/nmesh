@@ -283,6 +283,90 @@ rt_map_fre (Rt *t, RtMap *map)
 }
 
 static void
+pth_pool_fre (Rt *t)
+{
+  while (t && t->pth_pool)
+    {
+      Pth *nxt = t->pth_pool->next;
+      free (t->pth_pool);
+      t->pth_pool = nxt;
+    }
+}
+
+static void
+rtm_pool_fre (Rt *t)
+{
+  while (t && t->rtm_pool)
+    {
+      RtMap *nxt = t->rtm_pool->pool_next;
+      free (t->rtm_pool);
+      t->rtm_pool = nxt;
+    }
+}
+
+void
+rt_free (Rt *t)
+{
+  if (!t)
+    return;
+  rt_map_fre (t, t->map);
+  t->map = NULL;
+  pth_pool_fre (t);
+  rtm_pool_fre (t);
+  free (t->re_arr);
+  free (t->sources);
+  memset (t, 0, sizeof (*t));
+}
+
+int
+rt_cpy (Rt *dst, const Rt *src)
+{
+  if (!dst || !src)
+    return -1;
+  if (dst == src)
+    return 0;
+  Rt snap;
+  rt_init (&snap);
+  memcpy (snap.our_lla, src->our_lla, 16);
+  snap.prb_nxt_id = src->prb_nxt_id;
+  snap.mtu_ub = src->mtu_ub;
+  snap.mtu_probe = src->mtu_probe;
+  snap.map_dirty = true;
+  snap.gsp_dirty = src->gsp_dirty;
+  snap.gsp_last_ts = src->gsp_last_ts;
+  snap.gsp_tx_cnt = src->gsp_tx_cnt;
+  snap.ping_tx_cnt = src->ping_tx_cnt;
+  if (src->cnt > 0)
+    {
+      snap.re_arr = malloc ((size_t)src->cnt * sizeof (Re));
+      if (!snap.re_arr)
+        {
+          rt_free (&snap);
+          return -1;
+        }
+      memcpy (snap.re_arr, src->re_arr, (size_t)src->cnt * sizeof (Re));
+      snap.cnt = src->cnt;
+      snap.cap = src->cnt;
+    }
+  if (src->src_cnt > 0)
+    {
+      snap.sources = malloc ((size_t)src->src_cnt * sizeof (SrcEnt));
+      if (!snap.sources)
+        {
+          rt_free (&snap);
+          return -1;
+        }
+      memcpy (snap.sources, src->sources,
+              (size_t)src->src_cnt * sizeof (SrcEnt));
+      snap.src_cnt = src->src_cnt;
+      snap.src_cap = src->src_cnt;
+    }
+  rt_free (dst);
+  *dst = snap;
+  return 0;
+}
+
+static void
 re_to_pth (const Re *re, Pth *pth)
 {
   memset (pth, 0, sizeof (*pth));

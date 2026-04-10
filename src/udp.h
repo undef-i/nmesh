@@ -1,10 +1,12 @@
 #pragma once
 #include "packet.h"
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
-#define BATCH_MAX 64
+#define BATCH_MAX 256
 #define UDP_PND_MAX 256
 
 typedef struct
@@ -23,6 +25,8 @@ typedef struct
   uint32_t pend_cnt;
   bool gso_en;
   bool gro_en;
+  pthread_mutex_t tx_mtx;
+  _Atomic bool pend_want;
 } Udp;
 
 typedef struct
@@ -55,7 +59,7 @@ int udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,
             const uint8_t *data, size_t data_len);
 void udp_emsg_cb_set (UdpEmsgsizeCallback cb);
 void udp_unr_cb_set (UdpUnreachCallback cb);
-bool udp_w_want (const Udp *s);
+bool udp_w_want (Udp *s);
 int udp_w_hnd (Udp *s);
 bool udp_rx_pending (void);
 uint64_t udp_bp_ev (void);

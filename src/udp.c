@@ -23,13 +23,13 @@
 static UdpEmsgsizeCallback g_emsg_cb = NULL;
 static UdpUnreachCallback g_unr_cb = NULL;
 #if defined(__linux__) && defined(UDP_SEGMENT)
-#define UDP_GSO_MAX_SEGS 8
+#define UDP_GSO_MAX_SEGS 64
 #define UDP_GSO_MAX_BYTES 65535U
 #ifndef SOL_UDP
 #define SOL_UDP IPPROTO_UDP
 #endif
 #else
-#define UDP_GSO_MAX_SEGS 8
+#define UDP_GSO_MAX_SEGS 64
 #endif
 #define UDP_RX_BUF_MAX 65535U
 #define UDP_RX_SPLIT_MAX (BATCH_MAX * 64)
@@ -50,6 +50,20 @@ typedef struct
 static UdpRxSeg g_rx_split_arr[UDP_RX_SPLIT_MAX];
 static uint32_t g_rx_split_head = 0;
 static uint32_t g_rx_split_cnt = 0;
+
+typedef struct
+{
+  uint8_t dst_ip[16];
+  uint16_t mtu;
+  uint64_t ts;
+  bool is_val;
+} UdpEpMtuEnt;
+
+#define UDP_EP_MTU_CACHE_MAX 64
+#define UDP_EP_MTU_CACHE_TTL 1000ULL
+
+static UdpEpMtuEnt g_ep_mtu_cache[UDP_EP_MTU_CACHE_MAX];
+static pthread_mutex_t g_ep_mtu_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static void
 ip_to_v6m (const uint8_t ip[16], uint8_t out[16])
@@ -372,6 +386,7 @@ udp_pend_add (Udp *s, const UdpMsg *m)
   pm->data_len = m->data_len;
   memcpy (pm->data, m->data, m->data_len);
   s->pend_cnt++;
+  atomic_store_explicit (&s->pend_want, true, memory_order_relaxed);
   return true;
 }
 
@@ -423,6 +438,7 @@ udp_pend_fls (Udp *s)
       s->pend_cnt--;
       flush_cnt++;
     }
+  atomic_store_explicit (&s->pend_want, s->pend_cnt > 0, memory_order_relaxed);
   return flush_cnt;
 }
 
@@ -430,11 +446,18 @@ int
 udp_init (Udp *s, uint16_t *port)
 {
   memset (s, 0, sizeof (*s));
+  s->fd = -1;
+  atomic_store_explicit (&s->pend_want, false, memory_order_relaxed);
+  if (pthread_mutex_init (&s->tx_mtx, NULL) != 0)
+    return -1;
   s->gso_en = true;
   s->gro_en = false;
   s->fd = socket (AF_INET6, SOCK_DGRAM, 0);
   if (s->fd < 0)
-    return -1;
+    {
+      pthread_mutex_destroy (&s->tx_mtx);
+      return -1;
+    }
   /*
   const char *rmem = "/proc/sys/net/core/rmem_max";
   const char *wmem = "/proc/sys/net/core/wmem_max";
@@ -540,6 +563,7 @@ udp_init (Udp *s, uint16_t *port)
     {
       close (s->fd);
       s->fd = -1;
+      pthread_mutex_destroy (&s->tx_mtx);
       return -1;
     }
   int flags = fcntl (s->fd, F_GETFL, 0);
@@ -561,10 +585,11 @@ udp_free (Udp *s)
       close (s->fd);
       s->fd = -1;
     }
+  pthread_mutex_destroy (&s->tx_mtx);
 }
 
-int
-udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
+static int
+udp_tx_arr_lckd (Udp *s, UdpMsg *msgs, int cnt)
 {
   if (cnt <= 0)
     return 0;
@@ -578,8 +603,7 @@ udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
         {
           if (!udp_pend_add (s, &msgs[i]))
             {
-              fprintf (stderr, "udp: pending queue full, drop "
-                               "outgoing packet\n");
+              fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
               continue;
             }
           acc_cnt++;
@@ -634,6 +658,17 @@ udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
         }
     }
   return cnt;
+}
+
+int
+udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt)
+{
+  if (!s)
+    return -1;
+  pthread_mutex_lock (&s->tx_mtx);
+  int rc = udp_tx_arr_lckd (s, msgs, cnt);
+  pthread_mutex_unlock (&s->tx_mtx);
+  return rc;
 }
 
 int
@@ -838,9 +873,11 @@ udp_unr_cb_set (UdpUnreachCallback cb)
 }
 
 bool
-udp_w_want (const Udp *s)
+udp_w_want (Udp *s)
 {
-  return s && s->pend_cnt > 0;
+  if (!s)
+    return false;
+  return atomic_load_explicit (&s->pend_want, memory_order_relaxed);
 }
 
 bool
@@ -854,7 +891,10 @@ udp_w_hnd (Udp *s)
 {
   if (!s)
     return -1;
-  return udp_pend_fls (s);
+  pthread_mutex_lock (&s->tx_mtx);
+  int rc = udp_pend_fls (s);
+  pthread_mutex_unlock (&s->tx_mtx);
+  return rc;
 }
 
 uint16_t
@@ -900,6 +940,20 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
 {
   if (!dst_ip)
     return 1500;
+  int slot = (int)((dst_ip[12] ^ dst_ip[13] ^ dst_ip[14] ^ dst_ip[15])
+                   & (UDP_EP_MTU_CACHE_MAX - 1));
+  uint64_t now = sys_ts ();
+  pthread_mutex_lock (&g_ep_mtu_mtx);
+  UdpEpMtuEnt *ent = &g_ep_mtu_cache[slot];
+  if (ent->is_val && memcmp (ent->dst_ip, dst_ip, 16) == 0
+      && now <= ent->ts + UDP_EP_MTU_CACHE_TTL)
+    {
+      uint16_t mtu = ent->mtu;
+      pthread_mutex_unlock (&g_ep_mtu_mtx);
+      return mtu;
+    }
+  pthread_mutex_unlock (&g_ep_mtu_mtx);
+  uint16_t mtu = 1500;
   int is_v4m = (dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0
                 && dst_ip[3] == 0 && dst_ip[4] == 0 && dst_ip[5] == 0
                 && dst_ip[6] == 0 && dst_ip[7] == 0 && dst_ip[8] == 0
@@ -908,7 +962,7 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
     {
       int fd4 = socket (AF_INET, SOCK_DGRAM, 0);
       if (fd4 < 0)
-        return 1500;
+        goto out;
       struct sockaddr_in sa4;
       memset (&sa4, 0, sizeof (sa4));
       sa4.sin_family = AF_INET;
@@ -921,17 +975,16 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
           if (getsockopt (fd4, IPPROTO_IP, IP_MTU, &mtu4, &len4) == 0
               && mtu4 > 0)
             {
-              close (fd4);
-              return (uint16_t)mtu4;
+              mtu = (uint16_t)mtu4;
             }
         }
       close (fd4);
-      return 1500;
+      goto out;
     }
 
   int fd6 = socket (AF_INET6, SOCK_DGRAM, 0);
   if (fd6 < 0)
-    return 1500;
+    goto out;
   struct sockaddr_in6 sa6;
   memset (&sa6, 0, sizeof (sa6));
   sa6.sin6_family = AF_INET6;
@@ -944,12 +997,18 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
       if (getsockopt (fd6, IPPROTO_IPV6, IPV6_MTU, &mtu6, &len6) == 0
           && mtu6 > 0)
         {
-          close (fd6);
-          return (uint16_t)mtu6;
+          mtu = (uint16_t)mtu6;
         }
     }
   close (fd6);
-  return 1500;
+out:
+  pthread_mutex_lock (&g_ep_mtu_mtx);
+  memcpy (ent->dst_ip, dst_ip, 16);
+  ent->mtu = mtu;
+  ent->ts = now;
+  ent->is_val = true;
+  pthread_mutex_unlock (&g_ep_mtu_mtx);
+  return mtu;
 }
 
 int
