@@ -1,4 +1,5 @@
 #include "loop.h"
+#include "bogon.h"
 #include "config.h"
 #include "crypto.h"
 #include "forward.h"
@@ -14,18 +15,23 @@
 #include "utils.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <linux/virtio_net.h>
+#include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <termios.h>
 #include <unistd.h>
@@ -66,8 +72,24 @@ udp_ep_upd (int epfd, int udp_fd, bool w_want, bool *w_watch)
 
 static void tap_note_tx (int note_fd);
 static void tap_note_rx (int note_fd);
+static void tap_pipe_stop_wake (TapPipe *tap_pipe);
 static void *tap_read_loop (void *arg);
 static void *tap_loop (void *arg);
+static bool ctrl_pkt_is (uint8_t pkt_type);
+static size_t tap_loop_stk_sz (void);
+
+static void
+thr_aff_pin (pthread_t tid, int cpu_idx)
+{
+  long cpu_cnt = sysconf (_SC_NPROCESSORS_ONLN);
+  if (cpu_cnt <= 1 || cpu_idx < 0)
+    return;
+  cpu_idx %= (int)cpu_cnt;
+  cpu_set_t set;
+  CPU_ZERO (&set);
+  CPU_SET (cpu_idx, &set);
+  (void)pthread_setaffinity_np (tid, sizeof (set), &set);
+}
 
 int
 tap_pipe_init (TapPipe *tap_pipe, int tap_fd, Udp *udp, Cry *cry_ctx,
@@ -78,21 +100,42 @@ tap_pipe_init (TapPipe *tap_pipe, int tap_fd, Udp *udp, Cry *cry_ctx,
   memset (tap_pipe, 0, sizeof (*tap_pipe));
   rt_init (&tap_pipe->rt);
   tap_pipe->tap_fd = tap_fd;
+  tap_pipe->note_fd = -1;
+  tap_pipe->stop_fd = -1;
   tap_pipe->note_fd = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
+  tap_pipe->stop_fd = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
   tap_pipe->udp = udp;
   tap_pipe->cry_ctx = cry_ctx;
   tap_pipe->sid = sid;
-  if (tap_pipe->note_fd < 0
-      || pthread_rwlock_init (&tap_pipe->snap_lk, NULL) != 0
-      || pthread_mutex_init (&tap_pipe->q_mtx, NULL) != 0
-      || pthread_cond_init (&tap_pipe->q_ne, NULL) != 0
-      || pthread_cond_init (&tap_pipe->q_nf, NULL) != 0)
+  if (tap_pipe->note_fd < 0 || tap_pipe->stop_fd < 0)
     {
-      if (tap_pipe->note_fd >= 0)
-        close (tap_pipe->note_fd);
-      tap_pipe->note_fd = -1;
+      tap_pipe_free (tap_pipe);
       return -1;
     }
+  if (pthread_rwlock_init (&tap_pipe->snap_lk, NULL) != 0)
+    {
+      tap_pipe_free (tap_pipe);
+      return -1;
+    }
+  tap_pipe->snap_lk_init = true;
+  if (pthread_mutex_init (&tap_pipe->q_mtx, NULL) != 0)
+    {
+      tap_pipe_free (tap_pipe);
+      return -1;
+    }
+  tap_pipe->q_mtx_init = true;
+  if (pthread_cond_init (&tap_pipe->q_ne, NULL) != 0)
+    {
+      tap_pipe_free (tap_pipe);
+      return -1;
+    }
+  tap_pipe->q_ne_init = true;
+  if (pthread_cond_init (&tap_pipe->q_nf, NULL) != 0)
+    {
+      tap_pipe_free (tap_pipe);
+      return -1;
+    }
+  tap_pipe->q_nf_init = true;
   return 0;
 }
 
@@ -129,12 +172,6 @@ tap_pipe_sync (TapPipe *tap_pipe, const Rt *rt, const Cfg *cfg, uint64_t now)
   pthread_rwlock_unlock (&tap_pipe->snap_lk);
 }
 
-bool
-tap_pipe_sync_due (const TapPipe *tap_pipe, uint64_t now)
-{
-  return tap_pipe && now >= tap_pipe->snap_ts + 20ULL;
-}
-
 int
 tap_pipe_start (TapPipe *tap_pipe)
 {
@@ -143,8 +180,32 @@ tap_pipe_start (TapPipe *tap_pipe)
   if (pthread_create (&tap_pipe->tid_arr[0], NULL, tap_read_loop, tap_pipe)
       != 0)
     return -1;
-  if (pthread_create (&tap_pipe->tid_arr[1], NULL, tap_loop, tap_pipe) != 0)
-    return -1;
+  tap_pipe->tid_on[0] = true;
+  pthread_attr_t attr;
+  bool attr_on = false;
+  bool stk_on = false;
+  if (pthread_attr_init (&attr) == 0)
+    {
+      attr_on = true;
+      if (pthread_attr_setstacksize (&attr, tap_loop_stk_sz ()) == 0)
+        stk_on = true;
+    }
+  if (pthread_create (&tap_pipe->tid_arr[1], stk_on ? &attr : NULL, tap_loop,
+                      tap_pipe)
+      != 0)
+    {
+      if (attr_on)
+        pthread_attr_destroy (&attr);
+      tap_pipe_stop_wake (tap_pipe);
+      pthread_join (tap_pipe->tid_arr[0], NULL);
+      tap_pipe->tid_on[0] = false;
+      return -1;
+    }
+  if (attr_on)
+    pthread_attr_destroy (&attr);
+  tap_pipe->tid_on[1] = true;
+  thr_aff_pin (tap_pipe->tid_arr[0], 1);
+  thr_aff_pin (tap_pipe->tid_arr[1], 2);
   return 0;
 }
 
@@ -165,32 +226,125 @@ tap_note_rx (int note_fd)
     }
 }
 
+static void
+tap_pipe_stop_wake (TapPipe *tap_pipe)
+{
+  uint64_t one = 1;
+  if (!tap_pipe)
+    return;
+  if (tap_pipe->stop_fd >= 0)
+    (void)write (tap_pipe->stop_fd, &one, sizeof (one));
+  tap_note_tx (tap_pipe->note_fd);
+}
+
+void
+tap_pipe_stop (TapPipe *tap_pipe)
+{
+  if (!tap_pipe)
+    return;
+  tap_pipe->stop_req = true;
+  if (tap_pipe->q_mtx_init)
+    {
+      pthread_mutex_lock (&tap_pipe->q_mtx);
+      pthread_cond_broadcast (&tap_pipe->q_ne);
+      pthread_cond_broadcast (&tap_pipe->q_nf);
+      pthread_mutex_unlock (&tap_pipe->q_mtx);
+    }
+  tap_pipe_stop_wake (tap_pipe);
+}
+
+void
+tap_pipe_join (TapPipe *tap_pipe)
+{
+  if (!tap_pipe)
+    return;
+  for (int i = 0; i < 2; i++)
+    {
+      if (!tap_pipe->tid_on[i])
+        continue;
+      pthread_join (tap_pipe->tid_arr[i], NULL);
+      tap_pipe->tid_on[i] = false;
+    }
+}
+
+void
+tap_pipe_free (TapPipe *tap_pipe)
+{
+  if (!tap_pipe)
+    return;
+  tap_pipe_stop (tap_pipe);
+  tap_pipe_join (tap_pipe);
+  rt_free (&tap_pipe->rt);
+  if (tap_pipe->q_nf_init)
+    {
+      pthread_cond_destroy (&tap_pipe->q_nf);
+      tap_pipe->q_nf_init = false;
+    }
+  if (tap_pipe->q_ne_init)
+    {
+      pthread_cond_destroy (&tap_pipe->q_ne);
+      tap_pipe->q_ne_init = false;
+    }
+  if (tap_pipe->q_mtx_init)
+    {
+      pthread_mutex_destroy (&tap_pipe->q_mtx);
+      tap_pipe->q_mtx_init = false;
+    }
+  if (tap_pipe->snap_lk_init)
+    {
+      pthread_rwlock_destroy (&tap_pipe->snap_lk);
+      tap_pipe->snap_lk_init = false;
+    }
+  if (tap_pipe->stop_fd >= 0)
+    {
+      close (tap_pipe->stop_fd);
+      tap_pipe->stop_fd = -1;
+    }
+  if (tap_pipe->note_fd >= 0)
+    {
+      close (tap_pipe->note_fd);
+      tap_pipe->note_fd = -1;
+    }
+}
+
 static void *
 tap_read_loop (void *arg)
 {
   TapPipe *tap_pipe = arg;
-  struct pollfd pfd;
-  memset (&pfd, 0, sizeof (pfd));
-  pfd.fd = tap_pipe->tap_fd;
-  pfd.events = POLLIN;
+  struct pollfd pfd_arr[2];
+  memset (pfd_arr, 0, sizeof (pfd_arr));
+  pfd_arr[0].fd = tap_pipe->tap_fd;
+  pfd_arr[0].events = POLLIN;
+  pfd_arr[1].fd = tap_pipe->stop_fd;
+  pfd_arr[1].events = POLLIN;
   for (;;)
     {
-      int rc = poll (&pfd, 1, -1);
+      int rc = poll (pfd_arr, 2, -1);
       if (rc < 0)
         {
           if (errno == EINTR)
             continue;
           break;
         }
-      if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+      if ((pfd_arr[1].revents & POLLIN) != 0)
+        {
+          tap_note_rx (tap_pipe->stop_fd);
+          break;
+        }
+      if ((pfd_arr[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
         break;
-      if ((pfd.revents & POLLIN) == 0)
+      if ((pfd_arr[0].revents & POLLIN) == 0)
         continue;
       for (;;)
         {
           pthread_mutex_lock (&tap_pipe->q_mtx);
-          while (tap_pipe->q_cnt >= BATCH_MAX)
+          while (!tap_pipe->stop_req && tap_pipe->q_cnt >= BATCH_MAX)
             pthread_cond_wait (&tap_pipe->q_nf, &tap_pipe->q_mtx);
+          if (tap_pipe->stop_req)
+            {
+              pthread_mutex_unlock (&tap_pipe->q_mtx);
+              return NULL;
+            }
           uint32_t idx = tap_pipe->q_tail;
           pthread_mutex_unlock (&tap_pipe->q_mtx);
 
@@ -224,8 +378,13 @@ tap_loop (void *arg)
   for (;;)
     {
       pthread_mutex_lock (&tap_pipe->q_mtx);
-      while (tap_pipe->q_cnt == 0)
+      while (!tap_pipe->stop_req && tap_pipe->q_cnt == 0)
         pthread_cond_wait (&tap_pipe->q_ne, &tap_pipe->q_mtx);
+      if (tap_pipe->stop_req && tap_pipe->q_cnt == 0)
+        {
+          pthread_mutex_unlock (&tap_pipe->q_mtx);
+          break;
+        }
       int take_cnt = (tap_pipe->q_cnt < TAP_Q_PROC_MAX) ? (int)tap_pipe->q_cnt
                                                         : TAP_Q_PROC_MAX;
       for (int i = 0; i < take_cnt; i++)
@@ -395,6 +554,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
           size_t hp_len = 0;
           hp_bld (cry_ctx, cfg->addr, re->lla, hp_buf, &hp_len);
           udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
+          rt->ctrl_tx_b += (uint64_t)hp_len;
           re->hp_ts = ts;
           return;
         }
@@ -404,6 +564,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
   ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &p_len);
   udp_tx (udp, re->ep_ip, re->ep_port, p_buf, p_len);
   rt->ping_tx_cnt++;
+  rt->ctrl_tx_b += (uint64_t)p_len;
   rt_tx_ack (rt, re->ep_ip, re->ep_port, ts);
 }
 
@@ -437,7 +598,19 @@ tty_raw (void)
 }
 
 static uint32_t
-rt_e2e_m (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
+re_show_m (const Re *re)
+{
+  if (!re)
+    return RT_M_INF;
+  if (re->lat > 0 && re->lat < RTT_UNK)
+    return re->lat;
+  if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK)
+    return re->sm_m;
+  return RT_M_INF;
+}
+
+static uint32_t
+rt_show_m (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
 {
   if (sel->type == RT_DIR)
     {
@@ -455,7 +628,7 @@ rt_e2e_m (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
             continue;
           if (re->ep_port != sel->dir.port)
             continue;
-          uint32_t m = re_m (re);
+          uint32_t m = re_show_m (re);
           if (m < best)
             best = m;
         }
@@ -479,7 +652,7 @@ rt_e2e_m (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
             continue;
           uint32_t m_adv = (re->r2d > 0) ? re->r2d : re->adv_m;
           if (m_adv == 0 || m_adv == RTT_UNK || m_adv >= RT_M_INF)
-            m_adv = re->rt_m;
+            m_adv = re->adv_m;
           if (m_adv == 0 || m_adv == RTT_UNK || m_adv >= RT_M_INF)
             continue;
           if (m_adv < m_rd)
@@ -497,7 +670,7 @@ rt_e2e_m (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
             continue;
           if (re->ep_port != sel->rel.relay_port)
             continue;
-          uint32_t m = re_m (re);
+          uint32_t m = re_show_m (re);
           if (m < m_lr)
             m_lr = m;
         }
@@ -575,7 +748,7 @@ rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
         }
       if (!is_ok)
         continue;
-      if (is_ip_bgn (ip))
+      if (!is_underlay_ip (ip))
         continue;
       Re s_re;
       memset (&s_re, 0, sizeof (s_re));
@@ -615,6 +788,7 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
   Cfg new_cfg;
   if (cfg_load (cfg_path, &new_cfg) != 0)
     return;
+  bogon_cfg_apply (&new_cfg);
   if (memcmp (cfg->addr, new_cfg.addr, 16) != 0)
     fprintf (stderr, "main: address changed in config but not hot-applied\n");
   if (cfg->port != new_cfg.port || cfg->l_exp != new_cfg.l_exp)
@@ -638,6 +812,14 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
     {
       cfg->p2p = new_cfg.p2p;
       fprintf (stderr, "main: reloaded p2p mode\n");
+    }
+  if (cfg->bogon_cnt != new_cfg.bogon_cnt
+      || memcmp (cfg->bogon_arr, new_cfg.bogon_arr, sizeof (cfg->bogon_arr)) != 0)
+    {
+      cfg->bogon_cnt = new_cfg.bogon_cnt;
+      memcpy (cfg->bogon_arr, new_cfg.bogon_arr, sizeof (cfg->bogon_arr));
+      bogon_cfg_apply (cfg);
+      fprintf (stderr, "main: reloaded bogon filter\n");
     }
   if (memcmp (cfg->psk, new_cfg.psk, 32) != 0)
     {
@@ -671,6 +853,366 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
     }
   fprintf (stderr, "main: config reloaded, peers loaded=%d, peers added=%d\n",
            peer_cnt, add_cnt);
+}
+
+int
+loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
+          bool daemon_child, LoopReadyFn ready_fn, void *ready_arg)
+{
+  if (!cfg_path || !cfg_in)
+    return 1;
+
+  int rc = 1;
+  Cfg cfg = *cfg_in;
+  static PPool pool;
+  pp_init (&pool, cfg_path);
+  Rt rt;
+  rt_init (&rt);
+  rt_mtu_probe_set (&rt, cfg.mtu_probe);
+  memcpy (rt.our_lla, cfg.addr, 16);
+
+  int tap_fd = -1;
+  bool tap_created = false;
+  static Udp udp;
+  memset (&udp, 0, sizeof (udp));
+  udp.fd = -1;
+  bool udp_inited = false;
+  static TapPipe tap_pipe;
+  bool tap_pipe_inited = false;
+  int epfd = -1;
+  int timer_fd = -1;
+  int cfg_ifd = -1;
+  bool u_w_watch = false;
+  bool stdin_watch = false;
+
+  P peers[RT_MAX];
+  int peer_cnt = p_arr_ld (cfg_path, peers, RT_MAX);
+  for (int i = 0; i < peer_cnt; i++)
+    {
+      Re ne;
+      memset (&ne, 0, sizeof (ne));
+      memcpy (ne.ep_ip, peers[i].ip, 16);
+      ne.ep_port = peers[i].port;
+      ne.is_act = false;
+      ne.is_static = true;
+      ne.state = RT_PND;
+      ne.lat = RTT_UNK;
+      ne.rto = RTO_INIT;
+      rt_upd (&rt, &ne, 0);
+      bool is_dup = false;
+      for (int j = 0; j < pool.cnt; j++)
+        {
+          if (memcmp (pool.re_arr[j].ip, peers[i].ip, 16) == 0
+              && pool.re_arr[j].port == peers[i].port)
+            {
+              is_dup = true;
+              break;
+            }
+        }
+      if (!is_dup && pool.cnt < PEER_MAX)
+        {
+          memcpy (pool.re_arr[pool.cnt].ip, peers[i].ip, 16);
+          pool.re_arr[pool.cnt].port = peers[i].port;
+          pool.cnt++;
+        }
+    }
+
+  Cry cry_ctx;
+  cry_init (&cry_ctx, cfg.psk);
+  tap_stl_rm (cfg.ifname);
+  tap_fd = tap_init (cfg.ifname);
+  if (tap_fd < 0)
+    {
+      fprintf (stderr, "main: failed to create tap\n");
+      goto out;
+    }
+  tap_created = true;
+  if (tap_addr_set (cfg.ifname, cfg.addr) != 0)
+    {
+      fprintf (stderr, "main: failed to configure tap address\n");
+      goto out;
+    }
+  if (tap_mtu_set (cfg.ifname, cfg.mtu) != 0)
+    {
+      fprintf (stderr, "main: failed to configure tap mtu\n");
+      goto out;
+    }
+  printf ("main: tap device %s created (mtu=%u).\n", cfg.ifname,
+          (unsigned)cfg.mtu);
+
+  uint16_t act_port = cfg.port;
+  if (udp_init (&udp, &act_port) != 0)
+    {
+      if (!cfg.l_exp)
+        {
+          act_port = 0;
+          if (udp_init (&udp, &act_port) != 0)
+            {
+              fprintf (stderr, "main: failed to bind udp port\n");
+              goto out;
+            }
+        }
+      else
+        {
+          fprintf (stderr, "main: failed to bind explicit udp port %u\n",
+                   cfg.port);
+          goto out;
+        }
+    }
+  udp_inited = true;
+  g_rt = &rt;
+  udp_emsg_cb_set (on_udp_emsg);
+  udp_unr_cb_set (on_udp_unr);
+  printf ("main: udp bound to port %u\n", act_port);
+  {
+    uint16_t hw_mtu = udp_mtu_get (&udp);
+    rt_pmtu_ub_set (&rt, hw_mtu);
+  }
+  rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
+
+  if (tap_pipe_init (&tap_pipe, tap_fd, &udp, &cry_ctx, sid) != 0)
+    {
+      fprintf (stderr, "main: failed to init tap pipeline\n");
+      goto out;
+    }
+  tap_pipe_inited = true;
+
+  epfd = epoll_create1 (EPOLL_CLOEXEC);
+  if (epfd < 0)
+    {
+      perror ("main: epoll_create1 failed");
+      goto out;
+    }
+
+  struct epoll_event ev;
+  memset (&ev, 0, sizeof (ev));
+  ev.events = EPOLLIN;
+  ev.data.u64 = ID_TAP_NOTE;
+  if (epoll_ctl (epfd, EPOLL_CTL_ADD, tap_pipe_note_fd_get (&tap_pipe), &ev)
+      != 0)
+    {
+      perror ("main: epoll add tap note failed");
+      goto out;
+    }
+  ev.events = EPOLLIN | EPOLLERR;
+  ev.data.u64 = ID_UDP;
+  if (epoll_ctl (epfd, EPOLL_CTL_ADD, udp.fd, &ev) != 0)
+    {
+      perror ("main: epoll add udp failed");
+      goto out;
+    }
+
+  timer_fd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  if (timer_fd < 0)
+    {
+      perror ("main: timerfd_create failed");
+      goto out;
+    }
+  struct itimerspec its;
+  memset (&its, 0, sizeof (its));
+  its.it_value.tv_nsec = 1000000;
+  its.it_interval.tv_sec = GSP_INTV;
+  if (timerfd_settime (timer_fd, 0, &its, NULL) != 0)
+    {
+      perror ("main: timerfd_settime failed");
+      goto out;
+    }
+  ev.events = EPOLLIN;
+  ev.data.u64 = ID_TMR;
+  if (epoll_ctl (epfd, EPOLL_CTL_ADD, timer_fd, &ev) != 0)
+    {
+      perror ("main: epoll add timer failed");
+      goto out;
+    }
+
+  if (!daemon_child && isatty (STDIN_FILENO))
+    {
+      tty_raw ();
+      int stdin_flg = fcntl (STDIN_FILENO, F_GETFL, 0);
+      if (stdin_flg >= 0)
+        (void)fcntl (STDIN_FILENO, F_SETFL, stdin_flg | O_NONBLOCK);
+      ev.events = EPOLLIN;
+      ev.data.u64 = ID_STD;
+      if (epoll_ctl (epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev) == 0)
+        stdin_watch = true;
+    }
+
+  char cfg_dir[PATH_MAX];
+  char cfg_file[NAME_MAX];
+  const char *cfg_name = cfg_path;
+  const char *slash = strrchr (cfg_path, '/');
+  if (slash)
+    {
+      size_t dlen = (size_t)(slash - cfg_path);
+      if (dlen >= sizeof (cfg_dir))
+        dlen = sizeof (cfg_dir) - 1;
+      memcpy (cfg_dir, cfg_path, dlen);
+      cfg_dir[dlen] = '\0';
+      cfg_name = slash + 1;
+    }
+  else
+    {
+      snprintf (cfg_dir, sizeof (cfg_dir), ".");
+    }
+  size_t cfg_name_len = strlen (cfg_name);
+  if (cfg_name_len >= sizeof (cfg_file))
+    cfg_name_len = sizeof (cfg_file) - 1;
+  memcpy (cfg_file, cfg_name, cfg_name_len);
+  cfg_file[cfg_name_len] = '\0';
+
+  cfg_ifd = inotify_init1 (IN_NONBLOCK | IN_CLOEXEC);
+  if (cfg_ifd < 0)
+    {
+      fprintf (stderr, "main: inotify init failed; config reload disabled\n");
+    }
+  else
+    {
+      int wd
+          = inotify_add_watch (cfg_ifd, cfg_dir, IN_CLOSE_WRITE | IN_MOVED_TO);
+      if (wd < 0)
+        {
+          fprintf (stderr, "main: inotify watch failed for %s\n", cfg_dir);
+          close (cfg_ifd);
+          cfg_ifd = -1;
+        }
+      else
+        {
+          ev.events = EPOLLIN;
+          ev.data.u64 = ID_CFG;
+          if (epoll_ctl (epfd, EPOLL_CTL_ADD, cfg_ifd, &ev) != 0)
+            {
+              fprintf (stderr, "main: epoll add cfg watcher failed\n");
+              close (cfg_ifd);
+              cfg_ifd = -1;
+            }
+          else
+            {
+              fprintf (stderr, "main: config watcher active: %s\n", cfg_path);
+            }
+        }
+    }
+
+  printf ("main: nmesh running; entering epoll loop\n");
+  if (stdin_watch)
+    printf ("main: type 's' and press enter to view routing table\n");
+  fflush (stdout);
+
+  on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool);
+  rt_gsp_dirty_set (&rt, "initial");
+  tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
+  if (tap_pipe_start (&tap_pipe) != 0)
+    {
+      fprintf (stderr, "main: failed to start tap pipeline threads\n");
+      goto out;
+    }
+  udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+  if (ready_fn)
+    ready_fn (ready_arg);
+  rc = 0;
+
+  struct epoll_event ev_arr[EV_MAX];
+  while (1)
+    {
+      int nev = epoll_wait (epfd, ev_arr, EV_MAX, -1);
+      if (nev < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          perror ("main: epoll_wait failed");
+          rc = 1;
+          break;
+        }
+      for (int i = 0; i < nev; i++)
+        {
+          uint64_t tok = ev_arr[i].data.u64;
+          if (tok == ID_TAP_NOTE)
+            {
+              tap_pipe_note_hnd (&tap_pipe);
+              udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+            }
+          else if (tok == ID_UDP)
+            {
+              if ((ev_arr[i].events & EPOLLIN) != 0)
+                {
+                  do
+                    {
+                      on_udp (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, &pool);
+                    }
+                  while (udp_rx_pending ());
+                }
+              if ((ev_arr[i].events & EPOLLERR) != 0)
+                {
+                  uint8_t dst_ip[16];
+                  uint16_t dst_port = 0;
+                  uint16_t pmtu = 0;
+                  while (udp_err_rd (&udp, dst_ip, &dst_port, &pmtu) == 0)
+                    rt_pmtu_ptb_ep (&rt, dst_ip, dst_port, pmtu, sys_ts ());
+                }
+              if ((ev_arr[i].events & EPOLLOUT) != 0)
+                (void)udp_w_hnd (&udp);
+              udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+            }
+          else if (tok == ID_TMR)
+            {
+              on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
+                      &pool);
+              tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
+              udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+            }
+          else if (tok == ID_STD)
+            {
+              on_std (STDIN_FILENO, &rt, &cfg, &pool);
+            }
+          else if (tok == ID_CFG && cfg_ifd >= 0)
+            {
+              char evbuf[4096];
+              ssize_t n = read (cfg_ifd, evbuf, sizeof (evbuf));
+              if (n > 0)
+                {
+                  bool need_reload = false;
+                  for (ssize_t off = 0; off < n;)
+                    {
+                      struct inotify_event *ie
+                          = (struct inotify_event *)(evbuf + off);
+                      if (ie->len > 0 && strcmp (ie->name, cfg_file) == 0
+                          && ((ie->mask & IN_CLOSE_WRITE)
+                              || (ie->mask & IN_MOVED_TO)))
+                        need_reload = true;
+                      off += (ssize_t)sizeof (struct inotify_event)
+                             + (ssize_t)ie->len;
+                    }
+                  if (need_reload)
+                    {
+                      uint64_t now = sys_ts ();
+                      cfg_reload_apply (&cfg, &cry_ctx, &rt, &pool, cfg_path,
+                                        now);
+                      tap_pipe_sync (&tap_pipe, &rt, &cfg, now);
+                    }
+                }
+            }
+        }
+      gsp_dirty_flush (&udp, &cry_ctx, &rt, &cfg);
+      udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+    }
+
+out:
+  if (cfg_ifd >= 0)
+    close (cfg_ifd);
+  if (timer_fd >= 0)
+    close (timer_fd);
+  if (epfd >= 0)
+    close (epfd);
+  if (tap_pipe_inited)
+    tap_pipe_free (&tap_pipe);
+  if (udp_inited)
+    udp_free (&udp);
+  if (tap_fd >= 0)
+    close (tap_fd);
+  if (tap_created)
+    tap_iface_cleanup (cfg.ifname);
+  rt_free (&rt);
+  g_rt = NULL;
+  return rc;
 }
 
 
@@ -764,6 +1306,22 @@ typedef struct
 } TapRun;
 
 static _Thread_local TapRun g_tap_run;
+
+static size_t
+tap_loop_stk_sz (void)
+{
+  size_t stk_sz = (size_t)PTHREAD_STACK_MIN;
+  stk_sz += sizeof (TapRun);
+  stk_sz += sizeof (TapTso);
+  stk_sz += sizeof (TapUso);
+  stk_sz += sizeof (TapTxPath) * 4U;
+  long pg_sz = sysconf (_SC_PAGESIZE);
+  size_t pg = (pg_sz > 0) ? (size_t)pg_sz : 4096U;
+  size_t rem = stk_sz % pg;
+  if (rem != 0)
+    stk_sz += pg - rem;
+  return stk_sz;
+}
 
 static void tap_rel_pulse (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                            uint64_t now, uint64_t sid,
@@ -2009,6 +2567,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           uint8_t *raw_buf = pkt_arr[i].data;
           uint8_t *src_ip = pkt_arr[i].src_ip;
           uint16_t src_port = pkt_arr[i].src_port;
+          size_t pkt_len = pkt_arr[i].data_len;
           PktHdr *hdr = &dec_arr[i].hdr;
           uint8_t *pt = dec_arr[i].pt;
           size_t pt_len = dec_arr[i].pt_len;
@@ -2058,6 +2617,9 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 }
               continue;
             }
+
+          if (ctrl_pkt_is (hdr->pkt_type))
+            rt->ctrl_rx_b += (uint64_t)pkt_len;
 
           switch (hdr->pkt_type)
             {
@@ -2174,7 +2736,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                       rx_rp_rst_lla (rt, peer_lla);
                     if (hdr->rel_f == 0)
                       rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
-                    if (hdr->rel_f == 0 && !is_ip_bgn (src_ip)
+                    if (hdr->rel_f == 0 && is_underlay_ip (src_ip)
                         && !p_is_me (rt, cfg->addr, src_ip, src_port))
                       {
                         pp_add (pool, src_ip, src_port);
@@ -2184,6 +2746,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                     pong_bld (cry_ctx, cfg->addr, req_ts, sid, pong_buf,
                               &pong_len);
                     udp_tx (udp, src_ip, src_port, pong_buf, pong_len);
+                    rt->ctrl_tx_b += (uint64_t)pong_len;
                     rt_tx_ack (rt, src_ip, src_port, ts);
                   }
                 break;
@@ -2202,7 +2765,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                     if (rtt == 0)
                       rtt = 1;
                     rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
-                    if (hdr->rel_f == 0 && !is_ip_bgn (src_ip)
+                    if (hdr->rel_f == 0 && is_underlay_ip (src_ip)
                         && !p_is_me (rt, cfg->addr, src_ip, src_port))
                       {
                         pp_add (pool, src_ip, src_port);
@@ -2229,6 +2792,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                         size_t req_len = 0;
                         seq_req_bld (cry_ctx, seq_tgt, req_buf, &req_len);
                         udp_tx (udp, src_ip, src_port, req_buf, req_len);
+                        rt->ctrl_tx_b += (uint64_t)req_len;
                         rt_tx_ack (rt, src_ip, src_port, ts);
                       }
                   }
@@ -2259,6 +2823,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                             if (dt_len > 0)
                               {
                                 udp_tx (udp, src_ip, src_port, dt_buf, dt_len);
+                                rt->ctrl_tx_b += (uint64_t)dt_len;
                                 rt_tx_ack (rt, src_ip, src_port, ts);
                               }
                           }
@@ -2344,6 +2909,7 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
         {
           udp_tx_arr (udp, batch_arr, bc);
           rt->gsp_tx_cnt += (uint64_t)bc;
+          rt->ctrl_tx_b += (uint64_t)gsp_len * (uint64_t)bc;
           bc = 0;
         }
       memcpy (batch_arr[bc].dst_ip, re->ep_ip, 16);
@@ -2356,6 +2922,7 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
     {
       udp_tx_arr (udp, batch_arr, bc);
       rt->gsp_tx_cnt += (uint64_t)bc;
+      rt->ctrl_tx_b += (uint64_t)gsp_len * (uint64_t)bc;
     }
   rt->gsp_dirty = false;
   rt->gsp_last_ts = now;
@@ -2379,6 +2946,26 @@ um_prb_intv (uint64_t age_ms)
   return UM_PRB_IMAX;
 }
 
+static void
+ctrl_rate_upd (Rt *rt, uint64_t ts)
+{
+  if (!rt)
+    return;
+  uint64_t tot_b = rt->ctrl_tx_b + rt->ctrl_rx_b;
+  if (rt->ctrl_last_ts == 0 || ts <= rt->ctrl_last_ts)
+    {
+      rt->ctrl_last_ts = ts;
+      rt->ctrl_last_b = tot_b;
+      return;
+    }
+  uint64_t diff_ms = ts - rt->ctrl_last_ts;
+  if (diff_ms == 0)
+    return;
+  rt->ctrl_now_bps = ((tot_b - rt->ctrl_last_b) * 1000ULL) / diff_ms;
+  rt->ctrl_last_ts = ts;
+  rt->ctrl_last_b = tot_b;
+}
+
 void
 on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint16_t act_port, uint64_t sid, PPool *pool)
@@ -2396,14 +2983,19 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     rt_mtu_tk (rt, ts);
   else
     rt_mtu_probe_idle (rt);
-  rt_loc_add (rt, cfg->addr, act_port, ts);
+  if (rt->loc_last_ts == 0 || ts < rt->loc_last_ts
+      || (ts - rt->loc_last_ts) >= ((uint64_t)UPD_TK * 1000ULL))
+    {
+      rt_loc_add (rt, cfg->addr, act_port, ts);
+      rt->loc_last_ts = ts;
+    }
   rt_prn_st (rt, ts);
   rt_src_gc (rt, ts);
   {
     static const uint8_t z_lla[16] = { 0 };
     for (int i = 0; i < pool->cnt; i++)
       {
-        if (is_ip_bgn (pool->re_arr[i].ip))
+        if (!is_underlay_ip (pool->re_arr[i].ip))
           continue;
         rt_ep_upd (rt, z_lla, pool->re_arr[i].ip, pool->re_arr[i].port, ts);
       }
@@ -2465,6 +3057,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           rt_tx_ack (rt, prb_re.ep_ip, prb_re.ep_port, ts);
         }
     }
+  ctrl_rate_upd (rt, ts);
 }
 
 static void
@@ -2485,6 +3078,41 @@ status_append (char *buf, size_t cap, size_t *len, const char *fmt, ...)
     *len += add;
 }
 
+static bool
+ctrl_pkt_is (uint8_t pkt_type)
+{
+  return pkt_type == PT_PING || pkt_type == PT_PONG || pkt_type == PT_GSP
+         || pkt_type == PT_SEQ_REQ;
+}
+
+static void
+fmt_rate (char *buf, size_t cap, uint64_t bps)
+{
+  static const char *u[] = { "B/s", "KiB/s", "MiB/s", "GiB/s" };
+  double v = (double)bps;
+  int idx = 0;
+  while (v >= 1024.0 && idx < 3)
+    {
+      v /= 1024.0;
+      idx++;
+    }
+  snprintf (buf, cap, "%.1f %s", v, u[idx]);
+}
+
+static void
+fmt_size (char *buf, size_t cap, uint64_t bytes)
+{
+  static const char *u[] = { "B", "KiB", "MiB", "GiB" };
+  double v = (double)bytes;
+  int idx = 0;
+  while (v >= 1024.0 && idx < 3)
+    {
+      v /= 1024.0;
+      idx++;
+    }
+  snprintf (buf, cap, "%.1f %s", v, u[idx]);
+}
+
 static size_t
 status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
                   PPool *pool)
@@ -2503,6 +3131,22 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
   while (0)
   int um_cnt = 0;
   uint8_t z_lla[16] = { 0 };
+  uint64_t now = sys_ts ();
+  uint64_t ctrl_tot_b = rt->ctrl_tx_b + rt->ctrl_rx_b;
+  uint64_t up_ms = (rt->boot_ts > 0 && now > rt->boot_ts) ? (now - rt->boot_ts)
+                                                           : 0;
+  uint64_t ctrl_avg_bps
+      = (up_ms > 0) ? ((ctrl_tot_b * 1000ULL) / up_ms) : ctrl_tot_b;
+  char ctrl_avg_str[32];
+  char ctrl_now_str[32];
+  char ctrl_tot_str[32];
+  char ctrl_tx_str[32];
+  char ctrl_rx_str[32];
+  fmt_rate (ctrl_avg_str, sizeof (ctrl_avg_str), ctrl_avg_bps);
+  fmt_rate (ctrl_now_str, sizeof (ctrl_now_str), rt->ctrl_now_bps);
+  fmt_size (ctrl_tot_str, sizeof (ctrl_tot_str), ctrl_tot_b);
+  fmt_size (ctrl_tx_str, sizeof (ctrl_tx_str), rt->ctrl_tx_b);
+  fmt_size (ctrl_rx_str, sizeof (ctrl_rx_str), rt->ctrl_rx_b);
 
   typedef struct
   {
@@ -2624,7 +3268,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
       else if (sel.type == RT_REL && IS_LLA_VAL (sel.rel.relay_lla))
         inet_ntop (AF_INET6, sel.rel.relay_lla, nhop_str, sizeof (nhop_str));
 
-      uint32_t show_m = rt_e2e_m (rt, uniq_lla[u], &sel);
+      uint32_t show_m = rt_show_m (rt, uniq_lla[u], &sel);
       if (sel.type == RT_NONE || sel.type == RT_VP)
         {
           memset (sel_ip, 0, 16);
@@ -2666,12 +3310,10 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
                             "%u (LKG:%u, UKB:%u, base)", pmtu, lkg, ukb);
               }
           }
-          strcpy (row->st, show_m >= RT_M_INF ? "pending" : "active");
+          strcpy (row->st, "active");
         }
       if ((int)strlen (row->nh) > m_nh)
         m_nh = (int)strlen (row->nh);
-      if (sel.type != RT_NONE && sel.type != RT_VP && show_m >= RT_M_INF)
-        strcpy (row->st, "pending");
       if (strcmp (row->st, "active") == 0)
         act_map_cnt++;
       if ((int)strlen (row->st) > m_st)
@@ -2708,9 +3350,10 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
 
   STATUS_PUT ("fib: active: %d/%u, static: %d, unmapped: %d\n", act_map_cnt,
               (uint32_t)rt->cnt, pool->cnt, um_cnt);
-  STATUS_PUT ("ctrl: gossip_tx=%llu ping_tx=%llu\n",
+  STATUS_PUT ("ctrl: gossip_tx=%llu ping_tx=%llu now=%s avg=%s total=%s tx=%s rx=%s\n",
               (unsigned long long)rt->gsp_tx_cnt,
-              (unsigned long long)rt->ping_tx_cnt);
+              (unsigned long long)rt->ping_tx_cnt, ctrl_now_str, ctrl_avg_str,
+              ctrl_tot_str, ctrl_tx_str, ctrl_rx_str);
   if (r_cnt > 0)
     {
       STATUS_PUT ("  %-*s  %-*s  %-*s  %-*s  rtt\n", m_dst, "dst", m_nh,

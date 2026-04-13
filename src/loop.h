@@ -19,14 +19,21 @@ typedef struct
 {
   int tap_fd;
   int note_fd;
+  int stop_fd;
   Udp *udp;
   Cry *cry_ctx;
   uint64_t sid;
   pthread_t tid_arr[2];
+  bool tid_on[2];
+  bool stop_req;
   pthread_rwlock_t snap_lk;
+  bool snap_lk_init;
   pthread_mutex_t q_mtx;
+  bool q_mtx_init;
   pthread_cond_t q_ne;
+  bool q_ne_init;
   pthread_cond_t q_nf;
+  bool q_nf_init;
   uint32_t q_head;
   uint32_t q_tail;
   uint32_t q_cnt;
@@ -35,6 +42,8 @@ typedef struct
   Cfg cfg;
   uint64_t snap_ts;
 } TapPipe;
+
+typedef void (*LoopReadyFn) (void *arg);
 
 void on_udp_emsg (const uint8_t dst_ip[16], uint16_t dst_port,
                   size_t atmpt_plen);
@@ -46,8 +55,10 @@ int tap_pipe_note_fd_get (const TapPipe *tap_pipe);
 void tap_pipe_note_hnd (TapPipe *tap_pipe);
 void tap_pipe_sync (TapPipe *tap_pipe, const Rt *rt, const Cfg *cfg,
                     uint64_t now);
-bool tap_pipe_sync_due (const TapPipe *tap_pipe, uint64_t now);
 int tap_pipe_start (TapPipe *tap_pipe);
+void tap_pipe_stop (TapPipe *tap_pipe);
+void tap_pipe_join (TapPipe *tap_pipe);
+void tap_pipe_free (TapPipe *tap_pipe);
 void rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port,
                  uint64_t now);
 bool tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt,
@@ -68,3 +79,5 @@ void tty_raw (void);
 void cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
                        const char *cfg_path, uint64_t ts);
 void gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg);
+int loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
+              bool daemon_child, LoopReadyFn ready_fn, void *ready_arg);

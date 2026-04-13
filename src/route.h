@@ -168,9 +168,17 @@ typedef struct Rt
   bool mtu_probe;
   bool map_dirty;
   bool gsp_dirty;
+  uint64_t boot_ts;
+  uint64_t loc_last_ts;
+  uint64_t sync_rev;
   uint64_t gsp_last_ts;
   uint64_t gsp_tx_cnt;
   uint64_t ping_tx_cnt;
+  uint64_t ctrl_tx_b;
+  uint64_t ctrl_rx_b;
+  uint64_t ctrl_last_ts;
+  uint64_t ctrl_last_b;
+  uint64_t ctrl_now_bps;
   Pth *pth_pool;
   RtMap *rtm_pool;
 } Rt;

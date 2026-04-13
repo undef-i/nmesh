@@ -152,25 +152,6 @@ udp_rx_split_add (const uint8_t src_ip[16], uint16_t src_port,
 }
 
 static int
-udp_rx_split_drn (uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
-                  uint16_t src_ports[], size_t len_arr[], int max_cnt)
-{
-  int out_cnt = 0;
-  while (out_cnt < max_cnt && g_rx_split_cnt > 0)
-    {
-      UdpRxSeg *seg = &g_rx_split_arr[g_rx_split_head];
-      memcpy (buf_arr[out_cnt], seg->data, seg->data_len);
-      memcpy (src_ips[out_cnt], seg->src_ip, 16);
-      src_ports[out_cnt] = seg->src_port;
-      len_arr[out_cnt] = seg->data_len;
-      g_rx_split_head = (g_rx_split_head + 1) % UDP_RX_SPLIT_MAX;
-      g_rx_split_cnt--;
-      out_cnt++;
-    }
-  return out_cnt;
-}
-
-static int
 udp_rx_split_pkt_drn (UdpRxPkt pkt_arr[], int max_cnt)
 {
   int out_cnt = 0;
@@ -222,7 +203,6 @@ udp_gso_has_run (UdpMsg *msgs, int cnt)
 static int
 udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
 {
-  static uint8_t gso_buf[UDP_GSO_MAX_BYTES];
   int acc_cnt = 0;
   for (int i = 0; i < cnt;)
     {
@@ -244,28 +224,26 @@ udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
           continue;
         }
 
-      size_t off = 0;
-      for (int j = 0; j < grp_cnt; j++)
-        {
-          memcpy (gso_buf + off, msgs[i + j].data, msgs[i + j].data_len);
-          off += msgs[i + j].data_len;
-        }
-
       struct sockaddr_in6 addr;
       memset (&addr, 0, sizeof (addr));
       addr.sin6_family = AF_INET6;
       addr.sin6_port = htons (msgs[i].dst_port);
       ip_to_v6m (msgs[i].dst_ip, addr.sin6_addr.s6_addr);
 
-      struct iovec iov = { .iov_base = gso_buf, .iov_len = off };
+      struct iovec iov_arr[UDP_GSO_MAX_SEGS];
+      for (int j = 0; j < grp_cnt; j++)
+        {
+          iov_arr[j].iov_base = msgs[i + j].data;
+          iov_arr[j].iov_len = msgs[i + j].data_len;
+        }
       char cmsg_buf[CMSG_SPACE (sizeof (uint16_t))];
       memset (cmsg_buf, 0, sizeof (cmsg_buf));
       struct msghdr msg;
       memset (&msg, 0, sizeof (msg));
       msg.msg_name = &addr;
       msg.msg_namelen = sizeof (addr);
-      msg.msg_iov = &iov;
-      msg.msg_iovlen = 1;
+      msg.msg_iov = iov_arr;
+      msg.msg_iovlen = (size_t)grp_cnt;
       msg.msg_control = cmsg_buf;
       msg.msg_controllen = sizeof (cmsg_buf);
 

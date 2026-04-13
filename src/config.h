@@ -3,11 +3,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define BOGON_RULE_MAX 64
+
 typedef enum
 {
   P2P_EN = 0,
   P2P_DIS
 } P2pMode;
+
+typedef struct
+{
+  uint8_t ip[16];
+  uint8_t prefix_len;
+  bool is_set;
+} BogonRule;
 
 typedef struct
 {
@@ -17,6 +26,8 @@ typedef struct
   uint16_t mtu;
   bool mtu_probe;
   bool l_exp;
+  size_t bogon_cnt;
+  BogonRule bogon_arr[BOGON_RULE_MAX];
   P2pMode p2p;
   uint8_t psk[32];
 } Cfg;

@@ -1,4 +1,5 @@
 #pragma once
+#include "bogon.h"
 #include "packet.h"
 #include "route.h"
 #include <stdbool.h>
@@ -63,6 +64,12 @@ is_ip_v4m (const uint8_t ip[16])
   return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 && ip[4] == 0
          && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 && ip[8] == 0 && ip[9] == 0
          && ip[10] == 0xff && ip[11] == 0xff;
+}
+
+static inline bool
+is_underlay_ip (const uint8_t ip[16])
+{
+  return ip && !bogon_ip_match (ip);
 }
 
 static inline bool

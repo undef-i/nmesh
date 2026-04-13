@@ -1,4 +1,5 @@
 #include "gossip.h"
+#include "bogon.h"
 #include "packet.h"
 #include <arpa/inet.h>
 #include <stdbool.h>
@@ -156,96 +157,7 @@ mtu_inf_s (const Rt *rt, const uint8_t src_ip[16], uint16_t src_port)
 bool
 is_ip_bgn (const uint8_t ip[16])
 {
-  static const uint8_t z16[16] = { 0 };
-  bool is_v4m = true;
-  for (int idx = 0; idx < 10; idx++)
-    {
-      if (ip[idx] != 0)
-        {
-          is_v4m = false;
-          break;
-        }
-    }
-  if (ip[10] != 0xff || ip[11] != 0xff)
-    is_v4m = false;
-  if (is_v4m)
-    {
-      uint8_t a = ip[12], b = ip[13], c = ip[14];
-      if (a == 0)
-        return true;
-      if (a == 10)
-        return true;
-      if (a == 100 && (b >= 64 && b <= 127))
-        return true;
-      if (a == 172 && b >= 16 && b <= 31)
-        return true;
-      if (a == 192 && b == 0 && c == 0)
-        return true;
-      if (a == 192 && b == 0 && c == 2)
-        return true;
-      if (a == 192 && b == 88 && c == 99)
-        return true;
-      if (a == 192 && b == 168)
-        return true;
-      if (a == 198 && (b == 18 || b == 19))
-        return true;
-      if (a == 198 && b == 51 && c == 100)
-        return true;
-      if (a == 203 && b == 0 && c == 113)
-        return true;
-      if (a == 127)
-        return true;
-      if (a == 169 && b == 254)
-        return true;
-      if (a >= 224 && a <= 239)
-        return true;
-      if (a >= 240)
-        return true;
-      return false;
-    }
-  if (memcmp (ip, z16, 16) == 0)
-    return true;
-  bool is_lo = true;
-  for (int idx = 0; idx < 15; idx++)
-    {
-      if (ip[idx] != 0)
-        {
-          is_lo = false;
-          break;
-        }
-    }
-  if (is_lo && ip[15] == 1)
-    return true;
-  if (ip[0] == 0x01 && ip[1] == 0x00 && ip[2] == 0x00 && ip[3] == 0x00
-      && ip[4] == 0x00 && ip[5] == 0x00 && ip[6] == 0x00 && ip[7] == 0x00)
-    return true;
-  if (ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x02
-      && ip[4] == 0x00 && ip[5] == 0x00)
-    return true;
-  if (ip[0] == 0x20 && ip[1] == 0x01 && (ip[2] & 0xF0) == 0x10)
-    return true;
-  if (ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8)
-    return true;
-  if (ip[0] == 0x20 && ip[1] == 0x02)
-    return true;
-  if (ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00)
-    {
-      if (ip[4] == 0x0a && ip[5] == 0x00)
-        return true;
-      if (ip[4] == 0xc0 && ip[5] == 0x00 && ip[6] == 0x02)
-        return true;
-      if (ip[4] == 0xc0 && ip[5] == 0xa8)
-        return true;
-    }
-  if (ip[0] == 0xff)
-    return true;
-  if ((ip[0] == 0xfe) && ((ip[1] & 0xc0) == 0x80))
-    return true;
-  if ((ip[0] == 0xfe) && ((ip[1] & 0xc0) == 0xc0))
-    return true;
-  if ((ip[0] & 0xfe) == 0xfc)
-    return true;
-  return false;
+  return bogon_ip_match (ip);
 }
 
 static void

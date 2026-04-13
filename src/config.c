@@ -1,4 +1,5 @@
 #include "config.h"
+#include "bogon.h"
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -324,6 +325,16 @@ cfg_load (const char *path, Cfg *cfg)
               fclose (fp);
               return -1;
             }
+        }
+      else if (strcmp (k, "bogon") == 0)
+        {
+          if (cfg->bogon_cnt >= BOGON_RULE_MAX
+              || !bogon_rule_parse (v, &cfg->bogon_arr[cfg->bogon_cnt]))
+            {
+              fclose (fp);
+              return -1;
+            }
+          cfg->bogon_cnt++;
         }
       else if (strcmp (k, "ifname") == 0)
         {

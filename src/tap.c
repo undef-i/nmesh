@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #ifndef TUNSETIFF
 #define TUNSETIFF 0x400454caU
@@ -44,6 +45,20 @@
 #define ICMP6_OPT_TLL 2
 
 static bool g_tap_udp_gso = false;
+
+static int
+tap_cmd_run (const char *cmd, const char *what, const char *name)
+{
+  int rc = system (cmd);
+  if (rc == 0)
+    return 0;
+  if (WIFEXITED (rc))
+    fprintf (stderr, "tap: %s failed for %s (exit=%d)\n", what, name,
+             WEXITSTATUS (rc));
+  else
+    fprintf (stderr, "tap: %s failed for %s\n", what, name);
+  return -1;
+}
 
 static void
 tap_txq_set (const char *name)
@@ -90,6 +105,20 @@ tap_stl_rm (const char *name)
     {
       fprintf (stderr, "tap: failed to flush addresses for %s\n", name);
     }
+}
+
+void
+tap_iface_cleanup (const char *name)
+{
+  if (!name || !name[0] || if_nametoindex (name) == 0)
+    return;
+  char cmd[256];
+  snprintf (cmd, sizeof (cmd), "ip link set dev %s down", name);
+  (void)tap_cmd_run (cmd, "set link down", name);
+  snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
+  (void)tap_cmd_run (cmd, "flush addresses", name);
+  snprintf (cmd, sizeof (cmd), "ip link del dev %s", name);
+  (void)tap_cmd_run (cmd, "delete link", name);
 }
 
 int
@@ -161,9 +190,10 @@ tap_init (const char *name)
   {
     char cmd[256];
     snprintf (cmd, sizeof (cmd), "ip link set dev %s up", name);
-    if (system (cmd) < 0)
+    if (tap_cmd_run (cmd, "set link up", name) != 0)
       {
-        fprintf (stderr, "tap: system(ip link set up) failed\n");
+        close (fd);
+        return -1;
       }
   }
   int flags = fcntl (fd, F_GETFL, 0);
@@ -172,7 +202,7 @@ tap_init (const char *name)
   return fd;
 }
 
-void
+int
 tap_addr_set (const char *name, const uint8_t lla[16])
 {
   tap_txq_set (name);
@@ -189,47 +219,35 @@ tap_addr_set (const char *name, const uint8_t lla[16])
   snprintf (cmd, sizeof (cmd),
             "ip link set dev %s address %02x:%02x:%02x:%02x:%02x:%02x", name,
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to set address for %s\n", name);
-    }
+  if (tap_cmd_run (cmd, "set address", name) != 0)
+    return -1;
   snprintf (cmd, sizeof (cmd), "ip link set dev %s multicast on", name);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to set multicast for %s\n", name);
-    }
+  if (tap_cmd_run (cmd, "enable multicast", name) != 0)
+    return -1;
   snprintf (cmd, sizeof (cmd), "ip link set dev %s addrgenmode none", name);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to set addrgenmode for %s\n", name);
-    }
+  if (tap_cmd_run (cmd, "set addrgenmode", name) != 0)
+    return -1;
   snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to flush addresses for %s\n", name);
-    }
+  if (tap_cmd_run (cmd, "flush addresses", name) != 0)
+    return -1;
   snprintf (cmd, sizeof (cmd), "ip -6 addr add %s dev %s scope link", addr_str,
             name);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to add link-local address for %s\n", name);
-    }
+  if (tap_cmd_run (cmd, "add link-local address", name) != 0)
+    return -1;
+  return 0;
 }
 
-void
+int
 tap_mtu_set (const char *name, uint16_t mtu)
 {
   if (!name)
-    return;
+    return -1;
   if (mtu < 128)
     mtu = 128;
   char cmd[256];
   snprintf (cmd, sizeof (cmd), "ip link set dev %s mtu %u", name,
             (unsigned)mtu);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: system(ip link set mtu) failed\n");
-    }
+  return tap_cmd_run (cmd, "set mtu", name);
 }
 
 int

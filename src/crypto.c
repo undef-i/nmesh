@@ -10,15 +10,6 @@ enum
   CRY_ALG_AES256GCM = 1,
 };
 
-static void
-nonce_full_bld (const uint8_t wire_nonce[CRY_NONCE_WIRE_SZ],
-                uint8_t full_nonce[CRY_NONCE_FULL_SZ])
-{
-  memset (full_nonce, 0, CRY_NONCE_FULL_SZ);
-  memcpy (full_nonce + (CRY_NONCE_FULL_SZ - CRY_NONCE_WIRE_SZ), wire_nonce,
-          CRY_NONCE_WIRE_SZ);
-}
-
 int
 cry_init (Cry *s, const uint8_t psk[32])
 {

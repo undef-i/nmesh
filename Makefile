@@ -1,3 +1,5 @@
+.DELETE_ON_ERROR:
+
 CC = musl-gcc
 TARGET_NAME = nmesh
 BUILD_DIR = build
@@ -13,7 +15,7 @@ SRCS = $(wildcard src/*.c) $(LIBSODIUM_SRCS)
 
 CFLAGS_BASE = -std=gnu11 -Wall -Wextra -pthread -Iext/uthash/src \
 		-DSODIUM_STATIC -DCONFIG_H_IS_NOT_HERE -D_GNU_SOURCE \
-		-march=native -mtune=native -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
+		-march=x86-64 -mtune=native -DMODERN_CHACHA20 -DNATIVE_LITTLE_ENDIAN \
 		-DHAVE_CPUID -DHAVE_MMINTRIN_H -DHAVE_EMMINTRIN_H -DHAVE_PMMINTRIN_H \
 		-DHAVE_TMMINTRIN_H -DHAVE_SMMINTRIN_H -DHAVE_AVXINTRIN_H -DHAVE_AVX2INTRIN_H \
 		-DHAVE_WMMINTRIN_H -DHAVE_IMMINTRIN_H -DHAVE_TI_MODE -DHAVE_GETXBV \
@@ -21,6 +23,7 @@ CFLAGS_BASE = -std=gnu11 -Wall -Wextra -pthread -Iext/uthash/src \
 
 CFLAGS_APP = $(CFLAGS_BASE) -Isrc -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium
 CFLAGS_LIB = $(CFLAGS_BASE) -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium
+CFLAGS_DEP = -MMD -MP
 
 LDFLAGS_COMMON = -static -pthread
 
@@ -35,6 +38,8 @@ LDFLAGS_DEBUG =
 
 OBJS_REL = $(patsubst %.c,$(BUILD_DIR)/release/%.o,$(SRCS))
 OBJS_DBG = $(patsubst %.c,$(BUILD_DIR)/debug/%.o,$(SRCS))
+DEPS_REL = $(OBJS_REL:.o=.d)
+DEPS_DBG = $(OBJS_DBG:.o=.d)
 
 all: release
 
@@ -50,19 +55,19 @@ $(BUILD_DIR)/debug/$(TARGET_NAME): $(OBJS_DBG)
 
 $(BUILD_DIR)/release/src/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_APP) $(CFLAGS_RELEASE) -c $< -o $@
+	$(CC) $(CFLAGS_APP) $(CFLAGS_DEP) $(CFLAGS_RELEASE) -c $< -o $@
 
 $(BUILD_DIR)/debug/src/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_APP) $(CFLAGS_DEBUG) -c $< -o $@
+	$(CC) $(CFLAGS_APP) $(CFLAGS_DEP) $(CFLAGS_DEBUG) -c $< -o $@
 
 $(BUILD_DIR)/release/ext/%.o: ext/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_LIB) $(CFLAGS_RELEASE) -c $< -o $@
+	$(CC) $(CFLAGS_LIB) $(CFLAGS_DEP) $(CFLAGS_RELEASE) -c $< -o $@
 
 $(BUILD_DIR)/debug/ext/%.o: ext/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_LIB) $(CFLAGS_DEBUG) -c $< -o $@
+	$(CC) $(CFLAGS_LIB) $(CFLAGS_DEP) $(CFLAGS_DEBUG) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)
