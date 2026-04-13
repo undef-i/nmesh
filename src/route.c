@@ -479,7 +479,7 @@ rt_map_rbd (Rt *t)
       pth->next = rtm->paths;
       rtm->paths = pth;
 
-      if (pth->r2d == 0 && pth->is_act && pth->state != RT_DED)
+      if (pth->r2d == 0 && pth->is_act && pth->state == RT_ACT)
         {
           uint32_t m = pth_m (pth);
           if (!rtm->sel_dir_pth || m < rtm->sel_dir_m)
@@ -495,7 +495,7 @@ rt_map_rbd (Rt *t)
   {
     for (Pth *p = rtm->paths; p; p = p->next)
       {
-        if (!p->is_act || p->state == RT_DED)
+        if (!p->is_act || p->state != RT_ACT)
           continue;
 
         if (p->r2d > 0)
