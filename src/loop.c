@@ -78,6 +78,25 @@ static void *tap_loop (void *arg);
 static bool ctrl_pkt_is (uint8_t pkt_type);
 static size_t tap_loop_stk_sz (void);
 
+static int
+cpu_aff_avail_cnt (void)
+{
+  cpu_set_t set;
+  CPU_ZERO (&set);
+  if (sched_getaffinity (0, sizeof (set), &set) != 0)
+    {
+      long cpu_cnt = sysconf (_SC_NPROCESSORS_ONLN);
+      return (cpu_cnt > 0) ? (int)cpu_cnt : 1;
+    }
+  int cnt = 0;
+  for (int i = 0; i < CPU_SETSIZE; i++)
+    {
+      if (CPU_ISSET (i, &set))
+        cnt++;
+    }
+  return cnt > 0 ? cnt : 1;
+}
+
 static void
 thr_aff_pin (pthread_t tid, int cpu_idx)
 {
@@ -879,6 +898,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   bool udp_inited = false;
   static TapPipe tap_pipe;
   bool tap_pipe_inited = false;
+  bool tap_inline = (cpu_aff_avail_cnt () <= 1);
   int epfd = -1;
   int timer_fd = -1;
   int cfg_ifd = -1;
@@ -970,12 +990,15 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   }
   rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
 
-  if (tap_pipe_init (&tap_pipe, tap_fd, &udp, &cry_ctx, sid) != 0)
+  if (!tap_inline)
     {
-      fprintf (stderr, "main: failed to init tap pipeline\n");
-      goto out;
+      if (tap_pipe_init (&tap_pipe, tap_fd, &udp, &cry_ctx, sid) != 0)
+        {
+          fprintf (stderr, "main: failed to init tap pipeline\n");
+          goto out;
+        }
+      tap_pipe_inited = true;
     }
-  tap_pipe_inited = true;
 
   epfd = epoll_create1 (EPOLL_CLOEXEC);
   if (epfd < 0)
@@ -987,11 +1010,13 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   struct epoll_event ev;
   memset (&ev, 0, sizeof (ev));
   ev.events = EPOLLIN;
-  ev.data.u64 = ID_TAP_NOTE;
-  if (epoll_ctl (epfd, EPOLL_CTL_ADD, tap_pipe_note_fd_get (&tap_pipe), &ev)
+  ev.data.u64 = tap_inline ? ID_TAP : ID_TAP_NOTE;
+  if (epoll_ctl (epfd, EPOLL_CTL_ADD,
+                 tap_inline ? tap_fd : tap_pipe_note_fd_get (&tap_pipe), &ev)
       != 0)
     {
-      perror ("main: epoll add tap note failed");
+      perror (tap_inline ? "main: epoll add tap failed"
+                         : "main: epoll add tap note failed");
       goto out;
     }
   ev.events = EPOLLIN | EPOLLERR;
@@ -1099,11 +1124,14 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
 
   on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool);
   rt_gsp_dirty_set (&rt, "initial");
-  tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
-  if (tap_pipe_start (&tap_pipe) != 0)
+  if (!tap_inline)
     {
-      fprintf (stderr, "main: failed to start tap pipeline threads\n");
-      goto out;
+      tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
+      if (tap_pipe_start (&tap_pipe) != 0)
+        {
+          fprintf (stderr, "main: failed to start tap pipeline threads\n");
+          goto out;
+        }
     }
   udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
   if (ready_fn)
@@ -1125,7 +1153,12 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
       for (int i = 0; i < nev; i++)
         {
           uint64_t tok = ev_arr[i].data.u64;
-          if (tok == ID_TAP_NOTE)
+          if (tok == ID_TAP)
+            {
+              on_tap (tap_fd, &udp, &cry_ctx, &rt, &cfg, sid, sys_ts ());
+              udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+            }
+          else if (tok == ID_TAP_NOTE)
             {
               tap_pipe_note_hnd (&tap_pipe);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
@@ -1156,7 +1189,8 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
             {
               on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
                       &pool);
-              tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
+              if (!tap_inline)
+                tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
           else if (tok == ID_STD)
@@ -1186,7 +1220,8 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
                       uint64_t now = sys_ts ();
                       cfg_reload_apply (&cfg, &cry_ctx, &rt, &pool, cfg_path,
                                         now);
-                      tap_pipe_sync (&tap_pipe, &rt, &cfg, now);
+                      if (!tap_inline)
+                        tap_pipe_sync (&tap_pipe, &rt, &cfg, now);
                     }
                 }
             }
@@ -1218,14 +1253,6 @@ out:
 
 typedef struct
 {
-  uint8_t dest_lla[16];
-  RtDec dec;
-  uint64_t val_ts;
-  bool is_val;
-} TapFast;
-
-typedef struct
-{
   uint8_t rt_key[16];
   uint8_t tx_ip[16];
   uint16_t tx_port;
@@ -1234,6 +1261,14 @@ typedef struct
   uint8_t rel_f;
   bool is_val;
 } TapTxPath;
+
+typedef struct
+{
+  uint8_t dest_lla[16];
+  TapTxPath tx_path;
+  uint64_t val_ts;
+  bool is_val;
+} TapFast;
 
 typedef struct
 {
@@ -2011,40 +2046,34 @@ tap_tx_path_fit (Rt *rt, const Cfg *cfg, uint64_t now, const uint8_t *frame_pkt,
       return true;
     }
 
-  RtDec dec;
-  memset (&dec, 0, sizeof (dec));
   int fp_idx = (int)((tx_path->rt_key[12] ^ tx_path->rt_key[13]
                       ^ tx_path->rt_key[14] ^ tx_path->rt_key[15])
                      & 0xff);
   if (fast_path[fp_idx].is_val && now <= fast_path[fp_idx].val_ts
       && memcmp (fast_path[fp_idx].dest_lla, tx_path->rt_key, 16) == 0)
     {
-      dec = fast_path[fp_idx].dec;
+      *tx_path = fast_path[fp_idx].tx_path;
+      return true;
+    }
+  RtDec dec;
+  memset (&dec, 0, sizeof (dec));
+  if (memcmp (tx_path->rt_key, cfg->addr, 16) == 0)
+    {
+      dec.type = RT_NONE;
     }
   else
     {
-      if (memcmp (tx_path->rt_key, cfg->addr, 16) == 0)
+      Re dir;
+      if (cfg->p2p == P2P_EN && rt_dir_fnd (rt, tx_path->rt_key, &dir))
         {
-          dec.type = RT_NONE;
+          dec.type = RT_DIR;
+          memcpy (dec.dir.ip, dir.ep_ip, 16);
+          dec.dir.port = dir.ep_port;
         }
       else
         {
-          Re dir;
-          if (cfg->p2p == P2P_EN && rt_dir_fnd (rt, tx_path->rt_key, &dir))
-            {
-              dec.type = RT_DIR;
-              memcpy (dec.dir.ip, dir.ep_ip, 16);
-              dec.dir.port = dir.ep_port;
-            }
-          else
-            {
-              dec = rt_sel (rt, tx_path->rt_key, cfg->p2p == P2P_EN);
-            }
+          dec = rt_sel (rt, tx_path->rt_key, cfg->p2p == P2P_EN);
         }
-      memcpy (fast_path[fp_idx].dest_lla, tx_path->rt_key, 16);
-      fast_path[fp_idx].dec = dec;
-      fast_path[fp_idx].val_ts = now + 200ULL;
-      fast_path[fp_idx].is_val = true;
     }
 
   tx_path->type = dec.type;
@@ -2077,9 +2106,14 @@ tap_tx_path_fit (Rt *rt, const Cfg *cfg, uint64_t now, const uint8_t *frame_pkt,
   if (tx_path->tx_port == 0)
     {
       tx_path->type = RT_NONE;
+      fast_path[fp_idx].is_val = false;
       return true;
     }
   tx_path->pmtu = tx_path_pmtu_get (cfg, tx_path->tx_ip, rt_mtu (rt, &dec));
+  memcpy (fast_path[fp_idx].dest_lla, tx_path->rt_key, 16);
+  fast_path[fp_idx].tx_path = *tx_path;
+  fast_path[fp_idx].val_ts = now + 200ULL;
+  fast_path[fp_idx].is_val = true;
   return true;
 }
 
@@ -2518,23 +2552,35 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 {
   static _Thread_local uint8_t frame_bufs[BATCH_MAX][TAP_F_MAX + TAP_HR + TAP_TR]
       __attribute__ ((aligned (32)));
-  for (int i = 0; i < BATCH_MAX; i++)
+  for (;;)
     {
-      if (udp_w_want (udp))
-        break;
-      uint8_t *pl_ptr = frame_bufs[i] + TAP_HR;
-      ssize_t n = read (tap_fd, pl_ptr, TAP_F_MAX);
-      if (n <= 0)
+      bool hit_eagain = false;
+      int rd_cnt = 0;
+      for (int i = 0; i < BATCH_MAX; i++)
         {
-          if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+          if (udp_w_want (udp))
             break;
-          break;
+          uint8_t *pl_ptr = frame_bufs[i] + TAP_HR;
+          ssize_t n = read (tap_fd, pl_ptr, TAP_F_MAX);
+          if (n <= 0)
+            {
+              if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                hit_eagain = true;
+              break;
+            }
+          rd_cnt++;
+          if (!tap_frame_tx (tap_fd, udp, cry_ctx, rt, cfg, sid, now, pl_ptr,
+                             (size_t)n))
+            {
+              rd_cnt = -1;
+              break;
+            }
         }
-      if (!tap_frame_tx (tap_fd, udp, cry_ctx, rt, cfg, sid, now, pl_ptr,
-                         (size_t)n))
+      if (!tap_frame_flush (udp))
+        break;
+      if (rd_cnt < 0 || udp_w_want (udp) || hit_eagain || rd_cnt < BATCH_MAX)
         break;
     }
-  (void)tap_frame_flush (udp);
 }
 
 void
