@@ -1,4 +1,5 @@
 #include "replay.h"
+#include "utils.h"
 #include <string.h>
 
 #define RX_RP_MAX 512
@@ -12,6 +13,7 @@ typedef struct
   uint16_t port;
   uint8_t sid[4];
   uint64_t max_cnt;
+  uint64_t last_ts;
   uint64_t map[RX_RP_W];
 } RxRp;
 
@@ -62,6 +64,22 @@ rx_rp_map_set (uint64_t map[RX_RP_W], uint64_t cnt)
   map[wi] |= (1ULL << bi);
 }
 
+static void
+rx_rp_slot_init (RxRp *slot, const uint8_t ip[16], uint16_t port,
+                 const uint8_t sid[4], uint64_t cnt, uint64_t now)
+{
+  if (!slot)
+    return;
+  slot->is_act = true;
+  memcpy (slot->ip, ip, 16);
+  slot->port = port;
+  memcpy (slot->sid, sid, sizeof (slot->sid));
+  slot->max_cnt = cnt;
+  slot->last_ts = now;
+  rx_rp_map_rst (slot->map);
+  rx_rp_map_set (slot->map, cnt);
+}
+
 bool
 rx_rp_chk (const uint8_t ip[16], uint16_t port,
            const uint8_t nonce[PKT_NONCE_SZ])
@@ -69,6 +87,7 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
   uint8_t sid[4];
   nonce_sid_rd (nonce, sid);
   uint64_t cnt = nonce_cnt_rd (nonce);
+  uint64_t now = sys_ts ();
 
   static int l_idx = 0;
   RxRp *slot = NULL;
@@ -82,6 +101,8 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
   else
     {
       RxRp *same_ep = NULL;
+      RxRp *stale = NULL;
+      uint64_t stale_ts = UINT64_MAX;
       for (size_t i = 0; i < RX_RP_MAX; i++)
         {
           if (!g_rx_rp[i].is_act)
@@ -99,9 +120,18 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
             }
           if (!same_ep)
             same_ep = &g_rx_rp[i];
+          if (now > g_rx_rp[i].last_ts
+              && (now - g_rx_rp[i].last_ts) > UM_PRB_IMAX
+              && g_rx_rp[i].last_ts < stale_ts)
+            {
+              stale = &g_rx_rp[i];
+              stale_ts = g_rx_rp[i].last_ts;
+            }
         }
       if (!slot)
         slot = same_ep;
+      if (!slot)
+        slot = stale;
       if (!slot)
         return false;
       l_idx = (int)(slot - g_rx_rp);
@@ -109,21 +139,12 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
 
   if (!slot->is_act)
     {
-      slot->is_act = true;
-      memcpy (slot->ip, ip, 16);
-      slot->port = port;
-      memcpy (slot->sid, sid, sizeof (sid));
-      slot->max_cnt = cnt;
-      rx_rp_map_rst (slot->map);
-      rx_rp_map_set (slot->map, cnt);
+      rx_rp_slot_init (slot, ip, port, sid, cnt, now);
       return true;
     }
   if (memcmp (slot->sid, sid, sizeof (sid)) != 0)
     {
-      memcpy (slot->sid, sid, sizeof (sid));
-      slot->max_cnt = cnt;
-      rx_rp_map_rst (slot->map);
-      rx_rp_map_set (slot->map, cnt);
+      rx_rp_slot_init (slot, ip, port, sid, cnt, now);
       return true;
     }
   if (cnt > slot->max_cnt)
@@ -139,6 +160,7 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
             rx_rp_map_clr (slot->map, clr);
         }
       slot->max_cnt = cnt;
+      slot->last_ts = now;
       rx_rp_map_set (slot->map, cnt);
       return true;
     }
@@ -147,6 +169,7 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
     return false;
   if (rx_rp_map_tst (slot->map, cnt))
     return false;
+  slot->last_ts = now;
   rx_rp_map_set (slot->map, cnt);
   return true;
 }

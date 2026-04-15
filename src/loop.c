@@ -2619,7 +2619,10 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           size_t pt_len = dec_arr[i].pt_len;
           if (dec_arr[i].dec_res != 0)
             continue;
-          if (!rx_rp_chk (src_ip, src_port, raw_buf + PKT_CH_SZ))
+          bool bypass_replay
+              = is_ip_loopback (src_ip) && hdr->pkt_type == PT_STAT_REQ;
+          if (!bypass_replay
+              && !rx_rp_chk (src_ip, src_port, raw_buf + PKT_CH_SZ))
             continue;
 
           if (!has_last_src || src_port != last_src_port
