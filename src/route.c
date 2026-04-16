@@ -1,4 +1,5 @@
 #include "route.h"
+#include "udp.h"
 #include "utils.h"
 #include "packet.h"
 #include <arpa/inet.h>
@@ -38,6 +39,8 @@ seq_lt (uint32_t a, uint32_t b)
   return seq_gt (b, a);
 }
 
+static bool is_z16 (const uint8_t lla[16]);
+
 static uint16_t
 rt_mtu_ub (const Rt *t)
 {
@@ -59,8 +62,15 @@ rt_mtu_ub (const Rt *t)
 static uint16_t
 re_mtu_ub (const Rt *t, const Re *re)
 {
-  (void)re;
-  return rt_mtu_ub (t);
+  uint16_t upper = rt_mtu_ub (t);
+  if (t && !t->mtu_probe && re && re->r2d == 0 && !is_z16 (re->ep_ip)
+      && re->ep_port != 0)
+    {
+      uint16_t ep_mtu = udp_ep_mtu_get (re->ep_ip);
+      if (ep_mtu >= RT_MTU_MIN && ep_mtu < upper)
+        upper = ep_mtu;
+    }
+  return upper;
 }
 
 static uint16_t
@@ -71,6 +81,21 @@ re_mtu_boot (const Rt *t, const Re *re)
   if (re->r2d != 0)
     return RT_MTU_DEF;
   return (t && t->mtu_probe) ? RT_MTU_MIN : re_mtu_ub (t, re);
+}
+
+static uint16_t
+re_mtu_fix (const Rt *t, const Re *re)
+{
+  uint16_t fixed = re_mtu_ub (t, re);
+  if (!re)
+    return fixed;
+  if (re->mtu > 0 && re->mtu < fixed)
+    fixed = re->mtu;
+  if (re->mtu_lkg > 0 && re->mtu_lkg < fixed)
+    fixed = re->mtu_lkg;
+  if (re->mtu_ukb >= RT_MTU_MIN && re->mtu_ukb < fixed)
+    fixed = re->mtu_ukb;
+  return fixed;
 }
 
 static uint16_t
@@ -95,9 +120,10 @@ re_mtu_sync (Rt *t, Re *re)
   uint16_t upper = re_mtu_ub (t, re);
   if (!t->mtu_probe && re->r2d == 0)
     {
-      re->mtu = upper;
-      re->mtu_lkg = upper;
-      re->mtu_ukb = upper;
+      uint16_t fixed = re_mtu_fix (t, re);
+      re->mtu = fixed;
+      re->mtu_lkg = fixed;
+      re->mtu_ukb = fixed;
       re->mtu_st = MTU_ST_F;
       re->prb_i_ts = 0;
       re->prb_mtu = 0;
@@ -903,15 +929,20 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       if (ne.adv_m == 0)
         ne.adv_m = ne.rt_m;
       if (ne.mtu == 0)
-        ne.mtu = (ne.mtu_lkg > 0) ? ne.mtu_lkg
-                                  : ((ne.r2d == 0) ? RT_MTU_MIN
-                                                   : RT_MTU_DEF);
+        {
+          if (!t->mtu_probe && ne.r2d == 0)
+            ne.mtu = re_mtu_ub (t, &ne);
+          else
+            ne.mtu = (ne.mtu_lkg > 0) ? ne.mtu_lkg
+                                      : ((ne.r2d == 0) ? RT_MTU_MIN
+                                                       : RT_MTU_DEF);
+        }
       if (ne.mtu < RT_MTU_MIN)
         ne.mtu = RT_MTU_MIN;
       if (ne.mtu_lkg == 0)
         ne.mtu_lkg = ne.mtu;
       if (ne.mtu_ukb == 0)
-        ne.mtu_ukb = rt_mtu_ub (t);
+        ne.mtu_ukb = (!t->mtu_probe && ne.r2d == 0) ? ne.mtu : rt_mtu_ub (t);
       ne.prb_i_ts = 0;
       ne.mtu_st = MTU_ST_B;
       re_mtu_sync (t, &ne);
@@ -1084,8 +1115,14 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       re_rx_ack (&t->re_arr[i], sys_ts);
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
-        t->re_arr[i].mtu
-            = (t->re_arr[i].mtu_lkg > 0) ? t->re_arr[i].mtu_lkg : RT_MTU_MIN;
+        {
+          if (!t->mtu_probe && t->re_arr[i].r2d == 0)
+            t->re_arr[i].mtu = re_mtu_ub (t, &t->re_arr[i]);
+          else
+            t->re_arr[i].mtu = (t->re_arr[i].mtu_lkg > 0)
+                                   ? t->re_arr[i].mtu_lkg
+                                   : RT_MTU_MIN;
+        }
       if (t->re_arr[i].mtu < RT_MTU_MIN)
         t->re_arr[i].mtu = RT_MTU_MIN;
       if (t->re_arr[i].mtu_lkg == 0)
@@ -1124,9 +1161,9 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.rt_m = re_dir_seed_m (&ne);
       ne.adv_m = ne.rt_m;
       ne.seq = 1;
-      ne.mtu = RT_MTU_MIN;
-      ne.mtu_lkg = RT_MTU_MIN;
-      ne.mtu_ukb = rt_mtu_ub (t);
+      ne.mtu = re_mtu_boot (t, &ne);
+      ne.mtu_lkg = ne.mtu;
+      ne.mtu_ukb = (!t->mtu_probe) ? ne.mtu : rt_mtu_ub (t);
       ne.mtu_st = MTU_ST_B;
       ne.prb_i_ts = 0;
       re_mtu_sync (t, &ne);
