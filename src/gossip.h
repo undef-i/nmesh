@@ -6,9 +6,11 @@
 #include <stdint.h>
 #define GSP_MAX 20
 uint8_t *ping_bld (Cry *s, const uint8_t our_lla[16], uint64_t ts,
-                   uint64_t sid, uint8_t *buf, size_t *out_len);
+                   uint64_t sid, uint64_t prb_tok, uint8_t *buf,
+                   size_t *out_len);
 uint8_t *pong_bld (Cry *s, const uint8_t our_lla[16], uint64_t o_ts,
-                   uint64_t sid, uint8_t *buf, size_t *out_len);
+                   uint64_t sid, uint64_t rx_ts, uint64_t prb_tok, uint8_t *buf,
+                   size_t *out_len);
 uint8_t *gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
                   const uint8_t our_lla[16], uint8_t *buf, size_t *out_len);
 uint8_t *gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt,
@@ -45,7 +47,9 @@ int gsp_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
                       uint16_t *off, uint16_t *total_len,
                       const uint8_t **chunk, size_t *chunk_len);
 int on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
-             uint8_t *lla);
+             uint8_t *lla, uint64_t *prb_tok);
+int on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
+             uint8_t *lla, uint64_t *rx_ts, uint64_t *prb_tok);
 int on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             uint16_t src_port, const uint8_t our_lla[16], Rt *rt, PPool *pool,
             uint64_t sys_ts, bool *is_mod, bool *req_seq, uint8_t seq_tgt[16]);
