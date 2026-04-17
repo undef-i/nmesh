@@ -16,40 +16,11 @@ Create `nmesh.conf`:
 ```ini
 ifname = nmesh
 address = fe80::1
-listen = 11451
+listen = 50000
 mtu = 1280
 mtu_probe = disable
-bogon = 172.16.0.0/12
-bogon = 192.168.0.0/16
-bogon = 10.0.0.0/8
-bogon = 0.0.0.0/8
-bogon = 100.64.0.0/10
-bogon = 192.0.0.0/24
-bogon = 192.0.2.0/24
-bogon = 192.88.99.0/24
-bogon = 198.18.0.0/15
-bogon = 198.51.100.0/24
-bogon = 203.0.113.0/24
-bogon = 127.0.0.0/8
-bogon = 169.254.0.0/16
-bogon = 224.0.0.0/4
-bogon = 240.0.0.0/4
-bogon = ::
-bogon = ::1
-bogon = 100::/64
-bogon = 2001:2::/48
-bogon = 2001:10::/28
-bogon = 2001:db8::/32
-bogon = 2002::/16
-bogon = 2001::/40
-bogon = 2001:0:c000:2::/56
-bogon = 2001:0:c0a8::/48
-bogon = ff00::/8
-bogon = fe80::/10
-bogon = fec0::/10
-bogon = fc00::/7
 psk = your_psk
-peer = 203.0.113.1:11451
+peer = 203.0.113.1:50000
 
 ```
 `address` must be in the `fe80::/96` prefix.
@@ -61,12 +32,31 @@ sudo ./build/release/nmesh -c nmesh.conf
 
 ```
 
+## Performance
+
+Local baseline on commit `10f93764a0cf157692e4dc526bf261762b1e9de1`:
+
+| Metric | Result |
+| --- | --- |
+| UDP | 4.58 Gbits/sec, 4.7% loss |
+| TCP | 7.93 Gbits/sec, 0 retransmits |
+
+Local environment:
+
+- Linux `6.6.123.2-microsoft-standard-WSL2+` on `x86_64`
+- CPU: AMD Ryzen 9 7940HX with Radeon Graphics
+
+These numbers are a point-in-time local reference, not a portability claim.
 
 ## Known Issues
 
 - Fails if underlying MTU is below 128 bytes.
 
-
 ## Planned Features
 
 - [WIP] Data Channel Offload support for better performance.
+
+## Acknowledgements
+
+- [Tailscale](https://github.com/tailscale/tailscale), whose userspace GSO/GRO work informed this project's packet-path design.
+- [EtherGuard-VPN](https://github.com/KusakabeShi/EtherGuard-VPN), whose one-way delay routing design informed this project's route selection rules.
