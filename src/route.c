@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "packet.h"
 #include <arpa/inet.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -237,6 +238,66 @@ pth_m (const Pth *pth)
   return m;
 }
 
+static uint64_t
+pth_last_rx_ts (const Pth *pth)
+{
+  if (!pth)
+    return 0;
+  uint64_t ts = pth->rx_ts;
+  if (pth->pong_ts > ts)
+    ts = pth->pong_ts;
+  return ts;
+}
+
+static bool
+dir_cost_ok (int64_t m);
+
+static bool
+pth_dir_btr (const Pth *cand, const Pth *best)
+{
+  if (!cand)
+    return false;
+  if (!best)
+    return true;
+
+  bool cand_dir_ok = dir_cost_ok (cand->dir_cost);
+  bool best_dir_ok = dir_cost_ok (best->dir_cost);
+  if (cand_dir_ok != best_dir_ok)
+    return cand_dir_ok;
+  if (cand_dir_ok && cand->dir_cost != best->dir_cost)
+    return cand->dir_cost < best->dir_cost;
+
+  uint32_t cand_m = pth_m (cand);
+  uint32_t best_m = pth_m (best);
+  if (cand_m != best_m)
+    return cand_m < best_m;
+
+  bool cand_dat = cand->dat_ts != 0;
+  bool best_dat = best->dat_ts != 0;
+  if (cand_dat != best_dat)
+    return cand_dat;
+  if (cand->dat_ts != best->dat_ts)
+    return cand->dat_ts > best->dat_ts;
+
+  uint64_t cand_ts = pth_last_rx_ts (cand);
+  uint64_t best_ts = pth_last_rx_ts (best);
+  if (cand_ts != best_ts)
+    return cand_ts > best_ts;
+
+  int ip_cmp = memcmp (cand->ep_ip, best->ep_ip, 16);
+  if (ip_cmp != 0)
+    return ip_cmp < 0;
+  if (cand->ep_port != best->ep_port)
+    return cand->ep_port < best->ep_port;
+  return false;
+}
+
+static bool
+dir_cost_ok (int64_t m)
+{
+  return m != INT64_MAX;
+}
+
 static uint32_t
 re_dir_seed_m (const Re *re)
 {
@@ -459,6 +520,7 @@ re_to_pth (const Re *re, Pth *pth)
   pth->rto = re->rto;
   pth->sm_m = re->sm_m;
   pth->lat = re->lat;
+  pth->dir_cost = re->dir_cost;
   pth->r2d = re->r2d;
   pth->mtu = re->mtu;
   pth->mtu_lkg = re->mtu_lkg;
@@ -474,6 +536,10 @@ re_to_pth (const Re *re, Pth *pth)
   pth->vfy_ts = re->vfy_ts;
   pth->hld_ts = re->hld_ts;
   pth->prb_ts = re->prb_ts;
+  pth->prb_tok = re->prb_tok;
+  pth->pnd_ts = re->pnd_ts;
+  pth->hp_ts = re->hp_ts;
+  pth->dat_ts = re->dat_ts;
 }
 
 static void
@@ -507,11 +573,10 @@ rt_map_rbd (Rt *t)
 
       if (pth->r2d == 0 && pth->is_act && pth->state == RT_ACT)
         {
-          uint32_t m = pth_m (pth);
-          if (!rtm->sel_dir_pth || m < rtm->sel_dir_m)
+          if (pth_dir_btr (pth, rtm->sel_dir_pth))
             {
               rtm->sel_dir_pth = pth;
-              rtm->sel_dir_m = m;
+              rtm->sel_dir_m = pth_m (pth);
             }
         }
     }
@@ -519,8 +584,11 @@ rt_map_rbd (Rt *t)
   RtMap *rtm, *tmp;
   HASH_ITER (hh, n_map, rtm, tmp)
   {
+    int dir_act_cnt = 0;
     for (Pth *p = rtm->paths; p; p = p->next)
       {
+        if (p->r2d == 0 && p->is_act && p->state == RT_ACT)
+          dir_act_cnt++;
         if (!p->is_act || p->state != RT_ACT)
           continue;
 
@@ -895,6 +963,8 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         cur_re->prb_tx_ts = re->prb_tx_ts;
       if (re->ack_ts > 0)
         cur_re->ack_ts = re->ack_ts;
+      if (cur_re->r2d == 0 && cur_re->dir_cost == 0)
+        cur_re->dir_cost = INT64_MAX;
       re_mtu_sync (t, cur_re);
       if (is_rel)
         {
@@ -928,6 +998,8 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         }
       if (ne.adv_m == 0)
         ne.adv_m = ne.rt_m;
+      if (ne.r2d == 0 && ne.dir_cost == 0)
+        ne.dir_cost = INT64_MAX;
       if (ne.mtu == 0)
         {
           if (!t->mtu_probe && ne.r2d == 0)
@@ -996,6 +1068,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   out->rto = selected->rto;
   out->sm_m = selected->sm_m;
   out->lat = selected->lat;
+  out->dir_cost = selected->dir_cost;
   out->r2d = selected->r2d;
   out->mtu = selected->mtu;
   out->mtu_lkg = selected->mtu_lkg;
@@ -1011,6 +1084,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   out->vfy_ts = selected->vfy_ts;
   out->hld_ts = selected->hld_ts;
   out->prb_ts = selected->prb_ts;
+  out->prb_tok = selected->prb_tok;
   return true;
 }
 
@@ -1062,21 +1136,113 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
 }
 
 void
+rt_dir_cost_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
+                 uint16_t port, int64_t dir_cost)
+{
+  if (!t)
+    return;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      Re *re = &t->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (memcmp (re->lla, peer_lla, 16) != 0)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0)
+        continue;
+      if (re->ep_port != port)
+        continue;
+      if (!dir_cost_ok (re->dir_cost))
+        {
+          re->dir_cost = dir_cost;
+        }
+      else
+        {
+          re->dir_cost = (re->dir_cost * 7LL + dir_cost) / 8LL;
+        }
+      rt_map_mark (t);
+      return;
+    }
+}
+
+bool
+rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
+                    uint32_t rtt_ms, int64_t dir_cost, uint64_t sys_ts)
+{
+  if (!t || !peer_lla || prb_tok == 0)
+    return false;
+  if (rtt_ms == 0)
+    rtt_ms = 1;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      Re *re = &t->re_arr[i];
+      if (re->r2d != 0)
+        continue;
+      if (memcmp (re->lla, peer_lla, 16) != 0)
+        continue;
+      if (re->prb_tok != prb_tok)
+        continue;
+      re->lat = rtt_ms;
+      re_rx_ack (re, sys_ts);
+      re_rto_upd (re, rtt_ms);
+      if (re->sm_m == 0 || re->sm_m >= RT_M_INF)
+        {
+          re->sm_m = rtt_ms;
+        }
+      else
+        {
+          re->sm_m = (re->sm_m * 7U + rtt_ms) / 8U;
+          if (re->sm_m == 0)
+            re->sm_m = 1;
+        }
+      re->rt_m = re->sm_m;
+      if (dir_cost != INT64_MAX)
+        {
+          if (!dir_cost_ok (re->dir_cost))
+            {
+              re->dir_cost = dir_cost;
+            }
+          else
+            {
+              re->dir_cost = (re->dir_cost * 7LL + dir_cost) / 8LL;
+            }
+        }
+      rt_map_mark (t);
+      return true;
+    }
+  return false;
+}
+
+void
 rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
            uint64_t sys_ts)
 {
   static const uint8_t z_lla[16] = { 0 };
-  bool is_z16 = (memcmp (lla, z_lla, 16) == 0);
-  if (!is_z16 && !IS_LLA_VAL (lla))
+  bool is_zero_lla = (memcmp (lla, z_lla, 16) == 0);
+  int zero_idx = -1;
+  if (!is_zero_lla && !IS_LLA_VAL (lla))
     return;
-  if (!is_z16 && memcmp (lla, t->our_lla, 16) == 0)
+  if (!is_zero_lla && memcmp (lla, t->our_lla, 16) == 0)
     return;
-  if (!is_z16)
+  if (!is_zero_lla)
     {
-      rt_zero_ep_rm (t, ip, port, false);
+      for (uint32_t i = 0; i < t->cnt; i++)
+        {
+          Re *re = &t->re_arr[i];
+          if (re->r2d != 0 || !is_z16 (re->lla))
+            continue;
+          if (memcmp (re->ep_ip, ip, 16) != 0)
+            continue;
+          if (re->ep_port != port)
+            continue;
+          zero_idx = (int)i;
+          break;
+        }
+      if (zero_idx < 0)
+        rt_zero_ep_rm (t, ip, port, false);
       rt_dir_ep_rm_af (t, lla, ip, port);
     }
-  if (is_z16)
+  if (is_zero_lla)
     {
       for (uint32_t i = 0; i < t->cnt; i++)
         {
@@ -1112,6 +1278,13 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       }
       bool was_act = t->re_arr[i].is_act;
       RtSt was_state = t->re_arr[i].state;
+      bool was_zero = is_z16 (t->re_arr[i].lla);
+      if (!is_zero_lla)
+        {
+          memcpy (t->re_arr[i].lla, lla, 16);
+          t->re_arr[i].is_act = true;
+          t->re_arr[i].state = RT_ACT;
+        }
       re_rx_ack (&t->re_arr[i], sys_ts);
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
@@ -1135,10 +1308,41 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
           t->re_arr[i].rt_m = re_dir_seed_m (&t->re_arr[i]);
         }
       rt_map_mark (t);
-      if (!is_z16 && (!was_act || was_state != RT_ACT))
+      if (!is_zero_lla && (was_zero || !was_act || was_state != RT_ACT))
         {
           rt_gsp_dirty_set (t, "ep_upd (direct active)");
         }
+      return;
+    }
+  if (zero_idx >= 0)
+    {
+      Re *re = &t->re_arr[zero_idx];
+      bool was_act = re->is_act;
+      RtSt was_state = re->state;
+      memcpy (re->lla, lla, 16);
+      re->is_act = true;
+      re->state = RT_ACT;
+      re_rx_ack (re, sys_ts);
+      memcpy (re->nhop_lla, lla, 16);
+      if (re->mtu == 0)
+        {
+          if (!t->mtu_probe && re->r2d == 0)
+            re->mtu = re_mtu_ub (t, re);
+          else
+            re->mtu = (re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_MIN;
+        }
+      if (re->mtu < RT_MTU_MIN)
+        re->mtu = RT_MTU_MIN;
+      if (re->mtu_lkg == 0)
+        re->mtu_lkg = re->mtu;
+      if (re->mtu_ukb == 0)
+        re->mtu_ukb = rt_mtu_ub (t);
+      re_mtu_sync (t, re);
+      if (re->rt_m >= RT_M_INF)
+        re->rt_m = re_dir_seed_m (re);
+      rt_map_mark (t);
+      if (!was_act || was_state != RT_ACT || !is_zero_lla)
+        rt_gsp_dirty_set (t, "ep_upd (zero promote)");
       return;
     }
   if (rt_cap_chk (t, 1))
@@ -1149,6 +1353,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       memcpy (ne.ep_ip, ip, 16);
       ne.ep_port = port;
       ne.lat = RTT_UNK;
+      ne.dir_cost = INT64_MAX;
       ne.r2d = 0;
       ne.is_act = true;
       ne.state = RT_ACT;
@@ -1182,11 +1387,11 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       }
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
-      if (!is_z16)
+      if (!is_zero_lla)
         {
           rt_gsp_dirty_set (t, "ep_upd (direct new)");
         }
-      if (!is_z16)
+      if (!is_zero_lla)
         {
           char lla_str[INET6_ADDRSTRLEN] = { 0 };
           if (inet_ntop (AF_INET6, lla, lla_str, sizeof (lla_str)) != NULL)
@@ -1235,6 +1440,51 @@ rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
         continue;
       re->tx_ts = sys_ts;
     }
+}
+
+bool
+rt_dat_upd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
+{
+  if (!t)
+    return false;
+  Re *hit = NULL;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      Re *re = &t->re_arr[i];
+      if (memcmp (re->ep_ip, ip, 16) != 0)
+        continue;
+      if (re->ep_port != port)
+        continue;
+      hit = re;
+      break;
+    }
+
+  if (!hit || hit->r2d != 0 || !hit->is_act || hit->state != RT_ACT)
+    return false;
+
+  bool is_mod = false;
+  if (hit->dat_ts == 0)
+    {
+      hit->dat_ts = sys_ts ? sys_ts : 1;
+      is_mod = true;
+    }
+
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      Re *re = &t->re_arr[i];
+      if (re == hit || re->r2d != 0)
+        continue;
+      if (memcmp (re->lla, hit->lla, 16) != 0)
+        continue;
+      if (re->dat_ts == 0)
+        continue;
+      re->dat_ts = 0;
+      is_mod = true;
+    }
+
+  if (is_mod)
+    rt_map_mark (t);
+  return is_mod;
 }
 void
 rt_gsp_dirty_set (Rt *t, const char *r)
@@ -1883,15 +2133,17 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
                           lla_str, (unsigned long long)age, (int)re->state);
                   if (rt_gsp_affects_dir (t, re))
                     any_ded = true;
-                  re->is_act = false;
-                  re->state = RT_DED;
-                  re->rt_m = RT_M_INF;
-                  is_mod = true;
+      re->is_act = false;
+      re->state = RT_DED;
+      re->rt_m = RT_M_INF;
+      re->dir_cost = INT64_MAX;
+      is_mod = true;
                 }
               else
                 {
                   re->state = RT_DED;
                   re->rt_m = RT_M_INF;
+                  re->dir_cost = INT64_MAX;
                 }
             }
           if (!re->is_static)

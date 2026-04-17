@@ -575,15 +575,18 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
           udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
           rt->ctrl_tx_b += (uint64_t)hp_len;
           re->hp_ts = ts;
-          return;
         }
     }
   uint8_t p_buf[UDP_PL_MAX];
   size_t p_len = 0;
-  ping_bld (cry_ctx, cfg->addr, ts, sid, p_buf, &p_len);
+  uint64_t p_ts = sys_ts ();
+  uint64_t p_tok = ((uint64_t)u32_rnd () << 32) | (uint64_t)u32_rnd ();
+  ping_bld (cry_ctx, cfg->addr, p_ts, sid, p_tok, p_buf, &p_len);
   udp_tx (udp, re->ep_ip, re->ep_port, p_buf, p_len);
   rt->ping_tx_cnt++;
   rt->ctrl_tx_b += (uint64_t)p_len;
+  re->prb_ts = p_ts;
+  re->prb_tok = p_tok;
   rt_tx_ack (rt, re->ep_ip, re->ep_port, ts);
 }
 
@@ -621,6 +624,8 @@ re_show_m (const Re *re)
 {
   if (!re)
     return RT_M_INF;
+  if (re->dir_cost >= 0 && re->dir_cost < (int64_t)RT_M_INF)
+    return (uint32_t)re->dir_cost;
   if (re->lat > 0 && re->lat < RTT_UNK)
     return re->lat;
   if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK)
@@ -735,6 +740,37 @@ mesh_dst_lla_from_frame (const uint8_t *frame, const uint8_t base_lla[16],
   return true;
 }
 
+static bool
+mesh_src_lla_from_frame (const uint8_t *frame, const uint8_t base_lla[16],
+                         uint8_t out_lla[16])
+{
+  if (!frame || !base_lla || !out_lla)
+    return false;
+  const uint8_t *src_mac = frame + ETH_ALEN;
+  if (src_mac[0] != 0x02 || src_mac[1] != 0x00)
+    return false;
+  memcpy (out_lla, base_lla, 16);
+  out_lla[12] = src_mac[2];
+  out_lla[13] = src_mac[3];
+  out_lla[14] = src_mac[4];
+  out_lla[15] = src_mac[5];
+  return true;
+}
+
+static bool
+mesh_src_lla_from_ip6 (const uint8_t *frame, size_t frame_len,
+                       uint8_t out_lla[16])
+{
+  if (!frame || !out_lla || frame_len < ETH_HLEN + 40U)
+    return false;
+  uint16_t eth_type = (uint16_t)(((uint16_t)frame[12] << 8) | frame[13]);
+  if (eth_type != ETH_P_IPV6)
+    return false;
+  const uint8_t *ip6 = frame + ETH_HLEN;
+  memcpy (out_lla, ip6 + 8, 16);
+  return IS_LLA_VAL (out_lla);
+}
+
 void
 rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
 {
@@ -778,6 +814,7 @@ rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
       s_re.state = RT_ACT;
       s_re.lat = 0;
       s_re.sm_m = 0;
+      s_re.dir_cost = INT64_MAX;
       s_re.rt_m = 0;
       s_re.adv_m = 0;
       s_re.seq = 1;
@@ -859,6 +896,7 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       ne.is_static = true;
       ne.state = RT_PND;
       ne.lat = RTT_UNK;
+      ne.dir_cost = INT64_MAX;
       ne.rto = RTO_INIT;
       rt_upd (rt, &ne, ts);
       if (!pool_has_peer (pool, peers[i].ip, peers[i].port)
@@ -917,6 +955,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
       ne.is_static = true;
       ne.state = RT_PND;
       ne.lat = RTT_UNK;
+      ne.dir_cost = INT64_MAX;
       ne.rto = RTO_INIT;
       rt_upd (&rt, &ne, 0);
       bool is_dup = false;
@@ -2641,6 +2680,18 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 continue;
               if (hdr->rel_f == 0)
                 {
+                  if (rt_dat_upd (rt, src_ip, src_port, ts))
+                    {
+                      const uint8_t *frame = pt + VNET_HL;
+                      uint8_t src_lla[16] = { 0 };
+                      if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
+                           || mesh_src_lla_from_ip6 (frame, pt_len - VNET_HL,
+                                                     src_lla))
+                          && memcmp (src_lla, cfg->addr, 16) != 0)
+                        {
+                          rt_ep_upd (rt, src_lla, src_ip, src_port, ts);
+                        }
+                    }
                   gro_fed (tap_fd, pt, pt_len);
                   continue;
                 }
@@ -2717,6 +2768,18 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   break;
                 if (full_len < VNET_HL + ETH_HLEN)
                   break;
+                if (rt_dat_upd (rt, src_ip, src_port, ts))
+                  {
+                    const uint8_t *frame = full_l3 + VNET_HL;
+                    uint8_t src_lla[16] = { 0 };
+                    if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
+                         || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL,
+                                                   src_lla))
+                        && memcmp (src_lla, cfg->addr, 16) != 0)
+                      {
+                        rt_ep_upd (rt, src_lla, src_ip, src_port, ts);
+                      }
+                  }
                 gro_fed (tap_fd, full_l3, full_len);
                 break;
               }
@@ -2778,8 +2841,11 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             case PT_PING:
               {
                 uint64_t req_ts, peer_sid;
+                uint64_t prb_tok = 0;
                 uint8_t peer_lla[16];
-                if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla) == 0)
+                if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla,
+                             &prb_tok)
+                    == 0)
                   {
                     if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
                       rx_rp_rst_lla (rt, peer_lla);
@@ -2792,8 +2858,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                       }
                     static uint8_t pong_buf[UDP_PL_MAX];
                     size_t pong_len;
-                    pong_bld (cry_ctx, cfg->addr, req_ts, sid, pong_buf,
-                              &pong_len);
+                    pong_bld (cry_ctx, cfg->addr, req_ts, sid, ts, prb_tok,
+                              pong_buf, &pong_len);
                     udp_tx (udp, src_ip, src_port, pong_buf, pong_len);
                     rt->ctrl_tx_b += (uint64_t)pong_len;
                     rt_tx_ack (rt, src_ip, src_port, ts);
@@ -2803,8 +2869,12 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             case PT_PONG:
               {
                 uint64_t req_ts, peer_sid;
+                uint64_t peer_rx_ts = 0;
+                uint64_t prb_tok = 0;
                 uint8_t peer_lla[16];
-                if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla) == 0)
+                if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla,
+                             &peer_rx_ts, &prb_tok)
+                    == 0)
                   {
                     if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
                       rx_rp_rst_lla (rt, peer_lla);
@@ -2813,7 +2883,21 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                     uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
                     if (rtt == 0)
                       rtt = 1;
-                    rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
+                    int64_t dir_cost = INT64_MAX;
+                    if (peer_rx_ts > 0)
+                      {
+                        dir_cost = (int64_t)peer_rx_ts - (int64_t)req_ts;
+                      }
+                    if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt,
+                                             dir_cost, ts))
+                      {
+                        rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
+                        if (dir_cost != INT64_MAX)
+                          {
+                            rt_dir_cost_upd (rt, peer_lla, src_ip, src_port,
+                                             dir_cost);
+                          }
+                      }
                     if (hdr->rel_f == 0 && is_underlay_ip (src_ip)
                         && !p_is_me (rt, cfg->addr, src_ip, src_port))
                       {
@@ -2995,6 +3079,25 @@ um_prb_intv (uint64_t age_ms)
   return UM_PRB_IMAX;
 }
 
+static bool
+re_has_dir_alt (const Rt *rt, const Re *re)
+{
+  if (!rt || !re || re->r2d != 0 || lla_is_z (re->lla))
+    return false;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *alt = &rt->re_arr[i];
+      if (alt == re || alt->r2d != 0)
+        continue;
+      if (!alt->is_act || alt->state != RT_ACT)
+        continue;
+      if (memcmp (alt->lla, re->lla, 16) != 0)
+        continue;
+      return true;
+    }
+  return false;
+}
+
 static void
 ctrl_rate_upd (Rt *rt, uint64_t ts)
 {
@@ -3056,8 +3159,6 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       Re *re = &rt->re_arr[i];
       if (re->r2d != 0)
         continue;
-      if (re_is_stdby (rt, re, cfg->p2p == P2P_EN))
-        continue;
 
       bool is_unmapped = lla_is_z (re->lla);
       bool needs_probe = is_unmapped || re->state == RT_PND
@@ -3078,7 +3179,11 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       if (!re->is_act || re->state != RT_ACT)
         continue;
-      if (re->tx_ts > 0 && ts > re->tx_ts && (ts - re->tx_ts) < KA_TMO)
+      uint64_t prb_intv = (re_is_stdby (rt, re, cfg->p2p == P2P_EN)
+                           || re_has_dir_alt (rt, re))
+                              ? UM_PRB_I1
+                              : KA_TMO;
+      if (re->prb_ts > 0 && ts > re->prb_ts && (ts - re->prb_ts) < prb_intv)
         continue;
       pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
     }

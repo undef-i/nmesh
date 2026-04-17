@@ -122,6 +122,8 @@ start_ready_close (void)
 static void
 start_stdio_detach (void)
 {
+  if (!isatty (STDOUT_FILENO) && !isatty (STDERR_FILENO))
+    return;
   int devnull = open ("/dev/null", O_RDWR | O_CLOEXEC);
   if (devnull < 0)
     return;

@@ -29,7 +29,8 @@ typedef struct __attribute__ ((packed))
 #define UDP_PL_MAX (PKT_HDR_SZ + 16 + V6_PL_MAX)
 #define TAP_HR 128
 #define TAP_TR 64
-#define PING_PL_SZ 32
+#define PING_PL_SZ 40
+#define PONG_PL_SZ 48
 
 typedef struct __attribute__ ((packed))
 {

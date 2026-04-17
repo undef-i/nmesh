@@ -186,12 +186,13 @@ pkt_enc (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
 
 uint8_t *
 ping_bld (Cry *s, const uint8_t our_lla[16], uint64_t ts, uint64_t sid,
-          uint8_t *buf, size_t *out_len)
+          uint64_t prb_tok, uint8_t *buf, size_t *out_len)
 {
   uint8_t payload[PING_PL_SZ];
   u64_wr (payload, ts);
   u64_wr (payload + 8, sid);
   memcpy (payload + 16, our_lla, 16);
+  u64_wr (payload + 32, prb_tok);
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_PING, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, PING_PL_SZ, buf, out_len);
@@ -199,15 +200,17 @@ ping_bld (Cry *s, const uint8_t our_lla[16], uint64_t ts, uint64_t sid,
 
 uint8_t *
 pong_bld (Cry *s, const uint8_t our_lla[16], uint64_t o_ts, uint64_t sid,
-          uint8_t *buf, size_t *out_len)
+          uint64_t rx_ts, uint64_t prb_tok, uint8_t *buf, size_t *out_len)
 {
-  uint8_t payload[PING_PL_SZ];
+  uint8_t payload[PONG_PL_SZ];
   u64_wr (payload, o_ts);
   u64_wr (payload + 8, sid);
   memcpy (payload + 16, our_lla, 16);
+  u64_wr (payload + 32, rx_ts);
+  u64_wr (payload + 40, prb_tok);
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_PONG, 0, 32, hdr);
-  return pkt_enc (s, hdr, payload, PING_PL_SZ, buf, out_len);
+  return pkt_enc (s, hdr, payload, PONG_PL_SZ, buf, out_len);
 }
 
 uint8_t *
@@ -514,7 +517,7 @@ gsp_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
 
 int
 on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
-         uint8_t *lla)
+         uint8_t *lla, uint64_t *prb_tok)
 {
   if (!pt || pt_len < PING_PL_SZ)
     return -1;
@@ -523,6 +526,37 @@ on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
     *sid = u64_rd (pt + 8);
   if (lla)
     memcpy (lla, pt + 16, 16);
+  if (prb_tok)
+    *prb_tok = (pt_len >= PING_PL_SZ) ? u64_rd (pt + 32) : 0;
+  return 0;
+}
+
+int
+on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
+         uint8_t *lla, uint64_t *rx_ts, uint64_t *prb_tok)
+{
+  if (!pt || pt_len < PING_PL_SZ)
+    return -1;
+  if (o_ts)
+    *o_ts = u64_rd (pt);
+  if (sid)
+    *sid = u64_rd (pt + 8);
+  if (lla)
+    memcpy (lla, pt + 16, 16);
+  if (rx_ts)
+    {
+      if (pt_len >= PONG_PL_SZ)
+        *rx_ts = u64_rd (pt + 32);
+      else
+        *rx_ts = 0;
+    }
+  if (prb_tok)
+    {
+      if (pt_len >= PONG_PL_SZ)
+        *prb_tok = u64_rd (pt + 40);
+      else
+        *prb_tok = 0;
+    }
   return 0;
 }
 
@@ -629,6 +663,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rel_re.r2d
               = is_adv_rch ? adv_m : (is_s_alive ? REL_M_UNK : RT_M_INF);
           rel_re.lat = RTT_UNK;
+          rel_re.dir_cost = INT64_MAX;
           rel_re.rt_m = rel_re.r2d;
           if (rel_mtu > 0)
             {
@@ -654,6 +689,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         dir_re.adv_m = adv_m;
         dir_re.r2d = 0;
         dir_re.lat = RTT_UNK;
+        dir_re.dir_cost = INT64_MAX;
         dir_re.rt_m = RT_M_INF;
         dir_re.sm_m = RT_M_INF;
         if (gsp_mtu > 0)
@@ -723,7 +759,7 @@ on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
         {
           uint8_t p_buf[UDP_PL_MAX];
           size_t p_len;
-          ping_bld (s, o_lla, ts, sid, p_buf, &p_len);
+          ping_bld (s, o_lla, ts, sid, 0, p_buf, &p_len);
           udp_tx (udp, req_re.ep_ip, req_re.ep_port, p_buf, p_len);
         }
       return 0;

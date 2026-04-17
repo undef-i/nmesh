@@ -54,6 +54,7 @@ typedef struct
   uint32_t rto;
   uint32_t sm_m;
   uint32_t lat;
+  int64_t dir_cost;
   uint32_t r2d;
   uint16_t mtu;
   uint16_t mtu_lkg;
@@ -69,8 +70,10 @@ typedef struct
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
+  uint64_t prb_tok;
   uint64_t pnd_ts;
   uint64_t hp_ts;
+  uint64_t dat_ts;
 } Re;
 
 typedef struct Pth
@@ -96,6 +99,7 @@ typedef struct Pth
   uint32_t rto;
   uint32_t sm_m;
   uint32_t lat;
+  int64_t dir_cost;
   uint32_t r2d;
   uint16_t mtu;
   uint16_t mtu_lkg;
@@ -111,8 +115,10 @@ typedef struct Pth
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
+  uint64_t prb_tok;
   uint64_t pnd_ts;
   uint64_t hp_ts;
+  uint64_t dat_ts;
   struct Pth *next;
 } Pth;
 
@@ -219,10 +225,15 @@ void rt_upd (Rt *t, const Re *re, uint64_t sys_ts);
 bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
                  uint16_t port, uint32_t rtt_ms, uint64_t sys_ts);
+void rt_dir_cost_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
+                      uint16_t port, int64_t dir_cost);
+bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
+                         uint32_t rtt_ms, int64_t dir_cost, uint64_t sys_ts);
 void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
                 uint16_t port, uint64_t sys_ts);
 void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 void rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
+bool rt_dat_upd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 RtDec rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p);
 uint16_t rt_mtu (const Rt *t, const RtDec *sel);
 void rt_mtu_probe_set (Rt *t, bool is_on);
