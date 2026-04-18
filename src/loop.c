@@ -531,23 +531,6 @@ rt_re_fnd (Rt *rt, const uint8_t lla[16])
   return NULL;
 }
 
-static bool
-re_is_stdby (Rt *rt, const Re *re, bool is_p2p)
-{
-  if (!rt || !re || re->r2d != 0 || lla_is_z (re->lla))
-    return false;
-  RtDec dec = rt_sel (rt, re->lla, is_p2p);
-  if (dec.type == RT_DIR)
-    {
-      if (memcmp (re->ep_ip, dec.dir.ip, 16) == 0 && re->ep_port == dec.dir.port)
-        return false;
-      return true;
-    }
-  if (dec.type == RT_REL)
-    return true;
-  return false;
-}
-
 static void
 pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
           uint64_t sid, bool may_rel)
@@ -3104,25 +3087,6 @@ um_prb_intv (uint64_t age_ms)
   return UM_PRB_IMAX;
 }
 
-static bool
-re_has_dir_alt (const Rt *rt, const Re *re)
-{
-  if (!rt || !re || re->r2d != 0 || lla_is_z (re->lla))
-    return false;
-  for (uint32_t i = 0; i < rt->cnt; i++)
-    {
-      const Re *alt = &rt->re_arr[i];
-      if (alt == re || alt->r2d != 0)
-        continue;
-      if (!alt->is_act || alt->state != RT_ACT)
-        continue;
-      if (memcmp (alt->lla, re->lla, 16) != 0)
-        continue;
-      return true;
-    }
-  return false;
-}
-
 static void
 ctrl_rate_upd (Rt *rt, uint64_t ts)
 {
@@ -3204,10 +3168,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       if (!re->is_act || re->state != RT_ACT)
         continue;
-      uint64_t prb_intv = (re_is_stdby (rt, re, cfg->p2p == P2P_EN)
-                           || re_has_dir_alt (rt, re))
-                              ? UM_PRB_I1
-                              : KA_TMO;
+      uint64_t prb_intv = KA_TMO;
       if (re->prb_ts > 0 && ts > re->prb_ts && (ts - re->prb_ts) < prb_intv)
         continue;
       pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
