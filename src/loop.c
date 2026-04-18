@@ -705,6 +705,44 @@ rt_show_m (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
   return RT_M_INF;
 }
 
+static void
+status_rsp_tx_local (Cry *cry_ctx, const uint8_t dst_ip[16], uint16_t dst_port,
+                     uint32_t req_id, const char *txt, size_t txt_len)
+{
+  if (!cry_ctx || !dst_ip || !txt || txt_len == 0)
+    return;
+
+  int fd = socket (AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    return;
+
+  struct sockaddr_in6 dst;
+  memset (&dst, 0, sizeof (dst));
+  dst.sin6_family = AF_INET6;
+  dst.sin6_port = htons (dst_port);
+  memcpy (dst.sin6_addr.s6_addr, dst_ip, 16);
+
+  static uint8_t rsp_buf[UDP_PL_MAX];
+  size_t chunk_cap = UDP_PL_MAX - PKT_HDR_SZ - sizeof (StatHdr);
+  for (size_t off = 0; off < txt_len;)
+    {
+      size_t chunk_len = txt_len - off;
+      if (chunk_len > chunk_cap)
+        chunk_len = chunk_cap;
+      size_t rsp_len = 0;
+      if (!stat_rsp_bld (cry_ctx, req_id, (uint16_t)txt_len, (uint16_t)off,
+                         (const uint8_t *)txt + off, chunk_len, rsp_buf,
+                         &rsp_len))
+        break;
+      if (sendto (fd, rsp_buf, rsp_len, 0, (struct sockaddr *)&dst,
+                  sizeof (dst))
+          < 0)
+        break;
+      off += chunk_len;
+    }
+  close (fd);
+}
+
 static bool
 rt_key_get (const Rt *rt, const uint8_t *frame, const uint8_t our_lla[16],
             uint8_t out_lla[16])
@@ -2820,21 +2858,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                                  cfg, pool);
                 if (txt_len > txt_cap)
                   txt_len = txt_cap;
-                static uint8_t rsp_buf[UDP_PL_MAX];
-                size_t chunk_cap = UDP_PL_MAX - PKT_HDR_SZ - sizeof (StatHdr);
-                for (size_t off = 0; off < txt_len;)
-                  {
-                    size_t chunk_len = txt_len - off;
-                    if (chunk_len > chunk_cap)
-                      chunk_len = chunk_cap;
-                    size_t rsp_len = 0;
-                    if (!stat_rsp_bld (cry_ctx, req_id, (uint16_t)txt_len,
-                                       (uint16_t)off, (const uint8_t *)txt + off,
-                                       chunk_len, rsp_buf, &rsp_len))
-                      break;
-                    udp_tx (udp, src_ip, src_port, rsp_buf, rsp_len);
-                    off += chunk_len;
-                  }
+                status_rsp_tx_local (cry_ctx, src_ip, src_port, req_id, txt,
+                                     txt_len);
                 free (txt);
                 break;
               }
