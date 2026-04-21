@@ -201,7 +201,7 @@ udp_gso_has_run (UdpMsg *msgs, int cnt)
 }
 
 static int
-udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
+udp_gso_tx_seq (Udp *s, UdpMsg *msgs, int cnt)
 {
   int acc_cnt = 0;
   for (int i = 0; i < cnt;)
@@ -308,6 +308,118 @@ udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
                    errno, seg_len, grp_cnt);
         }
       i += grp_cnt;
+    }
+  return acc_cnt;
+}
+
+static int
+udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
+{
+  static struct mmsghdr msg_arr[BATCH_MAX];
+  static struct sockaddr_in6 addr_arr[BATCH_MAX];
+  static struct iovec iov_arr[BATCH_MAX * UDP_GSO_MAX_SEGS];
+  static char cmsg_arr[BATCH_MAX][CMSG_SPACE (sizeof (uint16_t))];
+  static int grp_bgn[BATCH_MAX];
+  static int grp_cnt_arr[BATCH_MAX];
+
+  int grp_total = 0;
+  int iov_idx = 0;
+  for (int i = 0; i < cnt;)
+    {
+      int grp_cnt = 1;
+      size_t seg_len = msgs[i].data_len;
+      size_t tot_len = seg_len;
+      while ((i + grp_cnt) < cnt
+             && udp_gso_grp_fit (&msgs[i], &msgs[i + grp_cnt], seg_len,
+                                 tot_len, grp_cnt))
+        {
+          tot_len += msgs[i + grp_cnt].data_len;
+          grp_cnt++;
+        }
+
+      int grp_idx = grp_total++;
+      grp_bgn[grp_idx] = i;
+      grp_cnt_arr[grp_idx] = grp_cnt;
+      memset (&addr_arr[grp_idx], 0, sizeof (addr_arr[grp_idx]));
+      addr_arr[grp_idx].sin6_family = AF_INET6;
+      addr_arr[grp_idx].sin6_port = htons (msgs[i].dst_port);
+      ip_to_v6m (msgs[i].dst_ip, addr_arr[grp_idx].sin6_addr.s6_addr);
+
+      memset (&msg_arr[grp_idx], 0, sizeof (msg_arr[grp_idx]));
+      msg_arr[grp_idx].msg_hdr.msg_name = &addr_arr[grp_idx];
+      msg_arr[grp_idx].msg_hdr.msg_namelen = sizeof (addr_arr[grp_idx]);
+      msg_arr[grp_idx].msg_hdr.msg_iov = &iov_arr[iov_idx];
+      msg_arr[grp_idx].msg_hdr.msg_iovlen = (size_t)grp_cnt;
+
+      for (int j = 0; j < grp_cnt; j++)
+        {
+          iov_arr[iov_idx + j].iov_base = msgs[i + j].data;
+          iov_arr[iov_idx + j].iov_len = msgs[i + j].data_len;
+        }
+
+      if (grp_cnt >= 2 && seg_len > 0)
+        {
+          memset (cmsg_arr[grp_idx], 0, sizeof (cmsg_arr[grp_idx]));
+          msg_arr[grp_idx].msg_hdr.msg_control = cmsg_arr[grp_idx];
+          msg_arr[grp_idx].msg_hdr.msg_controllen = sizeof (cmsg_arr[grp_idx]);
+          struct cmsghdr *cmsg = CMSG_FIRSTHDR (&msg_arr[grp_idx].msg_hdr);
+          cmsg->cmsg_level = SOL_UDP;
+          cmsg->cmsg_type = UDP_SEGMENT;
+          cmsg->cmsg_len = CMSG_LEN (sizeof (uint16_t));
+          *((uint16_t *)CMSG_DATA (cmsg)) = (uint16_t)seg_len;
+          msg_arr[grp_idx].msg_hdr.msg_controllen
+              = CMSG_SPACE (sizeof (uint16_t));
+        }
+
+      iov_idx += grp_cnt;
+      i += grp_cnt;
+    }
+
+  int grp_idx = 0;
+  int acc_cnt = 0;
+  while (grp_idx < grp_total)
+    {
+      int rc = sendmmsg (s->fd, msg_arr + grp_idx, grp_total - grp_idx, 0);
+      if (rc < 0)
+        {
+          if (errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP
+              || errno == ENOTSUP)
+            {
+              s->gso_en = false;
+              return acc_cnt
+                     + udp_gso_tx_seq (s, msgs + grp_bgn[grp_idx],
+                                       cnt - grp_bgn[grp_idx]);
+            }
+          if (is_err_tns (errno))
+            {
+              for (int i = grp_bgn[grp_idx]; i < cnt; i++)
+                {
+                  if (udp_pend_add (s, &msgs[i]))
+                    acc_cnt++;
+                  else
+                    fprintf (stderr,
+                             "udp: pending queue full, drop outgoing packet\n");
+                }
+              return acc_cnt;
+            }
+          return acc_cnt
+                 + udp_gso_tx_seq (s, msgs + grp_bgn[grp_idx],
+                                   cnt - grp_bgn[grp_idx]);
+        }
+      if (rc == 0)
+        break;
+      for (int i = 0; i < rc; i++)
+        acc_cnt += grp_cnt_arr[grp_idx + i];
+      grp_idx += rc;
+    }
+
+  if (grp_idx < grp_total)
+    {
+      for (int i = grp_bgn[grp_idx]; i < cnt; i++)
+        {
+          if (!udp_pend_add (s, &msgs[i]))
+            fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
+        }
     }
   return acc_cnt;
 }
