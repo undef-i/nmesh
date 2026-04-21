@@ -23,8 +23,9 @@ typedef struct __attribute__ ((packed))
 #define PKT_TF_REL 0x80
 #define PKT_TF_TYPE_MASK 0x7f
 #define PKT_CH_SZ 2
-#define PKT_NONCE_SZ 12
-#define PKT_HDR_SZ (PKT_CH_SZ + PKT_NONCE_SZ + 16)
+#define PKT_NONCE_SZ 16
+#define PKT_MAC_SZ 32
+#define PKT_HDR_SZ (PKT_CH_SZ + PKT_NONCE_SZ + PKT_MAC_SZ)
 #define V6_PL_MAX 9000
 #define UDP_PL_MAX (PKT_HDR_SZ + 16 + V6_PL_MAX)
 #define TAP_HR 128
@@ -71,5 +72,5 @@ _Static_assert (sizeof (GspEnt) == 70, "GspEnt size");
 _Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
 _Static_assert (sizeof (StatHdr) == 8, "StatHdr size");
-_Static_assert (PKT_HDR_SZ == 30, "PKT_HDR_SZ");
+_Static_assert (PKT_HDR_SZ == 50, "PKT_HDR_SZ");
 _Static_assert (UDP_PL_MAX == (PKT_HDR_SZ + 16 + V6_PL_MAX), "UDP_PL_MAX");

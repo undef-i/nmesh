@@ -174,12 +174,12 @@ static uint8_t *
 pkt_enc (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
          size_t pl_len, uint8_t *buf, size_t *out_len)
 {
-  uint8_t nonce[PKT_NONCE_SZ], mac[16];
+  uint8_t nonce[PKT_NONCE_SZ], mac[PKT_MAC_SZ];
   memcpy (buf, hdr, PKT_CH_SZ);
-  uint8_t *ct_ptr = buf + PKT_CH_SZ + PKT_NONCE_SZ + 16;
+  uint8_t *ct_ptr = buf + PKT_CH_SZ + PKT_NONCE_SZ + PKT_MAC_SZ;
   cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, ct_ptr);
   memcpy (buf + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
-  memcpy (buf + PKT_CH_SZ + PKT_NONCE_SZ, mac, 16);
+  memcpy (buf + PKT_CH_SZ + PKT_NONCE_SZ, mac, PKT_MAC_SZ);
   *out_len = PKT_HDR_SZ + pl_len;
   return buf;
 }

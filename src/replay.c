@@ -5,13 +5,14 @@
 #define RX_RP_MAX 512
 #define RX_RP_W 256
 #define RX_RP_B (RX_RP_W * 64)
+#define RX_RP_SID_SZ (PKT_NONCE_SZ - sizeof (uint64_t))
 
 typedef struct
 {
   bool is_act;
   uint8_t ip[16];
   uint16_t port;
-  uint8_t sid[4];
+  uint8_t sid[RX_RP_SID_SZ];
   uint64_t max_cnt;
   uint64_t last_ts;
   uint64_t map[RX_RP_W];
@@ -22,16 +23,19 @@ static RxRp g_rx_rp[RX_RP_MAX];
 static uint64_t
 nonce_cnt_rd (const uint8_t nonce[PKT_NONCE_SZ])
 {
-  return ((uint64_t)nonce[4] << 56) | ((uint64_t)nonce[5] << 48)
-         | ((uint64_t)nonce[6] << 40) | ((uint64_t)nonce[7] << 32)
-         | ((uint64_t)nonce[8] << 24) | ((uint64_t)nonce[9] << 16)
-         | ((uint64_t)nonce[10] << 8) | (uint64_t)nonce[11];
+  size_t off = PKT_NONCE_SZ - sizeof (uint64_t);
+  return ((uint64_t)nonce[off] << 56) | ((uint64_t)nonce[off + 1] << 48)
+         | ((uint64_t)nonce[off + 2] << 40)
+         | ((uint64_t)nonce[off + 3] << 32)
+         | ((uint64_t)nonce[off + 4] << 24)
+         | ((uint64_t)nonce[off + 5] << 16)
+         | ((uint64_t)nonce[off + 6] << 8) | (uint64_t)nonce[off + 7];
 }
 
 static void
-nonce_sid_rd (const uint8_t nonce[PKT_NONCE_SZ], uint8_t sid[4])
+nonce_sid_rd (const uint8_t nonce[PKT_NONCE_SZ], uint8_t sid[RX_RP_SID_SZ])
 {
-  memcpy (sid, nonce, 4);
+  memcpy (sid, nonce, RX_RP_SID_SZ);
 }
 
 static void
@@ -66,7 +70,7 @@ rx_rp_map_set (uint64_t map[RX_RP_W], uint64_t cnt)
 
 static void
 rx_rp_slot_init (RxRp *slot, const uint8_t ip[16], uint16_t port,
-                 const uint8_t sid[4], uint64_t cnt, uint64_t now)
+                 const uint8_t sid[RX_RP_SID_SZ], uint64_t cnt, uint64_t now)
 {
   if (!slot)
     return;
@@ -84,7 +88,7 @@ bool
 rx_rp_chk (const uint8_t ip[16], uint16_t port,
            const uint8_t nonce[PKT_NONCE_SZ])
 {
-  uint8_t sid[4];
+  uint8_t sid[RX_RP_SID_SZ];
   nonce_sid_rd (nonce, sid);
   uint64_t cnt = nonce_cnt_rd (nonce);
   uint64_t now = sys_ts ();
