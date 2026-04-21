@@ -2810,13 +2810,14 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                 uint16_t probe_mtu = 0;
                 if (gsp_prs_mtu_prb (pt, pt_len, &probe_id, &probe_mtu) != 0)
                   break;
-                static uint8_t ack_buf[UDP_PL_MAX];
-                size_t ack_len = 0;
-                mtu_ack_bld (cry_ctx, probe_id, probe_mtu, ack_buf, &ack_len);
-                udp_tx (udp, src_ip, src_port, ack_buf, ack_len);
-                rt_tx_ack (rt, src_ip, src_port, ts);
-                break;
-              }
+	                static uint8_t ack_buf[UDP_PL_MAX];
+	                size_t ack_len = 0;
+	                mtu_ack_bld (cry_ctx, probe_id, probe_mtu, ack_buf, &ack_len);
+	                for (uint32_t ack = 0; ack < RT_PRB_BST; ack++)
+	                  udp_tx (udp, src_ip, src_port, ack_buf, ack_len);
+	                rt_tx_ack (rt, src_ip, src_port, ts);
+	                break;
+	              }
             case PT_MTU_ACK:
               {
                 uint32_t probe_id = 0;
@@ -3169,6 +3170,9 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (!re->is_act || re->state != RT_ACT)
         continue;
       uint64_t prb_intv = KA_TMO;
+      if (re->r2d == 0 && re->pnd_ts > 0 && ts > re->pnd_ts
+          && (ts - re->pnd_ts) < KA_TMO)
+        prb_intv = um_prb_intv (ts - re->pnd_ts);
       if (re->prb_ts > 0 && ts > re->prb_ts && (ts - re->prb_ts) < prb_intv)
         continue;
       pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);

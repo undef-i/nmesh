@@ -619,6 +619,8 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         }
       bool is_adv_rch = (adv_m > 0 && adv_m < RT_M_INF);
       bool is_s_alive = ((RtSt)gsp_ent.state != RT_DED);
+      if (memcmp (gsp_ent.lla, our_lla, 16) == 0)
+        continue;
       bool loc_req_seq = false;
       bool feasible
           = rt_fsb (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, &loc_req_seq);

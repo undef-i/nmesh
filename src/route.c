@@ -26,8 +26,6 @@
 #define RT_MTU_VFY 10000ULL
 #define RT_MTU_HLD 600000ULL
 #define RT_MTU_EPS 10U
-#define RT_PRB_BST 3U
-
 static bool
 seq_gt (uint32_t a, uint32_t b)
 {
@@ -64,7 +62,7 @@ static uint16_t
 re_mtu_ub (const Rt *t, const Re *re)
 {
   uint16_t upper = rt_mtu_ub (t);
-  if (t && !t->mtu_probe && re && re->r2d == 0 && !is_z16 (re->ep_ip)
+  if (t && re && re->r2d == 0 && !is_z16 (re->ep_ip)
       && re->ep_port != 0)
     {
       uint16_t ep_mtu = udp_ep_mtu_get (re->ep_ip);
@@ -81,7 +79,7 @@ re_mtu_boot (const Rt *t, const Re *re)
     return RT_MTU_DEF;
   if (re->r2d != 0)
     return RT_MTU_DEF;
-  return (t && t->mtu_probe) ? RT_MTU_MIN : re_mtu_ub (t, re);
+  return (t && t->mtu_probe) ? RT_MTU_DEF : re_mtu_ub (t, re);
 }
 
 static uint16_t
@@ -109,6 +107,23 @@ re_mtu_cur (const Rt *t, const Re *re)
   if (re->mtu_lkg > 0)
     return re->mtu_lkg;
   return re_mtu_boot (t, re);
+}
+
+static bool
+re_mtu_is_searching (const Re *re)
+{
+  if (!re)
+    return false;
+  return re->mtu_ukb > (uint16_t)(re->mtu_lkg + RT_MTU_EPS);
+}
+
+static void
+re_mtu_search_kick (Re *re)
+{
+  if (!re_mtu_is_searching (re))
+    return;
+  re->prb_i_ts = 0;
+  re->prb_tx_ts = 0;
 }
 
 
@@ -296,6 +311,19 @@ static bool
 dir_cost_ok (int64_t m)
 {
   return m != INT64_MAX;
+}
+
+static void
+re_dir_cost_apply (Re *re, int64_t dir_cost)
+{
+  if (!re || dir_cost == INT64_MAX)
+    return;
+  if (!dir_cost_ok (re->dir_cost) || dir_cost <= re->dir_cost)
+    {
+      re->dir_cost = dir_cost;
+      return;
+    }
+  re->dir_cost = (re->dir_cost * 7LL + dir_cost) / 8LL;
 }
 
 static uint32_t
@@ -526,6 +554,7 @@ re_to_pth (const Re *re, Pth *pth)
   pth->mtu_lkg = re->mtu_lkg;
   pth->mtu_ukb = re->mtu_ukb;
   pth->mtu_st = re->mtu_st;
+  pth->mtu_ukb_soft = re->mtu_ukb_soft;
   pth->prb_i_ts = re->prb_i_ts;
   pth->prb_mtu = re->prb_mtu;
   pth->prb_id = re->prb_id;
@@ -843,10 +872,11 @@ rt_mtu_probe_set (Rt *t, bool is_on)
       uint16_t old_mtu = re->mtu;
       if (is_on)
         {
-          re->mtu = RT_MTU_MIN;
-          re->mtu_lkg = RT_MTU_MIN;
+          re->mtu = RT_MTU_DEF;
+          re->mtu_lkg = RT_MTU_DEF;
           re->mtu_ukb = re_mtu_ub (t, re);
           re->mtu_st = MTU_ST_B;
+          re->mtu_ukb_soft = false;
           re->prb_i_ts = 0;
           re->prb_mtu = 0;
           re->prb_id = 0;
@@ -1006,7 +1036,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
             ne.mtu = re_mtu_ub (t, &ne);
           else
             ne.mtu = (ne.mtu_lkg > 0) ? ne.mtu_lkg
-                                      : ((ne.r2d == 0) ? RT_MTU_MIN
+                                      : ((ne.r2d == 0) ? RT_MTU_DEF
                                                        : RT_MTU_DEF);
         }
       if (ne.mtu < RT_MTU_MIN)
@@ -1017,6 +1047,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         ne.mtu_ukb = (!t->mtu_probe && ne.r2d == 0) ? ne.mtu : rt_mtu_ub (t);
       ne.prb_i_ts = 0;
       ne.mtu_st = MTU_ST_B;
+      ne.mtu_ukb_soft = false;
       re_mtu_sync (t, &ne);
       if (ne.state == 0 && !ne.is_act)
         ne.state = RT_PND;
@@ -1074,6 +1105,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   out->mtu_lkg = selected->mtu_lkg;
   out->mtu_ukb = selected->mtu_ukb;
   out->mtu_st = selected->mtu_st;
+  out->mtu_ukb_soft = selected->mtu_ukb_soft;
   out->prb_i_ts = selected->prb_i_ts;
   out->prb_mtu = selected->prb_mtu;
   out->prb_id = selected->prb_id;
@@ -1158,7 +1190,7 @@ rt_dir_cost_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
         }
       else
         {
-          re->dir_cost = (re->dir_cost * 7LL + dir_cost) / 8LL;
+          re_dir_cost_apply (re, dir_cost);
         }
       rt_map_mark (t);
       return;
@@ -1197,16 +1229,7 @@ rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
         }
       re->rt_m = re->sm_m;
       if (dir_cost != INT64_MAX)
-        {
-          if (!dir_cost_ok (re->dir_cost))
-            {
-              re->dir_cost = dir_cost;
-            }
-          else
-            {
-              re->dir_cost = (re->dir_cost * 7LL + dir_cost) / 8LL;
-            }
-        }
+        re_dir_cost_apply (re, dir_cost);
       rt_map_mark (t);
       return true;
     }
@@ -1284,6 +1307,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
           memcpy (t->re_arr[i].lla, lla, 16);
           t->re_arr[i].is_act = true;
           t->re_arr[i].state = RT_ACT;
+          t->re_arr[i].pnd_ts = sys_ts;
         }
       re_rx_ack (&t->re_arr[i], sys_ts);
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
@@ -1294,7 +1318,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
           else
             t->re_arr[i].mtu = (t->re_arr[i].mtu_lkg > 0)
                                    ? t->re_arr[i].mtu_lkg
-                                   : RT_MTU_MIN;
+                                   : RT_MTU_DEF;
         }
       if (t->re_arr[i].mtu < RT_MTU_MIN)
         t->re_arr[i].mtu = RT_MTU_MIN;
@@ -1322,6 +1346,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       memcpy (re->lla, lla, 16);
       re->is_act = true;
       re->state = RT_ACT;
+      re->pnd_ts = sys_ts;
       re_rx_ack (re, sys_ts);
       memcpy (re->nhop_lla, lla, 16);
       if (re->mtu == 0)
@@ -1329,7 +1354,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
           if (!t->mtu_probe && re->r2d == 0)
             re->mtu = re_mtu_ub (t, re);
           else
-            re->mtu = (re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_MIN;
+            re->mtu = (re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_DEF;
         }
       if (re->mtu < RT_MTU_MIN)
         re->mtu = RT_MTU_MIN;
@@ -1357,6 +1382,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.r2d = 0;
       ne.is_act = true;
       ne.state = RT_ACT;
+      ne.pnd_ts = sys_ts;
       ne.pong_ts = sys_ts;
       ne.rx_ts = sys_ts;
       ne.rx_base = sys_ts;
@@ -1370,6 +1396,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.mtu_lkg = ne.mtu;
       ne.mtu_ukb = (!t->mtu_probe) ? ne.mtu : rt_mtu_ub (t);
       ne.mtu_st = MTU_ST_B;
+      ne.mtu_ukb_soft = false;
       ne.prb_i_ts = 0;
       re_mtu_sync (t, &ne);
       memcpy (ne.nhop_lla, lla, 16);
@@ -1576,7 +1603,7 @@ rt_mtu (const Rt *t, const RtDec *sel)
             continue;
           return re_mtu_cur (t, re);
         }
-      return t->mtu_probe ? RT_MTU_MIN : RT_MTU_DEF;
+      return t->mtu_probe ? RT_MTU_DEF : RT_MTU_DEF;
     }
   if (sel->type == RT_REL)
     {
@@ -1644,6 +1671,7 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
           if (re->mtu_ukb < re->mtu_lkg)
             re->mtu_ukb = re->mtu_lkg;
           re->mtu_st = MTU_ST_S;
+          re->mtu_ukb_soft = false;
           re->hld_ts = 0;
           re->vfy_ts = 0;
         }
@@ -1651,40 +1679,52 @@ rt_mtu_tk (Rt *t, uint64_t sys_ts)
         continue;
       if (sys_ts < re->prb_ddl)
         continue;
-      if (re->prb_tx >= 2)
+      if (re->prb_tx >= RT_PRB_BST)
         {
+          bool kick_search = false;
           uint16_t fail_mtu = re->prb_mtu;
           if (fail_mtu > re->mtu_lkg && fail_mtu > RT_MTU_MIN
                    && (uint16_t)(fail_mtu - 1U) < re->mtu_ukb)
             {
-              re->mtu_ukb = (uint16_t)(fail_mtu - 1U);
-              if (re->mtu_ukb < re->mtu_lkg)
-                re->mtu_ukb = re->mtu_lkg;
-              if (re->mtu > re->mtu_lkg)
-                re->mtu = re->mtu_lkg;
-              re->vfy_ts = 0;
+              if (re->mtu_ukb_soft)
+                {
+                  re->mtu_ukb = (uint16_t)(fail_mtu - 1U);
+                  if (re->mtu_ukb < re->mtu_lkg)
+                    re->mtu_ukb = re->mtu_lkg;
+                  if (re->mtu > re->mtu_lkg)
+                    re->mtu = re->mtu_lkg;
+                  re->vfy_ts = 0;
+                }
+              else
+                {
+                  kick_search = true;
+                }
               re->mtu_st = MTU_ST_S;
+              re->mtu_ukb_soft = true;
             }
           else
             {
+              re->mtu_ukb_soft = false;
               re->mtu_st
                   = (re->mtu_ukb <= (uint16_t)(re->mtu_lkg + RT_MTU_EPS))
                         ? MTU_ST_F
                         : MTU_ST_S;
             }
+          re->prb_mtu = 0;
+          re->prb_id = 0;
+          re->prb_tx = 0;
+          re->prb_ddl = 0;
+          re_mtu_sync (t, re);
+          if (kick_search)
+            re_mtu_search_kick (re);
+          continue;
         }
       else
         {
-          re->prb_tx++;
-          re->prb_tx_ts = sys_ts;
+          re->prb_tx_ts = 0;
           re->prb_ddl = sys_ts + RT_PRB_TMO;
           continue;
         }
-      re->prb_mtu = 0;
-      re->prb_id = 0;
-      re->prb_tx = 0;
-      re->prb_ddl = 0;
-      re_mtu_sync (t, re);
     }
 }
 
@@ -1738,8 +1778,11 @@ rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
         {
           if (sys_ts < re->prb_tx_ts + 1000ULL)
             continue;
+          if (re->prb_tx >= RT_PRB_BST)
+            continue;
           re->prb_tx++;
           re->prb_tx_ts = sys_ts;
+          re->prb_ddl = sys_ts + RT_PRB_TMO;
           *out_re = *re;
           *prb_mtu = re->prb_mtu;
           *prb_id = re->prb_id;
@@ -1754,7 +1797,8 @@ rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
             re->vfy_ts = sys_ts;
           if (sys_ts >= re->vfy_ts && (sys_ts - re->vfy_ts) >= RT_MTU_VFY)
             {
-              re->hld_ts = sys_ts + RT_MTU_HLD;
+              re->hld_ts
+                  = sys_ts + (re->mtu_ukb_soft ? RT_PRB_INTV : RT_MTU_HLD);
               re->vfy_ts = 0;
               re->mtu_st = MTU_ST_F;
               continue;
@@ -1828,6 +1872,7 @@ rt_pmtu_ack_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint32_t probe_id,
       re->prb_tx = 0;
       re->prb_ddl = 0;
       re->ack_ts = sys_ts;
+      re->mtu_ukb_soft = false;
       if (re->mtu_ukb <= (uint16_t)(re->mtu_lkg + RT_MTU_EPS))
         {
           if (re->vfy_ts == 0)
@@ -1841,6 +1886,7 @@ rt_pmtu_ack_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint32_t probe_id,
           re->mtu_st = MTU_ST_S;
         }
       re_mtu_sync (t, re);
+      re_mtu_search_kick (re);
       if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) != 0
           && re->mtu != old_mtu)
         {
@@ -1883,9 +1929,11 @@ rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
       re->prb_tx = 0;
       re->prb_ddl = 0;
       re->ack_ts = sys_ts;
+      re->mtu_ukb_soft = false;
       re->vfy_ts = 0;
       re->hld_ts = 0;
       re_mtu_sync (t, re);
+      re_mtu_search_kick (re);
       if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) != 0
           && re->mtu != old_mtu)
         {
@@ -1943,9 +1991,11 @@ rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port, size_t atmpt_plen,
       re->prb_ddl = 0;
       re->prb_i_ts = sys_ts;
       re->prb_tx_ts = sys_ts;
+      re->mtu_ukb_soft = false;
       re->vfy_ts = 0;
       re->hld_ts = 0;
       re_mtu_sync (t, re);
+      re_mtu_search_kick (re);
       if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) != 0
           && re->mtu != old_mtu)
         {
@@ -2033,8 +2083,7 @@ rt_pmtu_st (const Rt *t, const RtDec *sel, uint16_t *out_path_mtu,
       return false;
     }
   uint16_t mtu = re_mtu_cur (t, match);
-  bool is_srch = (match->prb_mtu != 0)
-                 || (match->mtu_ukb > (uint16_t)(match->mtu_lkg + RT_MTU_EPS));
+  bool is_srch = match->mtu_ukb > (uint16_t)(match->mtu_lkg + RT_MTU_EPS);
   bool is_fix = !is_srch;
   if (out_path_mtu)
     *out_path_mtu = mtu;
