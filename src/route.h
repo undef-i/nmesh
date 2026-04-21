@@ -13,6 +13,7 @@
 #define RT_MTU_MIN 128U
 #define RT_MTU_DEF 1280U
 #define RT_MTU_MAX 65535U
+#define RT_PRB_BST 3U
 
 typedef enum
 {
@@ -60,6 +61,7 @@ typedef struct
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
   MtuSt mtu_st;
+  bool mtu_ukb_soft;
   uint64_t prb_i_ts;
   uint16_t prb_mtu;
   uint32_t prb_id;
@@ -105,6 +107,7 @@ typedef struct Pth
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
   MtuSt mtu_st;
+  bool mtu_ukb_soft;
   uint64_t prb_i_ts;
   uint16_t prb_mtu;
   uint32_t prb_id;
