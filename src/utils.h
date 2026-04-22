@@ -44,6 +44,14 @@ uint32_t u32_rnd (void);
 bool rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], uint8_t out_ip[16],
                 uint16_t *out_port);
 
+static inline uint64_t
+re_probe_age_ms (const Re *re, uint64_t now)
+{
+  if (!re || re->rx_ts == 0 || now <= re->rx_ts)
+    return 0;
+  return now - re->rx_ts;
+}
+
 static inline uint32_t
 re_m (const Re *re)
 {
