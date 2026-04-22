@@ -275,6 +275,7 @@ cfg_load (const char *path, Cfg *cfg)
   cfg->mtu = 1280;
   cfg->mtu_probe = false;
   cfg->p2p = P2P_EN;
+  cfg->tap_mode = TAP_MODE_AUTO;
   strcpy (cfg->ifname, "nmesh");
   FILE *fp = fopen (path, "r");
   if (!fp)
@@ -299,7 +300,7 @@ cfg_load (const char *path, Cfg *cfg)
               return -1;
             }
         }
-      else if (strcmp (k, "listen") == 0 || strcmp (k, "port") == 0)
+      else if (strcmp (k, "port") == 0)
         {
           cfg->port = (uint16_t)strtoul (v, NULL, 10);
           cfg->l_exp = true;
@@ -317,6 +318,20 @@ cfg_load (const char *path, Cfg *cfg)
       else if (strcmp (k, "p2p") == 0)
         {
           cfg->p2p = (strcmp (v, "enable") == 0) ? P2P_EN : P2P_DIS;
+        }
+      else if (strcmp (k, "tap_mode") == 0)
+        {
+          if (strcmp (v, "auto") == 0)
+            cfg->tap_mode = TAP_MODE_AUTO;
+          else if (strcmp (v, "inline") == 0)
+            cfg->tap_mode = TAP_MODE_INLINE;
+          else if (strcmp (v, "pipe") == 0)
+            cfg->tap_mode = TAP_MODE_PIPE;
+          else
+            {
+              fclose (fp);
+              return -1;
+            }
         }
       else if (strcmp (k, "mtu_probe") == 0)
         {

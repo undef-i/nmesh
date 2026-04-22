@@ -11,6 +11,13 @@ typedef enum
   P2P_DIS
 } P2pMode;
 
+typedef enum
+{
+  TAP_MODE_AUTO = 0,
+  TAP_MODE_INLINE,
+  TAP_MODE_PIPE
+} TapMode;
+
 typedef struct
 {
   uint8_t ip[16];
@@ -29,6 +36,7 @@ typedef struct
   size_t bogon_cnt;
   BogonRule bogon_arr[BOGON_RULE_MAX];
   P2pMode p2p;
+  TapMode tap_mode;
   uint8_t psk[32];
 } Cfg;
 

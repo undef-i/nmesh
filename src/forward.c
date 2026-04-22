@@ -68,7 +68,7 @@ rt_nh_get (Rt *rt, const Cfg *cfg, const uint8_t dest_lla[16], RtDec *out_dec,
     {
       uint8_t gw_ip[16] = { 0 };
       uint16_t gw_port = 0;
-      if (!rt_gw_fnd (rt, cfg->addr, gw_ip, &gw_port))
+      if (!rt_gw_fnd (rt, cfg->addr, cfg->p2p != P2P_EN, gw_ip, &gw_port))
         return false;
       memcpy (out_ip, gw_ip, 16);
       *out_port = gw_port;

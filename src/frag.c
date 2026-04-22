@@ -1,4 +1,5 @@
 #include "frag.h"
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -11,6 +12,30 @@ sys_ts (void)
   struct timespec ts;
   clock_gettime (CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static bool
+frag_bkt_bufs_ensure (FBktData *d)
+{
+  if (!d)
+    return false;
+  if (!d->buf)
+    {
+      d->buf = malloc (65535U);
+      if (!d->buf)
+        return false;
+    }
+  if (!d->rx_bmp)
+    {
+      d->rx_bmp = malloc ((65535U / 8U) + 1U);
+      if (!d->rx_bmp)
+        {
+          free (d->buf);
+          d->buf = NULL;
+          return false;
+        }
+    }
+  return true;
 }
 
 static int
@@ -56,9 +81,11 @@ frag_bkt_new (const uint8_t src_lla[16], uint32_t msg_id)
     {
       FBktMeta *m = &g_frag_meta[oldest_idx];
       FBktData *d = &g_frag_data[oldest_idx];
+      if (!frag_bkt_bufs_ensure (d))
+        return -1;
 
       memset (m, 0, sizeof (*m));
-      memset (d->rx_bmp, 0, sizeof (d->rx_bmp));
+      memset (d->rx_bmp, 0, (65535U / 8U) + 1U);
 
       memcpy (m->src_lla, src_lla, 16);
       m->msg_id = msg_id;
@@ -84,6 +111,8 @@ frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off, bool mf,
 
   FBktMeta *m = &g_frag_meta[idx];
   FBktData *d = &g_frag_data[idx];
+  if (!d->buf || !d->rx_bmp)
+    return NULL;
   uint16_t end = (uint16_t)((size_t)off + data_len);
 
   if (!mf)
