@@ -41,8 +41,8 @@ extern Rt *g_rt;
 
 uint64_t sys_ts (void);
 uint32_t u32_rnd (void);
-bool rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], uint8_t out_ip[16],
-                uint16_t *out_port);
+bool rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
+                uint8_t out_ip[16], uint16_t *out_port);
 
 static inline uint64_t
 re_probe_age_ms (const Re *re, uint64_t now)
@@ -55,8 +55,6 @@ re_probe_age_ms (const Re *re, uint64_t now)
 static inline uint32_t
 re_m (const Re *re)
 {
-  if (re->lat > 0 && re->lat < RTT_UNK)
-    return re->lat;
   if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK)
     return re->sm_m;
   if (re->rt_m > 0 && re->rt_m < RT_M_INF && re->rt_m != RTT_UNK)

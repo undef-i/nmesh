@@ -14,16 +14,42 @@ make
 Create `nmesh.conf`:
 
 ```ini
-ifname = nmesh
+# Required: overlay IPv6 address (must be in fe80::/96).
 address = fe80::1
-listen = 50000
-mtu = 1280
-mtu_probe = disable
+
+# Required: pre-shared key (32-byte raw string or 64-hex).
 psk = your_psk
+
+# Optional: TAP interface name (default: nmesh).
+ifname = nmesh
+
+# Optional: listen port (default: 50000).
+port = 50000
+
+# Optional: overlay MTU (default: 1280, valid range: 128..65535).
+mtu = 1280
+
+# Optional: PMTU probing (default: disable).
+mtu_probe = disable
+
+# Optional: P2P behavior (default: enable).
+p2p = enable
+
+# Optional: tap data path mode (default: auto).
+# auto: single CPU -> inline, otherwise -> pipe
+# inline: TAP handled in main event loop thread
+# pipe: TAP handled by tap pipeline worker threads
+tap_mode = auto
+
+# Optional and repeatable: static bootstrap peers.
 peer = 203.0.113.1:50000
+# peer = [2001:db8::1]:50000
+
+# Optional and repeatable: bogon filter rules.
+# bogon = 10.0.0.0/8
+# bogon = fc00::/7
 
 ```
-`address` must be in the `fe80::/96` prefix.
 
 ## Run
 
@@ -34,12 +60,11 @@ sudo ./build/release/nmesh -c nmesh.conf
 
 ## Performance
 
-Local baseline on commit `10f93764a0cf157692e4dc526bf261762b1e9de1`:
-
-| Metric | Result |
-| --- | --- |
-| UDP | 4.58 Gbits/sec, 4.7% loss |
-| TCP | 7.93 Gbits/sec, 0 retransmits |
+|  | UDP (Gbps) | TCP (Gbps) |
+| --- | --- | --- |
+| nmesh | 3.263 | 8.517 |
+| nebula 1.10.3 | 1.543 | 1.263 |
+| wireguard-go v0.0.20250522 | 0.880 | 6.533 |
 
 Local environment:
 
@@ -48,9 +73,6 @@ Local environment:
 
 These numbers are a point-in-time local reference, not a portability claim.
 
-## Known Issues
-
-- Fails if underlying MTU is below 128 bytes.
 
 ## Planned Features
 

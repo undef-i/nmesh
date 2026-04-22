@@ -14,6 +14,15 @@
 #define RT_MTU_DEF 1280U
 #define RT_MTU_MAX 65535U
 #define RT_PRB_BST 3U
+#define RT_HL_INTV 10000ULL
+#define RT_GHS_HL 30ULL
+#define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
+#define RT_PRB_INTV 5000ULL
+#define RT_METRIC_WIN_BINS (RT_GHS_TS / RT_PRB_INTV)
+
+#if (RT_GHS_TS % RT_PRB_INTV) != 0
+#error "RT_GHS_TS must be divisible by RT_PRB_INTV for window bins"
+#endif
 
 typedef enum
 {
@@ -54,12 +63,16 @@ typedef struct
   uint32_t rttvar;
   uint32_t rto;
   uint32_t sm_m;
-  uint32_t lat;
   int64_t dir_cost;
+  uint64_t rtt_win_id[RT_METRIC_WIN_BINS];
+  uint32_t rtt_win_min[RT_METRIC_WIN_BINS];
+  uint64_t dir_win_id[RT_METRIC_WIN_BINS];
+  int64_t dir_win_min[RT_METRIC_WIN_BINS];
   uint32_t r2d;
   uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
+  uint16_t peer_rev_mtu;
   MtuSt mtu_st;
   bool mtu_ukb_soft;
   uint64_t prb_i_ts;
@@ -100,12 +113,12 @@ typedef struct Pth
   uint32_t rttvar;
   uint32_t rto;
   uint32_t sm_m;
-  uint32_t lat;
   int64_t dir_cost;
   uint32_t r2d;
   uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
+  uint16_t peer_rev_mtu;
   MtuSt mtu_st;
   bool mtu_ukb_soft;
   uint64_t prb_i_ts;
@@ -145,6 +158,7 @@ typedef struct
   uint32_t fwd_seq;
   uint32_t fwd_m;
   uint64_t last_ver;
+  bool no_dir;
   uint64_t gc_ts;
 } SrcEnt;
 
@@ -182,12 +196,18 @@ typedef struct Rt
   uint64_t sync_rev;
   uint64_t gsp_last_ts;
   uint64_t gsp_tx_cnt;
+  uint64_t gsp_dt_tx_cnt;
   uint64_t ping_tx_cnt;
+  uint64_t pong_tx_cnt;
+  uint64_t hp_tx_cnt;
+  uint64_t seqreq_tx_cnt;
   uint64_t ctrl_tx_b;
   uint64_t ctrl_rx_b;
   uint64_t ctrl_last_ts;
-  uint64_t ctrl_last_b;
-  uint64_t ctrl_now_bps;
+  uint64_t ctrl_last_tx_b;
+  uint64_t ctrl_last_rx_b;
+  uint64_t ctrl_now_tx_bps;
+  uint64_t ctrl_now_rx_bps;
   Pth *pth_pool;
   RtMap *rtm_pool;
 } Rt;
@@ -226,10 +246,11 @@ void rt_free (Rt *t);
 int rt_cpy (Rt *dst, const Rt *src);
 void rt_upd (Rt *t, const Re *re, uint64_t sys_ts);
 bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
+bool rt_dir_is_sel (Rt *t, const Re *re);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
                  uint16_t port, uint32_t rtt_ms, uint64_t sys_ts);
 void rt_dir_cost_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
-                      uint16_t port, int64_t dir_cost);
+                      uint16_t port, int64_t dir_cost, uint64_t sys_ts);
 bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
                          uint32_t rtt_ms, int64_t dir_cost, uint64_t sys_ts);
 void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
@@ -249,6 +270,8 @@ void rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
                      uint64_t sys_ts);
 void rt_mtu_tk (Rt *t, uint64_t sys_ts);
 void rt_pmtu_ub_set (Rt *t, uint16_t mtu);
+void rt_peer_rev_mtu_set (Rt *t, const uint8_t peer_lla[16],
+                          uint16_t peer_rev_mtu);
 void rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port,
                   size_t atmpt_plen, uint64_t sys_ts);
 void rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
@@ -263,7 +286,9 @@ void rt_src_gc (Rt *t, uint64_t sys_ts);
 bool rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
              uint64_t n_ver, bool *req_seq);
 void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
-                 uint64_t ver, uint64_t sys_ts);
+                 uint64_t ver, bool no_dir, uint64_t sys_ts);
+bool rt_src_no_dir (const Rt *t, const uint8_t rt_id[16]);
+void rt_dir_hint_prune (Rt *t, const uint8_t lla[16]);
 bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
                    uint64_t sys_ts);
 void pp_init (PPool *p, const char *persist_path);

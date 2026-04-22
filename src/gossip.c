@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <string.h>
 #define REL_M_UNK 1200U
-
 static uint64_t
 u64_rd (const uint8_t *s)
 {
@@ -160,6 +159,20 @@ is_ip_bgn (const uint8_t ip[16])
   return bogon_ip_match (ip);
 }
 
+static bool
+gsp_self_ep_exp_ok (const Re *re, const uint8_t our_lla[16])
+{
+  if (!re || !our_lla)
+    return false;
+  if (re->r2d != 0)
+    return false;
+  if (!re->is_act || re->state != RT_ACT)
+    return false;
+  if (memcmp (re->lla, our_lla, 16) != 0)
+    return true;
+  return re->rx_ts != 0;
+}
+
 static void
 hdr_bld (uint8_t pkt_type, uint8_t rel_f, uint8_t hop_c,
          uint8_t hdr[PKT_CH_SZ])
@@ -214,14 +227,20 @@ pong_bld (Cry *s, const uint8_t our_lla[16], uint64_t o_ts, uint64_t sid,
 }
 
 uint8_t *
-gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
-         const uint8_t our_lla[16], uint8_t *buf, size_t *out_len)
+gsp_bld (Cry *s, Rt *rt, int s_off,
+         const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
+         size_t *out_len)
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
-  for (int re_idx = 0; re_idx < rt_cnt && act_cnt < GSP_MAX; re_idx++)
+  if (!rt)
     {
-      const Re *re = &rt_arr[(s_off + re_idx) % rt_cnt];
+      *out_len = 0;
+      return buf;
+    }
+  for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < GSP_MAX; re_idx++)
+    {
+      const Re *re = &rt->re_arr[(s_off + re_idx) % (int)rt->cnt];
       static const uint8_t z[16] = { 0 };
       if (re->r2d != 0)
         continue;
@@ -230,20 +249,27 @@ gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
       bool is_z = (memcmp (re->lla, z, 16) == 0);
       if (!is_z && !IS_LLA_VAL (re->lla))
         continue;
+      if (!gsp_self_ep_exp_ok (re, our_lla))
+        continue;
       GspEnt gsp_ent;
       memcpy (gsp_ent.lla, re->lla, 16);
       memcpy (gsp_ent.ep_ip, re->ep_ip, 16);
       gsp_ent.ep_port = re->ep_port;
-      gsp_ent.flags = 0;
+      bool no_dir = false;
+      if (!is_z && memcmp (re->lla, our_lla, 16) == 0)
+        no_dir = !self_dir_ok;
+      else if (!is_z)
+        no_dir = rt_src_no_dir (rt, re->lla);
+      gsp_ent.flags = (!no_dir && rt_dir_is_sel (rt, re)) ? GSP_F_SEL_DIR : 0;
+      if (no_dir)
+        gsp_ent.flags |= GSP_F_NO_DIR;
       gsp_ent.state = (uint8_t)re->state;
       gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
       if (memcmp (re->lla, our_lla, 16) == 0
           && (gsp_ent.adv_m == 0 || gsp_ent.adv_m >= RT_M_INF))
-        {
-          gsp_ent.adv_m = RT_M_INF;
-        }
+        gsp_ent.adv_m = RT_M_INF;
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
@@ -263,14 +289,20 @@ gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
 }
 
 uint8_t *
-gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt, const uint8_t tgt_lla[16],
-            const uint8_t our_lla[16], uint8_t *buf, size_t *out_len)
+gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
+            const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
+            size_t *out_len)
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
-  for (int re_idx = 0; re_idx < rt_cnt && act_cnt < GSP_MAX; re_idx++)
+  if (!rt)
     {
-      const Re *re = &rt_arr[re_idx];
+      *out_len = 0;
+      return buf;
+    }
+  for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < GSP_MAX; re_idx++)
+    {
+      const Re *re = &rt->re_arr[re_idx];
       static const uint8_t z[16] = { 0 };
       if (memcmp (re->lla, tgt_lla, 16) != 0)
         continue;
@@ -281,20 +313,27 @@ gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt, const uint8_t tgt_lla[16],
       bool is_z = (memcmp (re->lla, z, 16) == 0);
       if (!is_z && !IS_LLA_VAL (re->lla))
         continue;
+      if (!gsp_self_ep_exp_ok (re, our_lla))
+        continue;
       GspEnt gsp_ent;
       memcpy (gsp_ent.lla, re->lla, 16);
       memcpy (gsp_ent.ep_ip, re->ep_ip, 16);
       gsp_ent.ep_port = re->ep_port;
-      gsp_ent.flags = 0;
+      bool no_dir = false;
+      if (!is_z && memcmp (re->lla, our_lla, 16) == 0)
+        no_dir = !self_dir_ok;
+      else if (!is_z)
+        no_dir = rt_src_no_dir (rt, re->lla);
+      gsp_ent.flags = (!no_dir && rt_dir_is_sel (rt, re)) ? GSP_F_SEL_DIR : 0;
+      if (no_dir)
+        gsp_ent.flags |= GSP_F_NO_DIR;
       gsp_ent.state = (uint8_t)re->state;
       gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
       if (memcmp (re->lla, our_lla, 16) == 0
           && (gsp_ent.adv_m == 0 || gsp_ent.adv_m >= RT_M_INF))
-        {
-          gsp_ent.adv_m = RT_M_INF;
-        }
+        gsp_ent.adv_m = RT_M_INF;
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
@@ -563,7 +602,8 @@ on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
 int
 on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         uint16_t src_port, const uint8_t our_lla[16], Rt *rt, PPool *pool,
-        uint64_t sys_ts, bool *is_mod, bool *o_req_seq, uint8_t seq_tgt[16])
+        bool allow_dir_hint, uint64_t sys_ts, bool *is_mod, bool *o_req_seq,
+        uint8_t seq_tgt[16])
 {
   if (!pt || pt_len < 2)
     return -1;
@@ -577,6 +617,9 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
   uint8_t src_lla[16] = { 0 };
   bool has_s_lla = lla_inf_s (rt, src_ip, src_port, src_lla);
   uint16_t mtu_s = mtu_inf_s (rt, src_ip, src_port);
+  bool saw_self_adv = false;
+  bool saw_self_sel_dir = false;
+  uint16_t self_sel_dir_mtu = 0;
   for (size_t gsp_idx = 0; gsp_idx < act_cnt; gsp_idx++)
     {
       size_t rd_off = 2 + gsp_idx * GSP_SZ;
@@ -586,11 +629,11 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       bool is_z = (memcmp (gsp_ent.lla, z_lla, 16) == 0);
       if (!is_z && !IS_LLA_VAL (gsp_ent.lla))
         continue;
-      if (!is_z && memcmp (gsp_ent.lla, our_lla, 16) == 0)
-        continue;
       if (is_z)
         {
-          if (!is_ip_bgn (gsp_ent.ep_ip)
+          if (is_ip_bgn (gsp_ent.ep_ip))
+            continue;
+          if (allow_dir_hint
               && !p_is_me (rt, our_lla, gsp_ent.ep_ip, gsp_ent.ep_port))
             {
               rt_ep_upd (rt, z_lla, gsp_ent.ep_ip, gsp_ent.ep_port, sys_ts);
@@ -604,7 +647,18 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       uint32_t n_seq = gsp_ent.seq;
       uint32_t adv_m = gsp_ent.adv_m;
       uint16_t gsp_mtu = gsp_ent.mtu;
+      bool no_dir = (gsp_ent.flags & GSP_F_NO_DIR) != 0;
       uint16_t rel_mtu = 0;
+      if (memcmp (gsp_ent.lla, our_lla, 16) == 0)
+        {
+          saw_self_adv = true;
+          if ((gsp_ent.flags & GSP_F_SEL_DIR) != 0 && gsp_mtu >= RT_MTU_MIN)
+            {
+              saw_self_sel_dir = true;
+              self_sel_dir_mtu = gsp_mtu;
+            }
+          continue;
+        }
       if (mtu_s > 0 && gsp_mtu > 0)
         {
           rel_mtu = (mtu_s < gsp_mtu) ? mtu_s : gsp_mtu;
@@ -619,8 +673,9 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         }
       bool is_adv_rch = (adv_m > 0 && adv_m < RT_M_INF);
       bool is_s_alive = ((RtSt)gsp_ent.state != RT_DED);
-      if (memcmp (gsp_ent.lla, our_lla, 16) == 0)
-        continue;
+      bool has_dir_hint
+          = !IS_LLA_VAL (gsp_ent.nhop_lla)
+            || memcmp (gsp_ent.nhop_lla, gsp_ent.lla, 16) == 0;
       bool loc_req_seq = false;
       bool feasible
           = rt_fsb (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, &loc_req_seq);
@@ -648,10 +703,13 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
 
       if (feasible || is_new_poison)
         {
-          rt_src_upd (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, sys_ts);
+          rt_src_upd (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, no_dir,
+                      sys_ts);
         }
       bool is_s_self = (memcmp (gsp_ent.ep_ip, src_ip, 16) == 0
                         && gsp_ent.ep_port == src_port);
+      if (no_dir && !is_s_self)
+        rt_dir_hint_prune (rt, gsp_ent.lla);
       if (!is_s_self)
         {
           Re rel_re;
@@ -662,9 +720,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rel_re.ver = gsp_ent.ver;
           rel_re.seq = n_seq;
           rel_re.adv_m = adv_m;
-          rel_re.r2d
-              = is_adv_rch ? adv_m : (is_s_alive ? REL_M_UNK : RT_M_INF);
-          rel_re.lat = RTT_UNK;
+          rel_re.r2d = is_adv_rch ? adv_m : (is_s_alive ? REL_M_UNK : RT_M_INF);
           rel_re.dir_cost = INT64_MAX;
           rel_re.rt_m = rel_re.r2d;
           if (rel_mtu > 0)
@@ -680,37 +736,49 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             memcpy (rel_re.nhop_lla, src_lla, 16);
           rt_upd (rt, &rel_re, sys_ts);
         }
-      {
-        Re dir_re;
-        memset (&dir_re, 0, sizeof (dir_re));
-        memcpy (dir_re.lla, gsp_ent.lla, 16);
-        memcpy (dir_re.ep_ip, gsp_ent.ep_ip, 16);
-        dir_re.ep_port = gsp_ent.ep_port;
-        dir_re.ver = gsp_ent.ver;
-        dir_re.seq = n_seq;
-        dir_re.adv_m = adv_m;
-        dir_re.r2d = 0;
-        dir_re.lat = RTT_UNK;
-        dir_re.dir_cost = INT64_MAX;
-        dir_re.rt_m = RT_M_INF;
-        dir_re.sm_m = RT_M_INF;
-        if (gsp_mtu > 0)
-          {
-            dir_re.mtu = gsp_mtu;
-            dir_re.mtu_lkg = gsp_mtu;
-            dir_re.mtu_ukb = gsp_mtu;
-          }
-        dir_re.state = ((RtSt)gsp_ent.state == RT_DED) ? RT_DED : RT_PND;
-        dir_re.is_act = false;
-        dir_re.rto = RTO_INIT;
-        memcpy (dir_re.nhop_lla, gsp_ent.nhop_lla, 16);
-        rt_upd (rt, &dir_re, sys_ts);
-        if (pool && !is_ip_bgn (gsp_ent.ep_ip)
-            && !p_is_me (rt, our_lla, gsp_ent.ep_ip, gsp_ent.ep_port))
-          {
-            pp_add (pool, gsp_ent.ep_ip, gsp_ent.ep_port);
-          }
-      }
+      bool import_dir_hint
+          = allow_dir_hint && !no_dir && has_dir_hint
+            && (is_s_self || (gsp_ent.flags & GSP_F_SEL_DIR) != 0);
+      if (import_dir_hint)
+        {
+          if (is_ip_bgn (gsp_ent.ep_ip))
+            continue;
+          Re dir_re;
+          memset (&dir_re, 0, sizeof (dir_re));
+          memcpy (dir_re.lla, gsp_ent.lla, 16);
+          memcpy (dir_re.ep_ip, gsp_ent.ep_ip, 16);
+          dir_re.ep_port = gsp_ent.ep_port;
+          dir_re.ver = gsp_ent.ver;
+          dir_re.seq = n_seq;
+          dir_re.adv_m = adv_m;
+          dir_re.r2d = 0;
+          dir_re.dir_cost = INT64_MAX;
+          dir_re.rt_m = RT_M_INF;
+          dir_re.sm_m = RT_M_INF;
+          if (gsp_mtu > 0)
+            {
+              dir_re.mtu = gsp_mtu;
+              dir_re.mtu_lkg = gsp_mtu;
+              dir_re.mtu_ukb = gsp_mtu;
+            }
+          dir_re.state = ((RtSt)gsp_ent.state == RT_DED) ? RT_DED : RT_PND;
+          dir_re.is_act = false;
+          dir_re.rto = RTO_INIT;
+          if (IS_LLA_VAL (gsp_ent.nhop_lla))
+            memcpy (dir_re.nhop_lla, gsp_ent.nhop_lla, 16);
+          else
+            memcpy (dir_re.nhop_lla, gsp_ent.lla, 16);
+          rt_upd (rt, &dir_re, sys_ts);
+          if (pool
+              && !p_is_me (rt, our_lla, gsp_ent.ep_ip, gsp_ent.ep_port))
+            {
+              pp_add (pool, gsp_ent.ep_ip, gsp_ent.ep_port);
+            }
+        }
+    }
+  if (has_s_lla && saw_self_adv)
+    {
+      rt_peer_rev_mtu_set (rt, src_lla, saw_self_sel_dir ? self_sel_dir_mtu : 0);
     }
   if (rt->cnt != rt_c_old || rt->gsp_dirty)
     *is_mod = true;

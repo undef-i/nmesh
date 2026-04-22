@@ -35,8 +35,8 @@ u32_rnd (void)
 }
 
 bool
-rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], uint8_t out_ip[16],
-           uint16_t *out_port)
+rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
+           uint8_t out_ip[16], uint16_t *out_port)
 {
   bool has_res = false;
   uint32_t best = RT_M_INF;
@@ -46,6 +46,8 @@ rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], uint8_t out_ip[16],
       if (!re->is_act || re->state == RT_DED)
         continue;
       if (re->r2d != 0)
+        continue;
+      if (static_only && !re->is_static)
         continue;
       if (memcmp (re->lla, our_lla, 16) == 0)
         continue;

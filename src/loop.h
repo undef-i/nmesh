@@ -5,6 +5,7 @@
 #include "route.h"
 #include "udp.h"
 #include "utils.h"
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -25,7 +26,7 @@ typedef struct
   uint64_t sid;
   pthread_t tid_arr[2];
   bool tid_on[2];
-  bool stop_req;
+  atomic_bool stop_req;
   pthread_rwlock_t snap_lk;
   bool snap_lk_init;
   pthread_mutex_t q_mtx;
@@ -37,7 +38,7 @@ typedef struct
   uint32_t q_head;
   uint32_t q_tail;
   uint32_t q_cnt;
-  TapSlot q_arr[BATCH_MAX];
+  TapSlot *q_arr;
   Rt rt;
   Cfg cfg;
   uint64_t snap_ts;

@@ -11,11 +11,12 @@ uint8_t *ping_bld (Cry *s, const uint8_t our_lla[16], uint64_t ts,
 uint8_t *pong_bld (Cry *s, const uint8_t our_lla[16], uint64_t o_ts,
                    uint64_t sid, uint64_t rx_ts, uint64_t prb_tok, uint8_t *buf,
                    size_t *out_len);
-uint8_t *gsp_bld (Cry *s, const Re *rt_arr, int rt_cnt, int s_off,
-                  const uint8_t our_lla[16], uint8_t *buf, size_t *out_len);
-uint8_t *gsp_dt_bld (Cry *s, const Re *rt_arr, int rt_cnt,
+uint8_t *gsp_bld (Cry *s, Rt *rt, int s_off,
+                  const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
+                  size_t *out_len);
+uint8_t *gsp_dt_bld (Cry *s, Rt *rt,
                      const uint8_t tgt_lla[16], const uint8_t our_lla[16],
-                     uint8_t *buf, size_t *out_len);
+                     bool self_dir_ok, uint8_t *buf, size_t *out_len);
 uint8_t *hp_bld (Cry *s, const uint8_t req_lla[16], const uint8_t tgt_lla[16],
                  uint8_t *buf, size_t *out_len);
 uint8_t *data_bld_zc_cnt (Cry *s, uint8_t *ipv6_ptr_start,
@@ -52,7 +53,8 @@ int on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
              uint8_t *lla, uint64_t *rx_ts, uint64_t *prb_tok);
 int on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             uint16_t src_port, const uint8_t our_lla[16], Rt *rt, PPool *pool,
-            uint64_t sys_ts, bool *is_mod, bool *req_seq, uint8_t seq_tgt[16]);
+            bool allow_dir_hint, uint64_t sys_ts, bool *is_mod, bool *req_seq,
+            uint8_t seq_tgt[16]);
 uint8_t *seq_req_bld (Cry *s, const uint8_t tgt_lla[16], uint8_t *buf,
                       size_t *out_len);
 int on_seq_req (const uint8_t *pt, size_t pt_len, uint8_t tgt_lla[16]);

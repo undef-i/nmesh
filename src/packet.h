@@ -66,6 +66,8 @@ typedef struct __attribute__ ((packed))
   uint16_t total_len;
 } StatHdr;
 
+#define GSP_F_SEL_DIR 0x01U
+#define GSP_F_NO_DIR 0x02U
 #define GSP_SZ sizeof (GspEnt)
 _Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
 _Static_assert (sizeof (GspEnt) == 70, "GspEnt size");
