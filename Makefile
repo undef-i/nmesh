@@ -72,3 +72,5 @@ $(BUILD_DIR)/debug/ext/%.o: ext/%.c
 clean:
 	rm -rf $(BUILD_DIR)
 
+.PHONY: all clean debug release
+-include $(DEPS_REL) $(DEPS_DBG)

@@ -544,12 +544,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
         {
           uint64_t intv = (re->state == RT_ACT && re->rt_m < RT_M_INF)
                               ? KA_TMO
-                              : um_prb_intv ((re->tx_ts > re->rx_ts
-                                                  && ts > re->tx_ts)
-                                                 ? (ts - re->tx_ts)
-                                             : (ts > re->rx_ts)
-                                                 ? (ts - re->rx_ts)
-                                                 : 0);
+                              : um_prb_intv (re_probe_age_ms (re, ts));
           if (re->hp_ts != 0 && ts > re->hp_ts && (ts - re->hp_ts) < intv)
             return;
           uint8_t hp_buf[UDP_PL_MAX];
@@ -966,6 +961,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
 
   P peers[RT_MAX];
   int peer_cnt = p_arr_ld (cfg_path, peers, RT_MAX);
+  uint64_t init_ts = sys_ts ();
   for (int i = 0; i < peer_cnt; i++)
     {
       Re ne;
@@ -978,7 +974,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
       ne.lat = RTT_UNK;
       ne.dir_cost = INT64_MAX;
       ne.rto = RTO_INIT;
-      rt_upd (&rt, &ne, 0);
+      rt_upd (&rt, &ne, init_ts);
       bool is_dup = false;
       for (int j = 0; j < pool.cnt; j++)
         {
@@ -2998,7 +2994,6 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
   if (cfg->p2p != P2P_EN)
     {
       rt->gsp_dirty = false;
-      printf ("gsp: flush: p2p disabled, clearing dirty\n");
       return;
     }
   uint64_t now = sys_ts ();
@@ -3156,11 +3151,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                          || re->rt_m >= RT_M_INF;
       if (needs_probe)
         {
-          uint64_t base_ts = re->rx_ts;
-          if (re->tx_ts > base_ts)
-            base_ts = re->tx_ts;
-          uint64_t age_ms = (base_ts > 0 && ts > base_ts) ? (ts - base_ts) : 0;
-          uint64_t intv = um_prb_intv (age_ms);
+          uint64_t intv = um_prb_intv (re_probe_age_ms (re, ts));
           if (re->pnd_ts > 0 && ts > re->pnd_ts && (ts - re->pnd_ts) < intv)
             continue;
           pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, true);

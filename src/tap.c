@@ -16,12 +16,6 @@
 #ifndef TUNSETSNDBUF
 #define TUNSETSNDBUF 0x400454d4U
 #endif
-#ifndef SIOCSIFFLAGS
-#define SIOCSIFFLAGS 0x8914U
-#endif
-#ifndef SIOCGIFFLAGS
-#define SIOCGIFFLAGS 0x8913U
-#endif
 #ifndef SIOCSIFTXQLEN
 #define SIOCSIFTXQLEN 0x8943U
 #endif
@@ -170,23 +164,6 @@ tap_init (const char *name)
       }
   }
   tap_txq_set (name);
-  int sock = socket (AF_INET, SOCK_DGRAM, 0);
-  if (sock >= 0)
-    {
-      struct ifreq grp;
-      memset (&grp, 0, sizeof (grp));
-      strncpy (grp.ifr_name, name, IFNAMSIZ - 1);
-      if (ioctl (sock, SIOCGIFFLAGS, &grp) < 0)
-        {
-          perror ("tap: ioctl(SIOCGIFFLAGS) failed");
-        }
-      grp.ifr_flags |= (IFF_UP | IFF_MULTICAST);
-      if (ioctl (sock, SIOCSIFFLAGS, &grp) < 0)
-        {
-          perror ("tap: ioctl(SIOCSIFFLAGS) failed");
-        }
-      close (sock);
-    }
   {
     char cmd[256];
     snprintf (cmd, sizeof (cmd), "ip link set dev %s up", name);
