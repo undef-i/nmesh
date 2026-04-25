@@ -63,11 +63,8 @@ typedef struct
   uint32_t rttvar;
   uint32_t rto;
   uint32_t sm_m;
-  int64_t dir_cost;
   uint64_t rtt_win_id[RT_METRIC_WIN_BINS];
   uint32_t rtt_win_min[RT_METRIC_WIN_BINS];
-  uint64_t dir_win_id[RT_METRIC_WIN_BINS];
-  int64_t dir_win_min[RT_METRIC_WIN_BINS];
   uint32_t r2d;
   uint16_t mtu;
   uint16_t mtu_lkg;
@@ -113,7 +110,6 @@ typedef struct Pth
   uint32_t rttvar;
   uint32_t rto;
   uint32_t sm_m;
-  int64_t dir_cost;
   uint32_t r2d;
   uint16_t mtu;
   uint16_t mtu_lkg;
@@ -249,10 +245,8 @@ bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
 bool rt_dir_is_sel (Rt *t, const Re *re);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
                  uint16_t port, uint32_t rtt_ms, uint64_t sys_ts);
-void rt_dir_cost_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
-                      uint16_t port, int64_t dir_cost, uint64_t sys_ts);
 bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
-                         uint32_t rtt_ms, int64_t dir_cost, uint64_t sys_ts);
+                         uint32_t rtt_ms, uint64_t sys_ts);
 void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
                 uint16_t port, uint64_t sys_ts);
 void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
