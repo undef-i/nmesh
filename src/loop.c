@@ -698,6 +698,8 @@ rt_show_rtt (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
           if (re->ep_port != sel->dir.port)
             continue;
           uint32_t m = re_show_rtt (re);
+          if (re->dir_cost > 0 && re->dir_cost < (int64_t)RT_M_INF)
+            m = (uint32_t)re->dir_cost;
           if (m < best)
             best = m;
         }
@@ -2831,8 +2833,7 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             continue;
           bool bypass_replay
               = is_ip_loopback (src_ip) && hdr->pkt_type == PT_STAT_REQ;
-          if (!bypass_replay
-              && !rx_rp_chk (src_ip, src_port, raw_buf + PKT_CH_SZ))
+          if (!bypass_replay && !rx_rp_chk (raw_buf + PKT_CH_SZ))
             continue;
 
           if (hdr->pkt_type == PT_DATA)
