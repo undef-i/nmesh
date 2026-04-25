@@ -10,8 +10,6 @@
 typedef struct
 {
   bool is_act;
-  uint8_t ip[16];
-  uint16_t port;
   uint8_t sid[RX_RP_SID_SZ];
   uint64_t max_cnt;
   uint64_t last_ts;
@@ -69,14 +67,12 @@ rx_rp_map_set (uint64_t map[RX_RP_W], uint64_t cnt)
 }
 
 static void
-rx_rp_slot_init (RxRp *slot, const uint8_t ip[16], uint16_t port,
-                 const uint8_t sid[RX_RP_SID_SZ], uint64_t cnt, uint64_t now)
+rx_rp_slot_init (RxRp *slot, const uint8_t sid[RX_RP_SID_SZ], uint64_t cnt,
+                 uint64_t now)
 {
   if (!slot)
     return;
   slot->is_act = true;
-  memcpy (slot->ip, ip, 16);
-  slot->port = port;
   memcpy (slot->sid, sid, sizeof (slot->sid));
   slot->max_cnt = cnt;
   slot->last_ts = now;
@@ -85,8 +81,7 @@ rx_rp_slot_init (RxRp *slot, const uint8_t ip[16], uint16_t port,
 }
 
 bool
-rx_rp_chk (const uint8_t ip[16], uint16_t port,
-           const uint8_t nonce[PKT_NONCE_SZ])
+rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
 {
   uint8_t sid[RX_RP_SID_SZ];
   nonce_sid_rd (nonce, sid);
@@ -96,15 +91,13 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
   static int l_idx = 0;
   RxRp *slot = NULL;
 
-  if (g_rx_rp[l_idx].is_act && g_rx_rp[l_idx].port == port
-      && memcmp (g_rx_rp[l_idx].ip, ip, 16) == 0
+  if (g_rx_rp[l_idx].is_act
       && memcmp (g_rx_rp[l_idx].sid, sid, sizeof (sid)) == 0)
     {
       slot = &g_rx_rp[l_idx];
     }
   else
     {
-      RxRp *same_ep = NULL;
       RxRp *stale = NULL;
       uint64_t stale_ts = UINT64_MAX;
       for (size_t i = 0; i < RX_RP_MAX; i++)
@@ -115,15 +108,11 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
                 slot = &g_rx_rp[i];
               continue;
             }
-          if (memcmp (g_rx_rp[i].ip, ip, 16) != 0 || g_rx_rp[i].port != port)
-            continue;
           if (memcmp (g_rx_rp[i].sid, sid, sizeof (sid)) == 0)
             {
               slot = &g_rx_rp[i];
               break;
             }
-          if (!same_ep)
-            same_ep = &g_rx_rp[i];
           if (now > g_rx_rp[i].last_ts
               && (now - g_rx_rp[i].last_ts) > UM_PRB_IMAX
               && g_rx_rp[i].last_ts < stale_ts)
@@ -133,8 +122,6 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
             }
         }
       if (!slot)
-        slot = same_ep;
-      if (!slot)
         slot = stale;
       if (!slot)
         return false;
@@ -143,12 +130,12 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
 
   if (!slot->is_act)
     {
-      rx_rp_slot_init (slot, ip, port, sid, cnt, now);
+      rx_rp_slot_init (slot, sid, cnt, now);
       return true;
     }
   if (memcmp (slot->sid, sid, sizeof (sid)) != 0)
     {
-      rx_rp_slot_init (slot, ip, port, sid, cnt, now);
+      rx_rp_slot_init (slot, sid, cnt, now);
       return true;
     }
   if (cnt > slot->max_cnt)
@@ -181,16 +168,10 @@ rx_rp_chk (const uint8_t ip[16], uint16_t port,
 void
 rx_rp_rst_ep (const uint8_t ip[16], uint16_t port)
 {
-  for (size_t i = 0; i < RX_RP_MAX; i++)
-    {
-      if (!g_rx_rp[i].is_act)
-        continue;
-      if (memcmp (g_rx_rp[i].ip, ip, 16) != 0)
-        continue;
-      if (g_rx_rp[i].port != port)
-        continue;
-      memset (&g_rx_rp[i], 0, sizeof (g_rx_rp[i]));
-    }
+  (void)ip;
+  (void)port;
+  /* Replay is keyed by authenticated nonce SID+counter.
+   * Endpoint resets must not flush global replay state. */
 }
 
 void

@@ -691,24 +691,21 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       bool is_new_poison
           = (adv_m >= RT_M_INF) && (!se || se->fwd_m < RT_M_INF);
 
-      if (!feasible && !is_new_poison)
+      bool src_fresh = feasible || is_new_poison;
+      if (!src_fresh && loc_req_seq && o_req_seq && seq_tgt)
         {
-          if (loc_req_seq && o_req_seq && seq_tgt)
-            {
-              *o_req_seq = true;
-              memcpy (seq_tgt, gsp_ent.lla, 16);
-            }
-          continue;
+          *o_req_seq = true;
+          memcpy (seq_tgt, gsp_ent.lla, 16);
         }
 
-      if (feasible || is_new_poison)
+      if (src_fresh)
         {
           rt_src_upd (rt, gsp_ent.lla, n_seq, adv_m, gsp_ent.ver, no_dir,
                       sys_ts);
         }
       bool is_s_self = (memcmp (gsp_ent.ep_ip, src_ip, 16) == 0
                         && gsp_ent.ep_port == src_port);
-      if (no_dir && !is_s_self)
+      if (src_fresh && no_dir && !is_s_self)
         rt_dir_hint_prune (rt, gsp_ent.lla);
       if (!is_s_self)
         {
@@ -737,7 +734,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rt_upd (rt, &rel_re, sys_ts);
         }
       bool import_dir_hint
-          = allow_dir_hint && !no_dir && has_dir_hint
+          = src_fresh && allow_dir_hint && !no_dir && has_dir_hint
             && (is_s_self || (gsp_ent.flags & GSP_F_SEL_DIR) != 0);
       if (import_dir_hint)
         {
