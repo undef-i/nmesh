@@ -1,10 +1,9 @@
 #pragma once
+#include "config.h"
 #include "uthash.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#define RT_MAX 256
-#define PEER_MAX 64
 #define RTT_UNK UINT32_MAX
 #define RTO_MIN 200U
 #define RTO_MAX 30000U
@@ -54,6 +53,7 @@ typedef struct
   RtSt state;
   bool is_act;
   bool is_static;
+  uint8_t tp_mask;
   uint64_t pong_ts;
   uint64_t rx_ts;
   uint64_t tx_ts;
@@ -101,6 +101,7 @@ typedef struct Pth
   RtSt state;
   bool is_act;
   bool is_static;
+  uint8_t tp_mask;
   uint64_t pong_ts;
   uint64_t rx_ts;
   uint64_t tx_ts;
@@ -166,8 +167,9 @@ typedef struct
 
 typedef struct
 {
-  PAnc re_arr[PEER_MAX];
+  PAnc *re_arr;
   int cnt;
+  int cap;
   const char *persist_path;
   bool is_dirty;
 } PPool;
@@ -190,6 +192,7 @@ typedef struct Rt
   uint64_t boot_ts;
   uint64_t loc_last_ts;
   uint64_t sync_rev;
+  uint32_t gsp_off;
   uint64_t gsp_last_ts;
   uint64_t gsp_tx_cnt;
   uint64_t gsp_dt_tx_cnt;
@@ -282,9 +285,15 @@ bool rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
 void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
                  uint64_t ver, bool no_dir, uint64_t sys_ts);
 bool rt_src_no_dir (const Rt *t, const uint8_t rt_id[16]);
+uint8_t rt_ep_tp_mask (const Rt *t, const uint8_t ip[16], uint16_t port);
+bool rt_ep_peer_lla (const Rt *t, const uint8_t ip[16], uint16_t port,
+                     uint8_t out_lla[16]);
+bool rt_peer_ep_fnd (const Rt *t, const uint8_t peer_lla[16],
+                     uint8_t out_ip[16], uint16_t *out_port);
 void rt_dir_hint_prune (Rt *t, const uint8_t lla[16]);
 bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
                    uint64_t sys_ts);
 void pp_init (PPool *p, const char *persist_path);
+void pp_free (PPool *p);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
 void rt_gsp_dirty_set (Rt *t, const char *r);

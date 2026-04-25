@@ -20,10 +20,12 @@ typedef struct
 typedef struct
 {
   int fd;
-  UdpPMsg pend[UDP_PND_MAX];
+  UdpPMsg *pend_arr;
+  uint32_t pend_cap;
   uint32_t pend_head;
   uint32_t pend_cnt;
   void *rx_split_arr;
+  uint32_t rx_split_cap;
   uint32_t rx_split_head;
   uint32_t rx_split_cnt;
   uint8_t (*rx_split_drn_bufs)[UDP_PL_MAX];

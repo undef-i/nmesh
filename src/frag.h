@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAG_BKT_MAX 512
+#define FRAG_BKT_CAP_INIT 512U
 
 typedef struct
 {

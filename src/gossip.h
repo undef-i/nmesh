@@ -1,4 +1,5 @@
 #pragma once
+#include "config.h"
 #include "crypto.h"
 #include "route.h"
 #include "udp.h"
@@ -60,4 +61,5 @@ uint8_t *seq_req_bld (Cry *s, const uint8_t tgt_lla[16], uint8_t *buf,
 int on_seq_req (const uint8_t *pt, size_t pt_len, uint8_t tgt_lla[16]);
 bool is_ip_bgn (const uint8_t ip[16]);
 int on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
-           const uint8_t our_lla[16], uint64_t sid, uint64_t sys_ts);
+           const Cfg *cfg, const uint8_t our_lla[16], uint64_t sid,
+           uint64_t sys_ts);

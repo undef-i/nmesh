@@ -1,6 +1,7 @@
 #include "gossip.h"
 #include "bogon.h"
 #include "packet.h"
+#include "tcp.h"
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -263,6 +264,10 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
       gsp_ent.flags = (!no_dir && rt_dir_is_sel (rt, re)) ? GSP_F_SEL_DIR : 0;
       if (no_dir)
         gsp_ent.flags |= GSP_F_NO_DIR;
+      if (tp_mask_has (re->tp_mask, TP_PROTO_UDP))
+        gsp_ent.flags |= GSP_F_TP_UDP;
+      if (tp_mask_has (re->tp_mask, TP_PROTO_TCP))
+        gsp_ent.flags |= GSP_F_TP_TCP;
       gsp_ent.state = (uint8_t)re->state;
       gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
       gsp_ent.seq = re->seq;
@@ -327,6 +332,10 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
       gsp_ent.flags = (!no_dir && rt_dir_is_sel (rt, re)) ? GSP_F_SEL_DIR : 0;
       if (no_dir)
         gsp_ent.flags |= GSP_F_NO_DIR;
+      if (tp_mask_has (re->tp_mask, TP_PROTO_UDP))
+        gsp_ent.flags |= GSP_F_TP_UDP;
+      if (tp_mask_has (re->tp_mask, TP_PROTO_TCP))
+        gsp_ent.flags |= GSP_F_TP_TCP;
       gsp_ent.state = (uint8_t)re->state;
       gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
       gsp_ent.seq = re->seq;
@@ -727,6 +736,13 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             }
           rel_re.state = is_s_alive ? RT_ACT : RT_DED;
           rel_re.is_act = is_s_alive;
+          rel_re.tp_mask = 0;
+          if ((gsp_ent.flags & GSP_F_TP_UDP) != 0)
+            rel_re.tp_mask |= TP_MASK_UDP;
+          if ((gsp_ent.flags & GSP_F_TP_TCP) != 0)
+            rel_re.tp_mask |= TP_MASK_TCP;
+          if (rel_re.tp_mask == 0)
+            rel_re.tp_mask = TP_MASK_UDP | TP_MASK_TCP;
           rel_re.rto = RTO_INIT;
           if (has_s_lla)
             memcpy (rel_re.nhop_lla, src_lla, 16);
@@ -758,6 +774,13 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             }
           dir_re.state = ((RtSt)gsp_ent.state == RT_DED) ? RT_DED : RT_PND;
           dir_re.is_act = false;
+          dir_re.tp_mask = 0;
+          if ((gsp_ent.flags & GSP_F_TP_UDP) != 0)
+            dir_re.tp_mask |= TP_MASK_UDP;
+          if ((gsp_ent.flags & GSP_F_TP_TCP) != 0)
+            dir_re.tp_mask |= TP_MASK_TCP;
+          if (dir_re.tp_mask == 0)
+            dir_re.tp_mask = TP_MASK_UDP | TP_MASK_TCP;
           dir_re.rto = RTO_INIT;
           if (IS_LLA_VAL (gsp_ent.nhop_lla))
             memcpy (dir_re.nhop_lla, gsp_ent.nhop_lla, 16);
@@ -793,7 +816,7 @@ on_seq_req (const uint8_t *pt, size_t pt_len, uint8_t tgt_lla[16])
 
 int
 on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
-       const uint8_t o_lla[16], uint64_t sid, uint64_t ts)
+       const Cfg *cfg, const uint8_t o_lla[16], uint64_t sid, uint64_t ts)
 {
   if (!pt || pt_len < 32)
     return -1;
@@ -825,7 +848,11 @@ on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
           uint8_t p_buf[UDP_PL_MAX];
           size_t p_len;
           ping_bld (s, o_lla, ts, sid, 0, p_buf, &p_len);
-          udp_tx (udp, req_re.ep_ip, req_re.ep_port, p_buf, p_len);
+          if (cfg)
+            (void)tp_send_ctrl (udp, rt, cfg, req_re.ep_ip, req_re.ep_port,
+                                p_buf, p_len);
+          else
+            udp_tx (udp, req_re.ep_ip, req_re.ep_port, p_buf, p_len);
         }
       return 0;
     }
@@ -835,7 +862,11 @@ on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
       uint8_t out_buf[UDP_PL_MAX];
       size_t out_len;
       hp_bld (s, req_lla, tgt_lla, out_buf, &out_len);
-      udp_tx (udp, tgt_re.ep_ip, tgt_re.ep_port, out_buf, out_len);
+      if (cfg)
+        (void)tp_send_ctrl (udp, rt, cfg, tgt_re.ep_ip, tgt_re.ep_port,
+                            out_buf, out_len);
+      else
+        udp_tx (udp, tgt_re.ep_ip, tgt_re.ep_port, out_buf, out_len);
     }
   return 0;
 }
