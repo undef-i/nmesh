@@ -80,5 +80,4 @@ These numbers are a point-in-time local reference, not a portability claim.
 
 ## Acknowledgements
 
-- [Tailscale](https://github.com/tailscale/tailscale), whose userspace GSO/GRO work informed this project's packet-path design.
-- [EtherGuard-VPN](https://github.com/KusakabeShi/EtherGuard-VPN), whose one-way delay routing design informed this project's route selection rules.
+- [Go Implementation of WireGuard](https://github.com/WireGuard/wireguard-go), whose userspace GSO/GRO work informed this project's packet-path design.

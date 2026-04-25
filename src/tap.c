@@ -22,8 +22,8 @@
 #define IFF_TAP 0x0002
 #define IFF_NO_PI 0x1000
 #define IFF_VNET_HDR 0x4000
-#define TAP_TXQ_LEN 500000
-#define TAP_SND_BUF (256 * 1024 * 1024)
+#define TAP_TXQ_LEN 1024
+#define TAP_SND_BUF (4 * 1024 * 1024)
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86ddU
 #endif
