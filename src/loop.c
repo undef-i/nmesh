@@ -354,7 +354,7 @@ tap_read_loop (void *arg)
           pthread_mutex_lock (&tap_pipe->q_mtx);
           while (!atomic_load_explicit (&tap_pipe->stop_req,
                                         memory_order_acquire)
-                 && tap_pipe->q_cnt >= BATCH_MAX)
+                 && tap_pipe->q_cnt >= TAP_Q_PROC_MAX)
             pthread_cond_wait (&tap_pipe->q_nf, &tap_pipe->q_mtx);
           if (atomic_load_explicit (&tap_pipe->stop_req, memory_order_acquire))
             {

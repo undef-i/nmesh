@@ -217,14 +217,30 @@ re_map_dcy (Re *re, uint64_t sys_ts)
 }
 
 static void
-re_rx_ack (Re *re, uint64_t sys_ts)
+re_rx_note (Re *re, uint64_t sys_ts)
 {
   re_map_dcy (re, sys_ts);
   re->rx_bmp |= 0x0001U;
   re->rx_ts = sys_ts;
+}
+
+static bool
+re_dir_activate (Re *re, uint64_t sys_ts)
+{
+  bool was_act = re->is_act && re->state == RT_ACT;
+  if (!was_act && sys_ts > 0)
+    re->pnd_ts = sys_ts;
   re->pong_ts = sys_ts;
   re->is_act = true;
   re->state = RT_ACT;
+  return !was_act;
+}
+
+static void
+re_rx_ack (Re *re, uint64_t sys_ts)
+{
+  re_rx_note (re, sys_ts);
+  (void)re_dir_activate (re, sys_ts);
 }
 
 static void
@@ -284,13 +300,6 @@ pth_dir_btr (const Pth *cand, const Pth *best)
   uint32_t best_m = pth_m (best);
   if (cand_m != best_m)
     return cand_m < best_m;
-
-  bool cand_dat = cand->dat_ts != 0;
-  bool best_dat = best->dat_ts != 0;
-  if (cand_dat != best_dat)
-    return cand_dat;
-  if (cand->dat_ts != best->dat_ts)
-    return cand->dat_ts > best->dat_ts;
 
   uint64_t cand_ts = pth_last_rx_ts (cand);
   uint64_t best_ts = pth_last_rx_ts (best);
@@ -942,6 +951,26 @@ rt_dir_ep_roam_pick (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
   return best;
 }
 
+static bool
+rt_dir_has_other_ep (const Rt *t, const uint8_t lla[16], const uint8_t ip[16],
+                     uint16_t port)
+{
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      const Re *re = &t->re_arr[i];
+      if (re->r2d != 0 || is_z16 (re->lla))
+        continue;
+      if (re->state == RT_DED)
+        continue;
+      if (memcmp (re->lla, lla, 16) != 0)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) == 0 && re->ep_port == port)
+        continue;
+      return true;
+    }
+  return false;
+}
+
 void
 pp_init (PPool *p, const char *persist_path)
 {
@@ -1058,6 +1087,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
     }
   if (!is_rel && !rt_direct_ep_ip_ok (re->ep_ip))
     return;
+  bool is_dir_obs = !is_zero && !is_rel && !is_loc_inj;
   if (!is_zero && !is_rel)
     {
       Re *roam = rt_dir_ep_roam_pick (t, re->lla, re->ep_ip, re->ep_port);
@@ -1086,7 +1116,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         continue;
       if (cur_re->ep_port != re->ep_port)
         continue;
-      if (re->is_act)
+      if ((is_rel || is_loc_inj) && re->is_act)
         cur_re->is_act = true;
       if (seq_gt (re->seq, cur_re->seq))
         cur_re->seq = re->seq;
@@ -1110,7 +1140,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
           cur_re->state = RT_DED;
           cur_re->is_act = false;
         }
-      else if (re->state == RT_ACT || re->is_act)
+      else if ((is_rel || is_loc_inj) && (re->state == RT_ACT || re->is_act))
         {
           cur_re->state = RT_ACT;
           cur_re->is_act = true;
@@ -1198,10 +1228,18 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       ne.mtu_st = MTU_ST_B;
       ne.mtu_ukb_soft = false;
       re_mtu_sync (t, &ne);
-      if (ne.state == 0 && !ne.is_act)
-        ne.state = RT_PND;
-      if (ne.is_act)
-        ne.state = RT_ACT;
+      if (is_dir_obs)
+        {
+          ne.is_act = false;
+          ne.state = RT_PND;
+        }
+      else
+        {
+          if (ne.state == 0 && !ne.is_act)
+            ne.state = RT_PND;
+          if (ne.is_act)
+            ne.state = RT_ACT;
+        }
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
     }
@@ -1285,7 +1323,8 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
       if (t->re_arr[i].ep_port != port)
         continue;
       re_rtt_min_apply (&t->re_arr[i], rtt_ms, sys_ts);
-      re_rx_ack (&t->re_arr[i], sys_ts);
+      re_rx_note (&t->re_arr[i], sys_ts);
+      (void)re_dir_activate (&t->re_arr[i], sys_ts);
       re_rto_upd (&t->re_arr[i], rtt_ms);
       {
         char lla_str[INET6_ADDRSTRLEN] = { 0 };
@@ -1322,7 +1361,8 @@ rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
       if (re->prb_tok != prb_tok)
         continue;
       re_rtt_min_apply (re, rtt_ms, sys_ts);
-      re_rx_ack (re, sys_ts);
+      re_rx_note (re, sys_ts);
+      (void)re_dir_activate (re, sys_ts);
       re_rto_upd (re, rtt_ms);
       rt_map_mark (t);
       return true;
@@ -1406,15 +1446,24 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       bool was_act = t->re_arr[i].is_act;
       RtSt was_state = t->re_arr[i].state;
       bool was_zero = is_z16 (t->re_arr[i].lla);
+      bool has_alt = rt_dir_has_other_ep (t, lla, ip, port);
+      bool should_act = was_act && was_state == RT_ACT;
+      if (!should_act && !has_alt)
+        should_act = true;
       if (!is_zero_lla)
         {
           memcpy (t->re_arr[i].lla, lla, 16);
-          t->re_arr[i].is_act = true;
-          t->re_arr[i].state = RT_ACT;
-          if (was_zero || !was_act || was_state != RT_ACT)
-            t->re_arr[i].pnd_ts = sys_ts;
+          if (should_act)
+            (void)re_dir_activate (&t->re_arr[i], sys_ts);
+          else
+            {
+              t->re_arr[i].is_act = false;
+              t->re_arr[i].state = RT_PND;
+              if (t->re_arr[i].pnd_ts == 0 || was_act || was_state != RT_PND)
+                t->re_arr[i].pnd_ts = sys_ts;
+            }
         }
-      re_rx_ack (&t->re_arr[i], sys_ts);
+      re_rx_note (&t->re_arr[i], sys_ts);
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
         {
@@ -1437,7 +1486,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
           t->re_arr[i].rt_m = re_dir_seed_m (&t->re_arr[i]);
         }
       rt_map_mark (t);
-      if (!is_zero_lla && (was_zero || !was_act || was_state != RT_ACT))
+      if (!is_zero_lla && should_act && (was_zero || !was_act || was_state != RT_ACT))
         {
           rt_gsp_dirty_set (t, "ep_upd (direct active)");
         }
@@ -1448,11 +1497,21 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       Re *re = &t->re_arr[zero_idx];
       bool was_act = re->is_act;
       RtSt was_state = re->state;
+      bool has_alt = rt_dir_has_other_ep (t, lla, ip, port);
+      bool should_act = was_act && was_state == RT_ACT;
+      if (!should_act && !has_alt)
+        should_act = true;
       memcpy (re->lla, lla, 16);
-      re->is_act = true;
-      re->state = RT_ACT;
-      re->pnd_ts = sys_ts;
-      re_rx_ack (re, sys_ts);
+      if (should_act)
+        (void)re_dir_activate (re, sys_ts);
+      else
+        {
+          re->is_act = false;
+          re->state = RT_PND;
+          if (re->pnd_ts == 0 || was_act || was_state != RT_PND)
+            re->pnd_ts = sys_ts;
+        }
+      re_rx_note (re, sys_ts);
       memcpy (re->nhop_lla, lla, 16);
       if (re->mtu == 0)
         {
@@ -1471,7 +1530,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       if (re->rt_m >= RT_M_INF)
         re->rt_m = re_dir_seed_m (re);
       rt_map_mark (t);
-      if (!was_act || was_state != RT_ACT || !is_zero_lla)
+      if (should_act && (!was_act || was_state != RT_ACT || !is_zero_lla))
         rt_gsp_dirty_set (t, "ep_upd (zero promote)");
       return;
     }
@@ -1483,8 +1542,8 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       memcpy (ne.ep_ip, ip, 16);
       ne.ep_port = port;
       ne.r2d = 0;
-      ne.is_act = true;
-      ne.state = RT_ACT;
+      ne.is_act = !rt_dir_has_other_ep (t, lla, ip, port);
+      ne.state = ne.is_act ? RT_ACT : RT_PND;
       ne.pnd_ts = sys_ts;
       ne.pong_ts = sys_ts;
       ne.rx_ts = sys_ts;
@@ -1517,7 +1576,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       }
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
-      if (!is_zero_lla)
+      if (!is_zero_lla && ne.is_act)
         {
           rt_gsp_dirty_set (t, "ep_upd (direct new)");
         }
@@ -1536,7 +1595,6 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
 void
 rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
 {
-  bool is_mod = false;
   for (uint32_t i = 0; i < t->cnt; i++)
     {
       Re *re = &t->re_arr[i];
@@ -1544,17 +1602,7 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
         continue;
       if (re->ep_port != port)
         continue;
-      if (!re->is_act || re->state != RT_ACT)
-        {
-          if (rt_dir_is_sel (t, re))
-            is_mod = true;
-        }
-      re_rx_ack (re, sys_ts);
-    }
-  if (is_mod)
-    {
-      rt_map_mark (t);
-      rt_gsp_dirty_set (t, "rx_ack (state mod)");
+      re_rx_note (re, sys_ts);
     }
 }
 
