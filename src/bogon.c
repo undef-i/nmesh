@@ -38,8 +38,9 @@ static const BogonRule g_default_rule_arr[] = {
   { .ip = { 0xfc }, .prefix_len = 7, .is_set = true },
 };
 
-static BogonRule g_rule_arr[BOGON_RULE_MAX];
+static BogonRule *g_rule_arr = NULL;
 static size_t g_rule_cnt = 0;
+static size_t g_rule_cap = 0;
 
 static bool
 prefix_match (const uint8_t a[16], const uint8_t b[16], uint8_t prefix_len)
@@ -59,8 +60,7 @@ prefix_match (const uint8_t a[16], const uint8_t b[16], uint8_t prefix_len)
 static bool
 bogon_rule_add (const BogonRule *rule)
 {
-  if (!rule || !rule->is_set || rule->prefix_len > 128
-      || g_rule_cnt >= BOGON_RULE_MAX)
+  if (!rule || !rule->is_set || rule->prefix_len > 128)
     return false;
   for (size_t i = 0; i < g_rule_cnt; i++)
     {
@@ -71,6 +71,15 @@ bogon_rule_add (const BogonRule *rule)
       if (memcmp (g_rule_arr[i].ip, rule->ip, 16) != 0)
         continue;
       return true;
+    }
+  if (g_rule_cnt >= g_rule_cap)
+    {
+      size_t new_cap = g_rule_cap ? (g_rule_cap * 2U) : BOGON_RULE_CAP_INIT;
+      BogonRule *new_arr = realloc (g_rule_arr, sizeof (*new_arr) * new_cap);
+      if (!new_arr)
+        return false;
+      g_rule_arr = new_arr;
+      g_rule_cap = new_cap;
     }
   g_rule_arr[g_rule_cnt++] = *rule;
   return true;

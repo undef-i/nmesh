@@ -3,6 +3,7 @@
 #include "gossip.h"
 #include "mss.h"
 #include "packet.h"
+#include "tcp.h"
 #include "utils.h"
 #include <linux/if_ether.h>
 #include <string.h>
@@ -158,9 +159,11 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       size_t out_len = 0;
       uint8_t *out_ptr
           = data_bld_zc (cry_ctx, relay_vnet, vnet_len, 1, hop_c, &out_len);
-      udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
-      rt_tx_ack (rt, tx_ip, tx_port, ts);
-      g_tx_ts = ts;
+      if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+        {
+          rt_tx_ack (rt, tx_ip, tx_port, ts);
+          g_tx_ts = ts;
+        }
     }
   else
     {
@@ -190,9 +193,11 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               off += chunk_len;
               continue;
             }
-          udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
-          rt_tx_ack (rt, tx_ip, tx_port, ts);
-          g_tx_ts = ts;
+          if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+            {
+              rt_tx_ack (rt, tx_ip, tx_port, ts);
+              g_tx_ts = ts;
+            }
           off += chunk_len;
         }
     }
@@ -201,7 +206,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
       hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
-      udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
+      (void)tp_send_ctrl (udp, rt, cfg, dec.rel.relay_ip, dec.rel.relay_port,
+                          hp_buf, hp_len);
     }
   return true;
 }
@@ -268,9 +274,11 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           sub_off += sub_len;
           continue;
         }
-      udp_tx (udp, tx_ip, tx_port, out_ptr, out_len);
-      rt_tx_ack (rt, tx_ip, tx_port, ts);
-      g_tx_ts = ts;
+      if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+        {
+          rt_tx_ack (rt, tx_ip, tx_port, ts);
+          g_tx_ts = ts;
+        }
       is_tx = true;
       sub_off += sub_len;
     }
@@ -279,7 +287,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
       hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
-      udp_tx (udp, dec.rel.relay_ip, dec.rel.relay_port, hp_buf, hp_len);
+      (void)tp_send_ctrl (udp, rt, cfg, dec.rel.relay_ip, dec.rel.relay_port,
+                          hp_buf, hp_len);
     }
   return is_tx;
 }

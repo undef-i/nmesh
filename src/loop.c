@@ -11,6 +11,7 @@
 #include "replay.h"
 #include "route.h"
 #include "tap.h"
+#include "tcp.h"
 #include "udp.h"
 #include "utils.h"
 #include <arpa/inet.h>
@@ -77,6 +78,18 @@ static void *tap_read_loop (void *arg);
 static void *tap_loop (void *arg);
 static bool ctrl_pkt_is (uint8_t pkt_type);
 static void *buf_alloc_align (size_t align, size_t size);
+typedef struct LoopRxCtx
+{
+  int tap_fd;
+  Udp *udp;
+  Cry *cry_ctx;
+  Rt *rt;
+  const Cfg *cfg;
+  uint64_t sid;
+  PPool *pool;
+} LoopRxCtx;
+static void on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src,
+                          void *arg);
 
 static int
 cpu_aff_avail_cnt (void)
@@ -188,8 +201,17 @@ tap_pipe_sync (TapPipe *tap_pipe, const Rt *rt, const Cfg *cfg, uint64_t now)
   pthread_rwlock_wrlock (&tap_pipe->snap_lk);
   if (rt_cpy (&tap_pipe->rt, rt) == 0)
     {
-      tap_pipe->cfg = *cfg;
-      tap_pipe->snap_ts = now;
+      Cfg new_cfg;
+      if (cfg_cpy (&new_cfg, cfg) == 0)
+        {
+          cfg_free (&tap_pipe->cfg);
+          tap_pipe->cfg = new_cfg;
+          tap_pipe->snap_ts = now;
+        }
+      else
+        {
+          fprintf (stderr, "main: tap snapshot config refresh failed\n");
+        }
     }
   else
     {
@@ -287,6 +309,7 @@ tap_pipe_free (TapPipe *tap_pipe)
   tap_pipe_stop (tap_pipe);
   tap_pipe_join (tap_pipe);
   rt_free (&tap_pipe->rt);
+  cfg_free (&tap_pipe->cfg);
   free (tap_pipe->q_arr);
   tap_pipe->q_arr = NULL;
   if (tap_pipe->q_nf_init)
@@ -413,7 +436,8 @@ tap_loop (void *arg)
       uint64_t now = sys_ts ();
       bool tap_ok = true;
       int done_cnt = 0;
-      while (done_cnt < take_cnt && !udp_w_want (tap_pipe->udp))
+      while (done_cnt < take_cnt && !udp_w_want (tap_pipe->udp)
+             && !tp_w_want ())
         {
           uint32_t idx = idx_arr[done_cnt];
           tap_ok = tap_frame_tx (tap_pipe->tap_fd, tap_pipe->udp,
@@ -550,39 +574,22 @@ rt_re_fnd (Rt *rt, const uint8_t lla[16])
 }
 
 static bool
-rt_static_ep_has (const Rt *rt, const uint8_t src_ip[16], uint16_t src_port)
-{
-  if (!rt || !src_ip || src_port == 0)
-    return false;
-  for (uint32_t i = 0; i < rt->cnt; i++)
-    {
-      const Re *re = &rt->re_arr[i];
-      if (re->r2d != 0 || !re->is_static)
-        continue;
-      if (memcmp (re->ep_ip, src_ip, 16) != 0)
-        continue;
-      if (re->ep_port != src_port)
-        continue;
-      return true;
-    }
-  return false;
-}
-
-static bool
 rt_static_peer_has (const Rt *rt, const uint8_t peer_lla[16],
                     const uint8_t src_ip[16], uint16_t src_port)
 {
-  if (!rt || !src_ip || src_port == 0)
+  if (!rt)
     return false;
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
       const Re *re = &rt->re_arr[i];
       if (re->r2d != 0 || !re->is_static)
         continue;
-      if (memcmp (re->ep_ip, src_ip, 16) == 0 && re->ep_port == src_port)
-        return true;
       if (peer_lla && IS_LLA_VAL (peer_lla)
           && memcmp (re->lla, peer_lla, 16) == 0)
+        return true;
+      if (!src_ip || src_port == 0)
+        continue;
+      if (memcmp (re->ep_ip, src_ip, 16) == 0 && re->ep_port == src_port)
         return true;
     }
   return false;
@@ -597,6 +604,31 @@ p2p_direct_peer_ok (const Cfg *cfg, const Rt *rt, const uint8_t peer_lla[16],
   if (cfg->p2p == P2P_EN)
     return true;
   return rt_static_peer_has (rt, peer_lla, src_ip, src_port);
+}
+
+static bool
+ctrl_send (Udp *udp, const Rt *rt, const Cfg *cfg, const TpSrc *tp_src,
+           const uint8_t dst_ip[16], uint16_t dst_port, const uint8_t *buf,
+           size_t len)
+{
+  if (tp_src && tp_src->is_tcp && tp_src->tcp_fd >= 0)
+    return tp_send_fd (tp_src->tcp_fd, buf, len);
+  if (!udp || !rt || !cfg || !dst_ip || dst_port == 0 || !buf || len == 0)
+    return false;
+  return tp_send_ctrl (udp, rt, cfg, dst_ip, dst_port, buf, len);
+}
+
+static void
+ctrl_tx_mark (Rt *rt, uint64_t *cnt, size_t len, const uint8_t dst_ip[16],
+              uint16_t dst_port, uint64_t ts)
+{
+  if (!rt)
+    return;
+  if (cnt)
+    (*cnt)++;
+  rt->ctrl_tx_b += (uint64_t)len;
+  if (dst_ip && dst_port != 0)
+    rt_tx_ack (rt, dst_ip, dst_port, ts);
 }
 
 static void
@@ -618,10 +650,13 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
           uint8_t hp_buf[UDP_PL_MAX];
           size_t hp_len = 0;
           hp_bld (cry_ctx, cfg->addr, re->lla, hp_buf, &hp_len);
-          udp_tx (udp, rd.rel.relay_ip, rd.rel.relay_port, hp_buf, hp_len);
-          rt->hp_tx_cnt++;
-          rt->ctrl_tx_b += (uint64_t)hp_len;
-          re->hp_ts = ts;
+          if (tp_send_ctrl (udp, rt, cfg, rd.rel.relay_ip, rd.rel.relay_port,
+                            hp_buf, hp_len))
+            {
+              ctrl_tx_mark (rt, &rt->hp_tx_cnt, hp_len, rd.rel.relay_ip,
+                            rd.rel.relay_port, ts);
+              re->hp_ts = ts;
+            }
         }
     }
   uint8_t p_buf[UDP_PL_MAX];
@@ -629,12 +664,12 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
   uint64_t p_ts = sys_ts ();
   uint64_t p_tok = ((uint64_t)u32_rnd () << 32) | (uint64_t)u32_rnd ();
   ping_bld (cry_ctx, cfg->addr, p_ts, sid, p_tok, p_buf, &p_len);
-  udp_tx (udp, re->ep_ip, re->ep_port, p_buf, p_len);
-  rt->ping_tx_cnt++;
-  rt->ctrl_tx_b += (uint64_t)p_len;
-  re->prb_ts = p_ts;
-  re->prb_tok = p_tok;
-  rt_tx_ack (rt, re->ep_ip, re->ep_port, ts);
+  if (tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, p_buf, p_len))
+    {
+      ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port, ts);
+      re->prb_ts = p_ts;
+      re->prb_tok = p_tok;
+    }
 }
 
 static struct termios g_tty_old;
@@ -855,7 +890,8 @@ mesh_src_lla_from_ip6 (const uint8_t *frame, size_t frame_len,
 }
 
 void
-rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
+rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint8_t tp_mask,
+            uint64_t now)
 {
   struct ifaddrs *ifaddr = NULL;
   if (getifaddrs (&ifaddr) != 0)
@@ -895,6 +931,7 @@ rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
       s_re.ep_port = port;
       s_re.is_act = true;
       s_re.state = RT_ACT;
+      s_re.tp_mask = tp_mask;
       s_re.sm_m = 0;
       s_re.rt_m = 0;
       s_re.adv_m = 0;
@@ -950,11 +987,34 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       cfg->p2p = new_cfg.p2p;
       fprintf (stderr, "main: reloaded p2p mode\n");
     }
-  if (cfg->bogon_cnt != new_cfg.bogon_cnt
-      || memcmp (cfg->bogon_arr, new_cfg.bogon_arr, sizeof (cfg->bogon_arr)) != 0)
+  if (cfg->tp_mask != new_cfg.tp_mask
+      || cfg->tp_pref_len != new_cfg.tp_pref_len
+      || (cfg->tp_pref_len > 0
+          && memcmp (cfg->tp_pref, new_cfg.tp_pref, cfg->tp_pref_len) != 0))
     {
+      free (cfg->tp_pref);
+      cfg->tp_mask = new_cfg.tp_mask;
+      cfg->tp_pref_len = new_cfg.tp_pref_len;
+      cfg->tp_pref_cap = new_cfg.tp_pref_cap;
+      cfg->tp_pref = new_cfg.tp_pref;
+      new_cfg.tp_pref = NULL;
+      new_cfg.tp_pref_cap = 0;
+      new_cfg.tp_pref_len = 0;
+      fprintf (stderr, "main: reloaded transport mode\n");
+    }
+  if (cfg->bogon_cnt != new_cfg.bogon_cnt
+      || (cfg->bogon_cnt > 0
+          && memcmp (cfg->bogon_arr, new_cfg.bogon_arr,
+                     sizeof (*cfg->bogon_arr) * cfg->bogon_cnt)
+                 != 0))
+    {
+      free (cfg->bogon_arr);
       cfg->bogon_cnt = new_cfg.bogon_cnt;
-      memcpy (cfg->bogon_arr, new_cfg.bogon_arr, sizeof (cfg->bogon_arr));
+      cfg->bogon_cap = new_cfg.bogon_cap;
+      cfg->bogon_arr = new_cfg.bogon_arr;
+      new_cfg.bogon_arr = NULL;
+      new_cfg.bogon_cap = 0;
+      new_cfg.bogon_cnt = 0;
       bogon_cfg_apply (cfg);
       fprintf (stderr, "main: reloaded bogon filter\n");
     }
@@ -964,8 +1024,14 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       cry_init (cry_ctx, cfg->psk);
       fprintf (stderr, "main: reloaded psk\n");
     }
-  P peers[RT_MAX];
-  int peer_cnt = p_arr_ld (cfg_path, peers, RT_MAX);
+  P *peers = NULL;
+  int peer_cnt = 0;
+  if (p_arr_load (cfg_path, &peers, &peer_cnt) != 0)
+    {
+      fprintf (stderr, "main: failed to reload peer list from config\n");
+      cfg_free (&new_cfg);
+      return;
+    }
   int add_cnt = 0;
   for (int i = 0; i < peer_cnt; i++)
     {
@@ -978,15 +1044,16 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       ne.state = RT_PND;
       ne.rto = RTO_INIT;
       rt_upd (rt, &ne, ts);
-      if (!pool_has_peer (pool, peers[i].ip, peers[i].port)
-          && pool->cnt < PEER_MAX)
+      if (!pool_has_peer (pool, peers[i].ip, peers[i].port))
         {
-          memcpy (pool->re_arr[pool->cnt].ip, peers[i].ip, 16);
-          pool->re_arr[pool->cnt].port = peers[i].port;
-          pool->cnt++;
-          add_cnt++;
+          int old_cnt = pool->cnt;
+          pp_add (pool, peers[i].ip, peers[i].port);
+          if (pool->cnt > old_cnt)
+            add_cnt++;
         }
     }
+  free (peers);
+  cfg_free (&new_cfg);
   fprintf (stderr, "main: config reloaded, peers loaded=%d, peers added=%d\n",
            peer_cnt, add_cnt);
 }
@@ -999,8 +1066,10 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
     return 1;
 
   int rc = 1;
-  Cfg cfg = *cfg_in;
-  static PPool pool;
+  Cfg cfg;
+  if (cfg_cpy (&cfg, cfg_in) != 0)
+    return 1;
+  PPool pool;
   pp_init (&pool, cfg_path);
   Rt rt;
   rt_init (&rt);
@@ -1013,6 +1082,8 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   memset (&udp, 0, sizeof (udp));
   udp.fd = -1;
   bool udp_inited = false;
+  TpRt tp_rt;
+  bool tp_inited = false;
   static TapPipe tap_pipe;
   bool tap_pipe_inited = false;
   bool tap_inline = false;
@@ -1035,8 +1106,13 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   bool u_w_watch = false;
   bool stdin_watch = false;
 
-  P peers[RT_MAX];
-  int peer_cnt = p_arr_ld (cfg_path, peers, RT_MAX);
+  P *peers = NULL;
+  int peer_cnt = 0;
+  if (p_arr_load (cfg_path, &peers, &peer_cnt) != 0)
+    {
+      fprintf (stderr, "main: failed to load static peers from config\n");
+      goto out;
+    }
   uint64_t init_ts = sys_ts ();
   for (int i = 0; i < peer_cnt; i++)
     {
@@ -1059,13 +1135,10 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
               break;
             }
         }
-      if (!is_dup && pool.cnt < PEER_MAX)
-        {
-          memcpy (pool.re_arr[pool.cnt].ip, peers[i].ip, 16);
-          pool.re_arr[pool.cnt].port = peers[i].port;
-          pool.cnt++;
-        }
+      if (!is_dup)
+        pp_add (&pool, peers[i].ip, peers[i].port);
     }
+  free (peers);
 
   Cry cry_ctx;
   cry_init (&cry_ctx, cfg.psk);
@@ -1118,7 +1191,13 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
     uint16_t hw_mtu = udp_mtu_get (&udp);
     rt_pmtu_ub_set (&rt, hw_mtu);
   }
-  rt_loc_add (&rt, cfg.addr, act_port, sys_ts ());
+  rt_loc_add (&rt, cfg.addr, act_port, cfg.tp_mask, sys_ts ());
+  if (tp_rt_init (&tp_rt, act_port) != 0)
+    {
+      fprintf (stderr, "main: failed to bind tcp port %u\n", act_port);
+      goto out;
+    }
+  tp_inited = true;
 
   if (!tap_inline)
     {
@@ -1156,6 +1235,14 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
       perror ("main: epoll add udp failed");
       goto out;
     }
+  ev.events = EPOLLIN;
+  ev.data.u64 = TP_EV_LISTEN;
+  if (epoll_ctl (epfd, EPOLL_CTL_ADD, tp_rt_listen_fd_get (&tp_rt), &ev) != 0)
+    {
+      perror ("main: epoll add tcp listener failed");
+      goto out;
+    }
+  tp_glb_bind (&tp_rt, epfd, &cry_ctx, &cfg, sid);
 
   timer_fd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   if (timer_fd < 0)
@@ -1267,6 +1354,13 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   if (ready_fn)
     ready_fn (ready_arg);
   rc = 0;
+  LoopRxCtx tcp_rx_ctx = { .tap_fd = tap_fd,
+                           .udp = &udp,
+                           .cry_ctx = &cry_ctx,
+                           .rt = &rt,
+                           .cfg = &cfg,
+                           .sid = sid,
+                           .pool = &pool };
 
   struct epoll_event ev_arr[EV_MAX];
   while (1)
@@ -1315,10 +1409,22 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
                 (void)udp_w_hnd (&udp);
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
             }
+          else if (tok == TP_EV_LISTEN)
+            {
+              tp_rt_accept_ready (&tp_rt, epfd);
+            }
+          else if ((tok & TP_EV_CONN_BASE) == TP_EV_CONN_BASE)
+            {
+              tp_rt_conn_ready (&tp_rt, epfd, (int)(tok & 0xffffffffU),
+                                ev_arr[i].events, &rt, &cfg, on_tcp_frame,
+                                &tcp_rx_ctx);
+              udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
+            }
           else if (tok == ID_TMR)
             {
               on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
                       &pool);
+              tp_rt_tick (&tp_rt, &rt, &cfg);
               if (!tap_inline)
                 tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
               udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
@@ -1361,6 +1467,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
     }
 
 out:
+  tp_glb_unbind ();
   if (cfg_ifd >= 0)
     close (cfg_ifd);
   if (timer_fd >= 0)
@@ -1369,6 +1476,8 @@ out:
     close (epfd);
   if (tap_pipe_inited)
     tap_pipe_free (&tap_pipe);
+  if (tp_inited)
+    tp_rt_free (&tp_rt);
   if (udp_inited)
     udp_free (&udp);
   if (tap_fd >= 0)
@@ -1376,6 +1485,8 @@ out:
   if (tap_created)
     tap_iface_cleanup (cfg.ifname);
   rt_free (&rt);
+  pp_free (&pool);
+  cfg_free (&cfg);
   g_rt = NULL;
   return rc;
 }
@@ -1389,6 +1500,7 @@ typedef struct
   uint16_t pmtu;
   RtDecT type;
   uint8_t rel_f;
+  bool use_tcp;
   bool is_val;
 } TapTxPath;
 
@@ -1472,8 +1584,10 @@ typedef struct
 {
   uint64_t l_nh_ts;
   TapFast fast_path[256];
-  uint8_t flood_lla[256][16];
-  TapFloodEp flood_ep[256];
+  uint8_t (*flood_lla)[16];
+  size_t flood_lla_cap;
+  TapFloodEp *flood_ep;
+  size_t flood_ep_cap;
   uint8_t (*frag_bufs)[UDP_PL_MAX + TAP_HR];
   uint8_t (*uso_bufs)[TAP_F_MAX + TAP_HR + TAP_TR];
   UdpMsg *batch_arr;
@@ -1493,6 +1607,33 @@ buf_alloc_align (size_t align, size_t size)
     return NULL;
   memset (ptr, 0, size);
   return ptr;
+}
+
+static bool
+loop_arr_rsv (void **arr, size_t *cap, size_t need, size_t elem_sz)
+{
+  if (!arr || !cap)
+    return false;
+  if (need <= *cap)
+    return true;
+  size_t new_cap = *cap ? *cap : 1;
+  while (new_cap < need)
+    {
+      if (new_cap > (SIZE_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  if (elem_sz == 0 || new_cap > (SIZE_MAX / elem_sz))
+    return false;
+  void *new_arr = realloc (*arr, elem_sz * new_cap);
+  if (!new_arr)
+    return false;
+  *arr = new_arr;
+  *cap = new_cap;
+  return true;
 }
 
 static TapRun *
@@ -2006,7 +2147,7 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
 {
   pthread_once (&g_tso_par_once, tap_tso_par_boot);
   if (!g_tso_par.is_on || !udp || !cry_ctx || !rt || !cfg || !tso || !tx_path
-      || !tx_path->is_val || tx_path->type == RT_NONE)
+      || !tx_path->is_val || tx_path->type == RT_NONE || tx_path->use_tcp)
     return 0;
   uint16_t max_vnet = tnl_vnet_cap_get (tx_path->pmtu, tx_path->tx_ip);
   int seg_cnt = (int)((tso->pl_len + tso->seg_pl - 1U) / tso->seg_pl);
@@ -2146,7 +2287,7 @@ tap_data_fast_bld_cnt (Cry *cry_ctx, const TapTxPath *tx_path, uint64_t cnt,
                        uint8_t *vnet_frame, size_t vnet_len, UdpMsg *msg)
 {
   if (!cry_ctx || !tx_path || !tx_path->is_val || tx_path->type == RT_NONE
-      || !vnet_frame || !msg)
+      || tx_path->use_tcp || !vnet_frame || !msg)
     return false;
   size_t out_len = 0;
   uint8_t *out_ptr = data_bld_zc_cnt (cry_ctx, vnet_frame, vnet_len,
@@ -2198,6 +2339,15 @@ frame_l3_info_get (const uint8_t *frame_pkt, size_t frame_len, size_t *l3_off,
       *eth_type = (uint16_t)(((uint16_t)frame_pkt[16] << 8) | frame_pkt[17]);
       *l3_off = ETH_HLEN + 4U;
     }
+}
+
+static bool
+tap_tx_use_tcp (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
+                uint16_t port)
+{
+  if (!cfg || !ip || port == 0)
+    return false;
+  return cfg_tp_pick (cfg, rt_ep_tp_mask (rt, ip, port)) == TP_PROTO_TCP;
 }
 
 static bool
@@ -2289,6 +2439,7 @@ tap_tx_path_fit (Rt *rt, const Cfg *cfg, uint64_t now, const uint8_t *frame_pkt,
       fast_path[fp_idx].is_val = false;
       return true;
     }
+  tx_path->use_tcp = tap_tx_use_tcp (rt, cfg, tx_path->tx_ip, tx_path->tx_port);
   tx_path->pmtu = tx_path_pmtu_get (cfg, tx_path->tx_ip, rt_mtu (rt, &dec));
   memcpy (fast_path[fp_idx].dest_lla, tx_path->rt_key, 16);
   fast_path[fp_idx].tx_path = *tx_path;
@@ -2351,11 +2502,15 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
       size_t out_len;
       uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_frame, vnet_len, 0, 32, &out_len);
       static const uint8_t z_lla[16] = { 0 };
+      size_t flood_need = (rt->cnt > 0) ? (size_t)rt->cnt : 1U;
+      if (!loop_arr_rsv ((void **)&tap_run->flood_lla, &tap_run->flood_lla_cap,
+                         flood_need, sizeof (*tap_run->flood_lla))
+          || !loop_arr_rsv ((void **)&tap_run->flood_ep, &tap_run->flood_ep_cap,
+                            flood_need, sizeof (*tap_run->flood_ep)))
+        return false;
       uint8_t (*uniq_lla)[16] = tap_run->flood_lla;
-      int uniq_cap
-          = (int)(sizeof (tap_run->flood_lla) / sizeof (tap_run->flood_lla[0]));
       int u_cnt = 0;
-      for (uint32_t ri = 0; ri < rt->cnt && u_cnt < uniq_cap; ri++)
+      for (uint32_t ri = 0; ri < rt->cnt; ri++)
         {
           Re *re = &rt->re_arr[ri];
           if (!re->is_act || re->state == RT_DED)
@@ -2377,9 +2532,8 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
             memcpy (uniq_lla[u_cnt++], re->lla, 16);
         }
       TapFloodEp *ep_arr = tap_run->flood_ep;
-      int ep_cap = (int)(sizeof (tap_run->flood_ep) / sizeof (tap_run->flood_ep[0]));
       int ep_cnt = 0;
-      for (int u = 0; u < u_cnt && ep_cnt < ep_cap; u++)
+      for (int u = 0; u < u_cnt; u++)
         {
           RtDec sel = rt_sel (rt, uniq_lla[u], cfg->p2p == P2P_EN);
           uint8_t ep_ip[16] = { 0 };
@@ -2430,17 +2584,12 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
         }
       for (int re = 0; re < ep_cnt; re++)
         {
-          if (*bc >= BATCH_MAX
-              && !tap_batch_fls (udp, batch_arr, bc,
-                                 "udp: batch send failed before enqueue multicast"))
-            return false;
-          memcpy (batch_arr[*bc].dst_ip, ep_arr[re].ip, 16);
-          batch_arr[*bc].dst_port = ep_arr[re].port;
-          batch_arr[*bc].data = out_ptr;
-          batch_arr[*bc].data_len = out_len;
-          (*bc)++;
-          rt_tx_ack (rt, ep_arr[re].ip, ep_arr[re].port, now);
-          g_tx_ts = now;
+          if (tp_send (udp, rt, cfg, ep_arr[re].ip, ep_arr[re].port, out_ptr,
+                       out_len))
+            {
+              rt_tx_ack (rt, ep_arr[re].ip, ep_arr[re].port, now);
+              g_tx_ts = now;
+            }
         }
       return true;
     }
@@ -2500,18 +2649,34 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
     {
       size_t out_len;
       uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f, 32, &out_len);
-      if (*bc >= BATCH_MAX
-          && !tap_batch_fls (udp, batch_arr, bc,
-                             "udp: batch send failed before enqueue data"))
-        return false;
-      memcpy (batch_arr[*bc].dst_ip, tx_ip, 16);
-      batch_arr[*bc].dst_port = tx_port;
-      batch_arr[*bc].data = out_ptr;
-      batch_arr[*bc].data_len = out_len;
-      (*bc)++;
-      if (tx_ack_apply)
-        rt_tx_ack (rt, tx_ip, tx_port, now);
-      g_tx_ts = now;
+      if (tx_path_lcl.use_tcp)
+        {
+          if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+            {
+              if (tx_ack_apply)
+                rt_tx_ack (rt, tx_ip, tx_port, now);
+              g_tx_ts = now;
+            }
+          else
+            {
+              return false;
+            }
+        }
+      else
+        {
+          if (*bc >= BATCH_MAX
+              && !tap_batch_fls (udp, batch_arr, bc,
+                                 "udp: batch send failed before enqueue data"))
+            return false;
+          memcpy (batch_arr[*bc].dst_ip, tx_ip, 16);
+          batch_arr[*bc].dst_port = tx_port;
+          batch_arr[*bc].data = out_ptr;
+          batch_arr[*bc].data_len = out_len;
+          (*bc)++;
+          if (tx_ack_apply)
+            rt_tx_ack (rt, tx_ip, tx_port, now);
+          g_tx_ts = now;
+        }
     }
   else
     {
@@ -2527,14 +2692,15 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
       size_t off = 0;
       while (off < vnet_len)
         {
-          if (*bc + 1 > BATCH_MAX
+          if (!tx_path_lcl.use_tcp && *bc + 1 > BATCH_MAX
               && !tap_batch_fls (udp, batch_arr, bc,
                                  "udp: batch send failed during frag flush"))
             return false;
           size_t chunk_len = vnet_len - off;
           if (chunk_len > chunk_max)
             chunk_len = chunk_max;
-          uint8_t *chunk_dst1 = frag_bufs[*bc] + TAP_HR + PKT_HDR_SZ
+          uint8_t *chunk_dst1
+              = frag_bufs[tx_path_lcl.use_tcp ? 0 : *bc] + TAP_HR + PKT_HDR_SZ
                                 + sizeof (FragHdr) + ((rel_f != 0) ? 4U : 0U);
           memcpy (chunk_dst1, vnet_frame + off, chunk_len);
           if (off > 0x7fffU)
@@ -2550,14 +2716,30 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
               off += chunk_len;
               continue;
             }
-          memcpy (batch_arr[*bc].dst_ip, tx_ip, 16);
-          batch_arr[*bc].dst_port = tx_port;
-          batch_arr[*bc].data = out_ptr;
-          batch_arr[*bc].data_len = out_len;
-          (*bc)++;
-          if (tx_ack_apply)
-            rt_tx_ack (rt, tx_ip, tx_port, now);
-          g_tx_ts = now;
+          if (tx_path_lcl.use_tcp)
+            {
+              if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+                {
+                  if (tx_ack_apply)
+                    rt_tx_ack (rt, tx_ip, tx_port, now);
+                  g_tx_ts = now;
+                }
+              else
+                {
+                  return false;
+                }
+            }
+          else
+            {
+              memcpy (batch_arr[*bc].dst_ip, tx_ip, 16);
+              batch_arr[*bc].dst_port = tx_port;
+              batch_arr[*bc].data = out_ptr;
+              batch_arr[*bc].data_len = out_len;
+              (*bc)++;
+              if (tx_ack_apply)
+                rt_tx_ack (rt, tx_ip, tx_port, now);
+              g_tx_ts = now;
+            }
           off += chunk_len;
         }
     }
@@ -2630,7 +2812,8 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                   && !tap_batch_fls (udp, tap_run->batch_arr, &tap_run->bc,
                                      "udp: batch send failed during tso flush"))
                 return false;
-              tap_tx_mark (rt, now, &tx_path);
+              if (!tx_path.use_tcp)
+                tap_tx_mark (rt, now, &tx_path);
               tap_rel_pulse (udp, cry_ctx, rt, cfg, now, sid, &tx_path);
               return true;
             }
@@ -2642,7 +2825,8 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       size_t tso_len = 0;
       while (tap_tso_seg (&tso, tap_run->uso_bufs[tso_i] + TAP_HR, &tso_len))
         {
-          if (has_tx_path && max_vnet > 0 && tso_len <= max_vnet)
+          if (has_tx_path && !tx_path.use_tcp && max_vnet > 0
+              && tso_len <= max_vnet)
             {
               if (!tap_data_fast (udp, cry_ctx, &tx_path, now,
                                   tap_run->uso_bufs[tso_i] + TAP_HR, tso_len,
@@ -2672,7 +2856,8 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         return false;
       if (has_tx_path)
         {
-          tap_tx_mark (rt, now, &tx_path);
+          if (!tx_path.use_tcp)
+            tap_tx_mark (rt, now, &tx_path);
           tap_rel_pulse (udp, cry_ctx, rt, cfg, now, sid, &tx_path);
         }
       return true;
@@ -2691,7 +2876,8 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       size_t uso_len = 0;
       while (tap_uso_seg (&uso, tap_run->uso_bufs[uso_i] + TAP_HR, &uso_len))
         {
-          if (has_tx_path && max_vnet > 0 && uso_len <= max_vnet)
+          if (has_tx_path && !tx_path.use_tcp && max_vnet > 0
+              && uso_len <= max_vnet)
             {
               if (!tap_data_fast (udp, cry_ctx, &tx_path, now,
                                   tap_run->uso_bufs[uso_i] + TAP_HR, uso_len,
@@ -2721,7 +2907,8 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         return false;
       if (has_tx_path)
         {
-          tap_tx_mark (rt, now, &tx_path);
+          if (!tx_path.use_tcp)
+            tap_tx_mark (rt, now, &tx_path);
           tap_rel_pulse (udp, cry_ctx, rt, cfg, now, sid, &tx_path);
         }
       return true;
@@ -2756,7 +2943,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       int rd_cnt = 0;
       for (int i = 0; i < BATCH_MAX; i++)
         {
-          if (udp_w_want (udp))
+          if (udp_w_want (udp) || tp_w_want ())
             break;
           uint8_t *pl_ptr = frame_bufs[i] + TAP_HR;
           ssize_t n = read (tap_fd, pl_ptr, TAP_F_MAX);
@@ -2776,9 +2963,380 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         }
       if (!tap_frame_flush (udp))
         break;
-      if (rd_cnt < 0 || udp_w_want (udp) || hit_eagain || rd_cnt < BATCH_MAX)
+      if (rd_cnt < 0 || udp_w_want (udp) || tp_w_want () || hit_eagain
+          || rd_cnt < BATCH_MAX)
         break;
     }
+}
+
+static bool
+rx_src_ep_get (const TpSrc *tp_src, const uint8_t udp_src_ip[16],
+               uint16_t udp_src_port, uint8_t out_ip[16], uint16_t *out_port)
+{
+  if (!out_ip || !out_port)
+    return false;
+  memset (out_ip, 0, 16);
+  *out_port = 0;
+  if (tp_src && tp_src->route_port != 0)
+    {
+      memcpy (out_ip, tp_src->route_ip, 16);
+      *out_port = tp_src->route_port;
+      return true;
+    }
+  if (udp_src_ip && udp_src_port != 0)
+    {
+      memcpy (out_ip, udp_src_ip, 16);
+      *out_port = udp_src_port;
+      return true;
+    }
+  return false;
+}
+
+static void
+on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16],
+               uint16_t udp_src_port, size_t pkt_len, const PktHdr *hdr,
+               uint8_t *pt, size_t pt_len, uint64_t ts)
+{
+  if (!ctx || !ctx->udp || !ctx->cry_ctx || !ctx->rt || !ctx->cfg || !hdr)
+    return;
+
+  int tap_fd = ctx->tap_fd;
+  Udp *udp = ctx->udp;
+  Cry *cry_ctx = ctx->cry_ctx;
+  Rt *rt = ctx->rt;
+  const Cfg *cfg = ctx->cfg;
+  uint64_t sid = ctx->sid;
+  PPool *pool = ctx->pool;
+
+  uint8_t src_ip[16] = { 0 };
+  uint16_t src_port = 0;
+  bool has_src = rx_src_ep_get (tp_src, udp_src_ip, udp_src_port, src_ip,
+                                &src_port);
+
+  if (hdr->pkt_type == PT_DATA)
+    {
+      g_rx_ts = ts;
+      if (pt_len < VNET_HL + ETH_HLEN)
+        return;
+      if (hdr->rel_f == 0)
+        {
+          if (cfg->p2p != P2P_EN
+              && !rt_static_peer_has (rt, tp_src ? tp_src->peer_lla : NULL,
+                                      has_src ? src_ip : NULL, src_port))
+            return;
+          if (has_src && rt_dat_upd (rt, src_ip, src_port, ts))
+            {
+              const uint8_t *frame = pt + VNET_HL;
+              uint8_t src_lla[16] = { 0 };
+              if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
+                   || mesh_src_lla_from_ip6 (frame, pt_len - VNET_HL,
+                                             src_lla))
+                  && memcmp (src_lla, cfg->addr, 16) != 0
+                  && cfg->p2p == P2P_EN)
+                {
+                  rt_ep_upd (rt, src_lla, src_ip, src_port, ts);
+                }
+            }
+          gro_fed (tap_fd, pt, pt_len);
+          return;
+        }
+      if (hdr->hop_c <= 1)
+        {
+          fprintf (stderr,
+                   "routing: drop: ttl expired, routing loop detected\n");
+          return;
+        }
+      uint8_t dest_lla[16] = { 0 };
+      const uint8_t *frame = pt + VNET_HL;
+      if (!mesh_dst_lla_from_frame (frame, cfg->addr, dest_lla))
+        return;
+      if (memcmp (dest_lla, cfg->addr, 16) == 0)
+        {
+          gro_fed (tap_fd, pt, pt_len);
+        }
+      else if (has_src)
+        {
+          rel_fwd_dat (udp, cry_ctx, rt, cfg, dest_lla, pt, pt_len,
+                       (uint8_t)(hdr->hop_c - 1), ts, src_ip, src_port);
+        }
+      return;
+    }
+
+  if (ctrl_pkt_is (hdr->pkt_type))
+    rt->ctrl_rx_b += (uint64_t)pkt_len;
+
+  switch (hdr->pkt_type)
+    {
+    case PT_FRAG:
+      {
+        g_rx_ts = ts;
+        const uint8_t *payload = pt;
+        size_t payload_len = pt_len;
+        uint8_t dest_lla[16] = { 0 };
+        if (hdr->rel_f != 0)
+          {
+            if (payload_len < 4 + sizeof (FragHdr))
+              break;
+            if (hdr->hop_c <= 1)
+              {
+                fprintf (stderr,
+                         "routing: drop: ttl expired, routing loop detected\n");
+                break;
+              }
+            memcpy (dest_lla, cfg->addr, 16);
+            memcpy (dest_lla + 12, payload, 4);
+            payload += 4;
+            payload_len -= 4;
+          }
+        if (payload_len < sizeof (FragHdr))
+          break;
+        uint32_t msg_id = ((uint32_t)payload[0] << 24)
+                          | ((uint32_t)payload[1] << 16)
+                          | ((uint32_t)payload[2] << 8)
+                          | (uint32_t)payload[3];
+        uint16_t off_mf
+            = (uint16_t)(((uint16_t)payload[4] << 8) | payload[5]);
+        uint16_t frag_off = (uint16_t)(off_mf & 0x7fffU);
+        bool mf = (off_mf & 0x8000U) != 0;
+        const uint8_t *chunk = payload + sizeof (FragHdr);
+        size_t chunk_len = payload_len - sizeof (FragHdr);
+        if (hdr->rel_f != 0 && memcmp (dest_lla, cfg->addr, 16) != 0)
+          {
+            if (has_src)
+              relay_fwd_frag (udp, cry_ctx, rt, cfg, dest_lla, msg_id, frag_off,
+                              mf, chunk, chunk_len,
+                              (uint8_t)(hdr->hop_c - 1), ts, src_ip, src_port);
+            break;
+          }
+        if (hdr->rel_f == 0
+            && cfg->p2p != P2P_EN
+            && !rt_static_peer_has (rt, tp_src ? tp_src->peer_lla : NULL,
+                                    has_src ? src_ip : NULL, src_port))
+          break;
+        if (!has_src)
+          break;
+        uint16_t full_len = 0;
+        uint8_t *full_l3
+            = frag_asm (src_ip, msg_id, frag_off, mf, chunk, chunk_len,
+                        &full_len);
+        if (!full_l3 || full_len < VNET_HL + ETH_HLEN)
+          break;
+        if (rt_dat_upd (rt, src_ip, src_port, ts))
+          {
+            const uint8_t *frame = full_l3 + VNET_HL;
+            uint8_t src_lla[16] = { 0 };
+            if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
+                 || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL, src_lla))
+                && memcmp (src_lla, cfg->addr, 16) != 0
+                && cfg->p2p == P2P_EN)
+              {
+                rt_ep_upd (rt, src_lla, src_ip, src_port, ts);
+              }
+          }
+        gro_fed (tap_fd, full_l3, full_len);
+        break;
+      }
+    case PT_MTU_PRB:
+      {
+        if (!has_src)
+          break;
+        uint32_t probe_id = 0;
+        uint16_t probe_mtu = 0;
+        if (gsp_prs_mtu_prb (pt, pt_len, &probe_id, &probe_mtu) != 0)
+          break;
+        static uint8_t ack_buf[UDP_PL_MAX];
+        size_t ack_len = 0;
+        mtu_ack_bld (cry_ctx, probe_id, probe_mtu, ack_buf, &ack_len);
+        for (uint32_t ack = 0; ack < RT_PRB_BST; ack++)
+          {
+            if (!ctrl_send (udp, rt, cfg, tp_src, src_ip, src_port, ack_buf,
+                            ack_len))
+              break;
+            ctrl_tx_mark (rt, NULL, ack_len, src_ip, src_port, ts);
+          }
+        break;
+      }
+    case PT_MTU_ACK:
+      {
+        if (!has_src)
+          break;
+        uint32_t probe_id = 0;
+        uint16_t probe_mtu = 0;
+        if (gsp_prs_mtu_ack (pt, pt_len, &probe_id, &probe_mtu) != 0)
+          break;
+        rt_pmtu_ack_ep (rt, src_ip, src_port, probe_id, probe_mtu, ts);
+        break;
+      }
+    case PT_STAT_REQ:
+      {
+        if (!has_src || !is_ip_loopback (src_ip))
+          break;
+        uint32_t req_id = 0;
+        if (gsp_prs_stat_req (pt, pt_len, &req_id) != 0)
+          break;
+        uint16_t txt_cap = UINT16_MAX;
+        char *txt = calloc (1, (size_t)txt_cap + 1U);
+        if (!txt)
+          break;
+        size_t txt_len
+            = status_buf_bld (txt, (size_t)txt_cap + 1U, rt, cfg, pool);
+        if (txt_len > txt_cap)
+          txt_len = txt_cap;
+        status_rsp_tx_local (cry_ctx, src_ip, src_port, req_id, txt, txt_len);
+        free (txt);
+        break;
+      }
+    case PT_PING:
+      {
+        uint64_t req_ts = 0;
+        uint64_t peer_sid = 0;
+        uint64_t prb_tok = 0;
+        uint8_t peer_lla[16];
+        if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &prb_tok) != 0)
+          break;
+        if (hdr->rel_f == 0
+            && !p2p_direct_peer_ok (cfg, rt, peer_lla,
+                                    has_src ? src_ip : NULL, src_port))
+          break;
+        if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
+          rx_rp_rst_lla (rt, peer_lla);
+        if (hdr->rel_f == 0 && has_src)
+          rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
+        if (cfg->p2p == P2P_EN && hdr->rel_f == 0 && has_src
+            && !p_is_me (rt, cfg->addr, src_ip, src_port))
+          pp_add (pool, src_ip, src_port);
+        static uint8_t pong_buf[UDP_PL_MAX];
+        size_t pong_len = 0;
+        pong_bld (cry_ctx, cfg->addr, req_ts, sid, ts, prb_tok, pong_buf,
+                  &pong_len);
+        if (ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL, src_port,
+                       pong_buf, pong_len))
+          ctrl_tx_mark (rt, &rt->pong_tx_cnt, pong_len,
+                        has_src ? src_ip : NULL, src_port, ts);
+        break;
+      }
+    case PT_PONG:
+      {
+        uint64_t req_ts = 0;
+        uint64_t peer_sid = 0;
+        uint64_t peer_rx_ts = 0;
+        uint64_t prb_tok = 0;
+        uint8_t peer_lla[16];
+        if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_rx_ts,
+                     &prb_tok)
+            != 0)
+          break;
+        if (hdr->rel_f == 0
+            && !p2p_direct_peer_ok (cfg, rt, peer_lla,
+                                    has_src ? src_ip : NULL, src_port))
+          break;
+        if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
+          rx_rp_rst_lla (rt, peer_lla);
+        if (hdr->rel_f == 0 && has_src)
+          rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
+        uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
+        if (rtt == 0)
+          rtt = 1;
+        (void)peer_rx_ts;
+        if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, ts) && has_src)
+          rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
+        if (cfg->p2p == P2P_EN && hdr->rel_f == 0 && has_src
+            && !p_is_me (rt, cfg->addr, src_ip, src_port))
+          pp_add (pool, src_ip, src_port);
+        break;
+      }
+    case PT_GSP:
+      {
+        if (!has_src)
+          break;
+        bool is_mod = false;
+        bool req_seq = false;
+        uint8_t seq_tgt[16] = { 0 };
+        on_gsp (pt, pt_len, src_ip, src_port, cfg->addr, rt, pool,
+                cfg->p2p == P2P_EN, ts, &is_mod, &req_seq, seq_tgt);
+        if (is_mod)
+          rt_gsp_dirty_set (rt, "on_gsp (is_mod)");
+        if (req_seq)
+          {
+            static uint8_t req_buf[UDP_PL_MAX];
+            size_t req_len = 0;
+            seq_req_bld (cry_ctx, seq_tgt, req_buf, &req_len);
+            if (ctrl_send (udp, rt, cfg, tp_src, src_ip, src_port, req_buf,
+                           req_len))
+              ctrl_tx_mark (rt, &rt->seqreq_tx_cnt, req_len, src_ip, src_port,
+                            ts);
+          }
+        break;
+      }
+    case PT_SEQ_REQ:
+      {
+        if (!has_src)
+          break;
+        uint8_t tgt_lla[16];
+        if (on_seq_req (pt, pt_len, tgt_lla) != 0)
+          break;
+        if (memcmp (tgt_lla, cfg->addr, 16) != 0)
+          break;
+        bool is_bump = false;
+        for (uint32_t j = 0; j < rt->cnt; j++)
+          {
+            if (memcmp (rt->re_arr[j].lla, cfg->addr, 16) == 0)
+              {
+                rt->re_arr[j].seq++;
+                is_bump = true;
+              }
+          }
+        if (!is_bump)
+          break;
+        static uint8_t dt_buf[UDP_PL_MAX];
+        size_t dt_len = 0;
+        gsp_dt_bld (cry_ctx, rt, tgt_lla, cfg->addr, cfg->p2p == P2P_EN,
+                    dt_buf, &dt_len);
+        if (dt_len > 0
+            && ctrl_send (udp, rt, cfg, tp_src, src_ip, src_port, dt_buf,
+                          dt_len))
+          ctrl_tx_mark (rt, &rt->gsp_dt_tx_cnt, dt_len, src_ip, src_port, ts);
+        break;
+      }
+    case PT_HP:
+      {
+        if (cfg->p2p == P2P_EN)
+          on_hp (pt, pt_len, cry_ctx, udp, rt, cfg, cfg->addr, sid, ts);
+        break;
+      }
+    }
+}
+
+static void
+on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
+{
+  LoopRxCtx *ctx = arg;
+  if (!ctx || !ctx->cry_ctx || !frame || len == 0)
+    return;
+
+  uint64_t ts = sys_ts ();
+  static uint64_t l_reap_ts = 0;
+  if (ts >= l_reap_ts + 50ULL)
+    {
+      frag_reap_tk (ts);
+      l_reap_ts = ts;
+    }
+
+  uint8_t src_ip[16] = { 0 };
+  uint16_t src_port = 0;
+  if (rx_src_ep_get (src, NULL, 0, src_ip, &src_port))
+    rt_rx_ack (ctx->rt, src_ip, src_port, ts);
+
+  uint8_t pt_buf[UDP_PL_MAX];
+  PktHdr hdr;
+  uint8_t *pt = NULL;
+  size_t pt_len = 0;
+  if (pkt_dec (ctx->cry_ctx, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf),
+               &hdr, &pt, &pt_len)
+      != 0)
+    return;
+  on_rx_dec_pkt (ctx, src, NULL, 0, len, &hdr, pt, pt_len, ts);
+  gro_fls_all (ctx->tap_fd);
 }
 
 void
@@ -2787,6 +3345,13 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 {
   static UdpRxPkt pkt_arr[BATCH_MAX];
   static UdpDecRes dec_arr[BATCH_MAX];
+  LoopRxCtx ctx = { .tap_fd = tap_fd,
+                    .udp = udp,
+                    .cry_ctx = cry_ctx,
+                    .rt = rt,
+                    .cfg = cfg,
+                    .sid = sid,
+                    .pool = pool };
   for (;;)
     {
       int rc = udp_rx_pkt_arr (udp, pkt_arr, BATCH_MAX);
@@ -2830,306 +3395,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               = is_ip_loopback (src_ip) && hdr->pkt_type == PT_STAT_REQ;
           if (!bypass_replay && !rx_rp_chk (raw_buf + PKT_CH_SZ))
             continue;
-
-          if (hdr->pkt_type == PT_DATA)
-            {
-              g_rx_ts = ts;
-              if (pt_len < VNET_HL + ETH_HLEN)
-                continue;
-              if (hdr->rel_f == 0)
-                {
-                  if (cfg->p2p != P2P_EN
-                      && !rt_static_ep_has (rt, src_ip, src_port))
-                    continue;
-                  if (rt_dat_upd (rt, src_ip, src_port, ts))
-                    {
-                      const uint8_t *frame = pt + VNET_HL;
-                      uint8_t src_lla[16] = { 0 };
-                      if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
-                           || mesh_src_lla_from_ip6 (frame, pt_len - VNET_HL,
-                                                     src_lla))
-                          && memcmp (src_lla, cfg->addr, 16) != 0
-                          && cfg->p2p == P2P_EN)
-                        {
-                          rt_ep_upd (rt, src_lla, src_ip, src_port, ts);
-                        }
-                    }
-                  gro_fed (tap_fd, pt, pt_len);
-                  continue;
-                }
-              if (hdr->hop_c <= 1)
-                {
-                  fprintf (stderr,
-                           "routing: drop: ttl expired, routing loop detected\n");
-                  continue;
-                }
-              uint8_t dest_lla[16] = { 0 };
-              const uint8_t *frame = pt + VNET_HL;
-              if (!mesh_dst_lla_from_frame (frame, cfg->addr, dest_lla))
-                continue;
-              if (memcmp (dest_lla, cfg->addr, 16) == 0)
-                {
-                  gro_fed (tap_fd, pt, pt_len);
-                }
-              else
-                {
-                  rel_fwd_dat (udp, cry_ctx, rt, cfg, dest_lla, pt, pt_len,
-                               (uint8_t)(hdr->hop_c - 1), ts, src_ip,
-                               src_port);
-                }
-              continue;
-            }
-
-          if (ctrl_pkt_is (hdr->pkt_type))
-            rt->ctrl_rx_b += (uint64_t)pkt_len;
-
-          switch (hdr->pkt_type)
-            {
-            case PT_FRAG:
-              {
-                g_rx_ts = ts;
-                const uint8_t *payload = pt;
-                size_t payload_len = pt_len;
-                uint8_t dest_lla[16] = { 0 };
-                if (hdr->rel_f != 0)
-                  {
-                    if (payload_len < 4 + sizeof (FragHdr))
-                      break;
-                    if (hdr->hop_c <= 1)
-                      {
-                        fprintf (
-                            stderr,
-                            "routing: drop: ttl expired, routing loop detected\n");
-                        break;
-                      }
-                    memcpy (dest_lla, cfg->addr, 16);
-                    memcpy (dest_lla + 12, payload, 4);
-                    payload += 4;
-                    payload_len -= 4;
-                  }
-                if (payload_len < sizeof (FragHdr))
-                  break;
-                uint32_t msg_id
-                    = ((uint32_t)payload[0] << 24)
-                      | ((uint32_t)payload[1] << 16)
-                      | ((uint32_t)payload[2] << 8)
-                      | (uint32_t)payload[3];
-                uint16_t off_mf
-                    = (uint16_t)(((uint16_t)payload[4] << 8) | payload[5]);
-                uint16_t frag_off = (uint16_t)(off_mf & 0x7fffU);
-                bool mf = (off_mf & 0x8000U) != 0;
-                const uint8_t *chunk = payload + sizeof (FragHdr);
-                size_t chunk_len = payload_len - sizeof (FragHdr);
-                if (hdr->rel_f != 0 && memcmp (dest_lla, cfg->addr, 16) != 0)
-                  {
-                    relay_fwd_frag (udp, cry_ctx, rt, cfg, dest_lla, msg_id,
-                                    frag_off, mf, chunk, chunk_len,
-                                    (uint8_t)(hdr->hop_c - 1), ts, src_ip,
-                                    src_port);
-                    break;
-                  }
-                if (hdr->rel_f == 0 && cfg->p2p != P2P_EN
-                    && !rt_static_ep_has (rt, src_ip, src_port))
-                  break;
-                uint16_t full_len = 0;
-                uint8_t *full_l3 = frag_asm (src_ip, msg_id, frag_off, mf,
-                                             chunk, chunk_len, &full_len);
-                if (!full_l3)
-                  break;
-                if (full_len < VNET_HL + ETH_HLEN)
-                  break;
-                if (rt_dat_upd (rt, src_ip, src_port, ts))
-                  {
-                    const uint8_t *frame = full_l3 + VNET_HL;
-                    uint8_t src_lla[16] = { 0 };
-                    if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
-                         || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL,
-                                                   src_lla))
-                        && memcmp (src_lla, cfg->addr, 16) != 0
-                        && cfg->p2p == P2P_EN)
-                      {
-                        rt_ep_upd (rt, src_lla, src_ip, src_port, ts);
-                      }
-                  }
-                gro_fed (tap_fd, full_l3, full_len);
-                break;
-              }
-            case PT_MTU_PRB:
-              {
-                uint32_t probe_id = 0;
-                uint16_t probe_mtu = 0;
-                if (gsp_prs_mtu_prb (pt, pt_len, &probe_id, &probe_mtu) != 0)
-                  break;
-	                static uint8_t ack_buf[UDP_PL_MAX];
-	                size_t ack_len = 0;
-	                mtu_ack_bld (cry_ctx, probe_id, probe_mtu, ack_buf, &ack_len);
-	                for (uint32_t ack = 0; ack < RT_PRB_BST; ack++)
-	                  udp_tx (udp, src_ip, src_port, ack_buf, ack_len);
-	                rt_tx_ack (rt, src_ip, src_port, ts);
-	                break;
-	              }
-            case PT_MTU_ACK:
-              {
-                uint32_t probe_id = 0;
-                uint16_t probe_mtu = 0;
-                if (gsp_prs_mtu_ack (pt, pt_len, &probe_id, &probe_mtu) != 0)
-                  break;
-                rt_pmtu_ack_ep (rt, src_ip, src_port, probe_id, probe_mtu, ts);
-                break;
-              }
-            case PT_STAT_REQ:
-              {
-                if (!is_ip_loopback (src_ip))
-                  break;
-                uint32_t req_id = 0;
-                if (gsp_prs_stat_req (pt, pt_len, &req_id) != 0)
-                  break;
-                uint16_t txt_cap = UINT16_MAX;
-                char *txt = calloc (1, (size_t)txt_cap + 1U);
-                if (!txt)
-                  break;
-                size_t txt_len = status_buf_bld (txt, (size_t)txt_cap + 1U, rt,
-                                                 cfg, pool);
-                if (txt_len > txt_cap)
-                  txt_len = txt_cap;
-                status_rsp_tx_local (cry_ctx, src_ip, src_port, req_id, txt,
-                                     txt_len);
-                free (txt);
-                break;
-              }
-            case PT_PING:
-              {
-                uint64_t req_ts, peer_sid;
-                uint64_t prb_tok = 0;
-                uint8_t peer_lla[16];
-                if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla,
-                             &prb_tok)
-                    == 0)
-                  {
-                    if (hdr->rel_f == 0
-                        && !p2p_direct_peer_ok (cfg, rt, peer_lla, src_ip,
-                                                src_port))
-                      break;
-                    if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
-                      rx_rp_rst_lla (rt, peer_lla);
-                    if (hdr->rel_f == 0)
-                      rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
-                    if (cfg->p2p == P2P_EN && hdr->rel_f == 0
-                        && !p_is_me (rt, cfg->addr, src_ip, src_port))
-                      {
-                        pp_add (pool, src_ip, src_port);
-                      }
-                    static uint8_t pong_buf[UDP_PL_MAX];
-                    size_t pong_len;
-                    pong_bld (cry_ctx, cfg->addr, req_ts, sid, ts, prb_tok,
-                              pong_buf, &pong_len);
-                    udp_tx (udp, src_ip, src_port, pong_buf, pong_len);
-                    rt->pong_tx_cnt++;
-                    rt->ctrl_tx_b += (uint64_t)pong_len;
-                    rt_tx_ack (rt, src_ip, src_port, ts);
-                  }
-                break;
-              }
-            case PT_PONG:
-              {
-                uint64_t req_ts, peer_sid;
-                uint64_t peer_rx_ts = 0;
-                uint64_t prb_tok = 0;
-                uint8_t peer_lla[16];
-                if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla,
-                             &peer_rx_ts, &prb_tok)
-                    == 0)
-                  {
-                    if (hdr->rel_f == 0
-                        && !p2p_direct_peer_ok (cfg, rt, peer_lla, src_ip,
-                                                src_port))
-                      break;
-                    if (rt_peer_sess (rt, peer_lla, peer_sid, ts))
-                      rx_rp_rst_lla (rt, peer_lla);
-                    if (hdr->rel_f == 0)
-                      rt_ep_upd (rt, peer_lla, src_ip, src_port, ts);
-                    uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
-                    if (rtt == 0)
-                      rtt = 1;
-                    (void)peer_rx_ts;
-                    if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, ts))
-                      {
-                        rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
-                      }
-                    if (cfg->p2p == P2P_EN && hdr->rel_f == 0
-                        && !p_is_me (rt, cfg->addr, src_ip, src_port))
-                      {
-                        pp_add (pool, src_ip, src_port);
-                      }
-                  }
-                break;
-              }
-            case PT_GSP:
-              {
-                bool is_mod = false;
-                bool req_seq = false;
-                uint8_t seq_tgt[16] = { 0 };
-                on_gsp (pt, pt_len, src_ip, src_port, cfg->addr, rt, pool,
-                        cfg->p2p == P2P_EN, ts, &is_mod, &req_seq, seq_tgt);
-                if (is_mod)
-                  {
-                    rt_gsp_dirty_set (rt, "on_gsp (is_mod)");
-                  }
-                if (req_seq)
-                  {
-                    static uint8_t req_buf[UDP_PL_MAX];
-                    size_t req_len = 0;
-                    seq_req_bld (cry_ctx, seq_tgt, req_buf, &req_len);
-                    udp_tx (udp, src_ip, src_port, req_buf, req_len);
-                    rt->seqreq_tx_cnt++;
-                    rt->ctrl_tx_b += (uint64_t)req_len;
-                    rt_tx_ack (rt, src_ip, src_port, ts);
-                  }
-                break;
-              }
-            case PT_SEQ_REQ:
-              {
-                uint8_t tgt_lla[16];
-                if (on_seq_req (pt, pt_len, tgt_lla) == 0)
-                  {
-                    if (memcmp (tgt_lla, cfg->addr, 16) == 0)
-                      {
-                        bool is_bump = false;
-                        for (uint32_t j = 0; j < rt->cnt; j++)
-                          {
-                            if (memcmp (rt->re_arr[j].lla, cfg->addr, 16) == 0)
-                              {
-                                rt->re_arr[j].seq++;
-                                is_bump = true;
-                              }
-                          }
-                        if (is_bump)
-                          {
-                            static uint8_t dt_buf[UDP_PL_MAX];
-                            size_t dt_len = 0;
-                            gsp_dt_bld (cry_ctx, rt, tgt_lla, cfg->addr,
-                                        cfg->p2p == P2P_EN, dt_buf, &dt_len);
-                            if (dt_len > 0)
-                              {
-                                udp_tx (udp, src_ip, src_port, dt_buf, dt_len);
-                                rt->gsp_dt_tx_cnt++;
-                                rt->ctrl_tx_b += (uint64_t)dt_len;
-                                rt_tx_ack (rt, src_ip, src_port, ts);
-                              }
-                          }
-                      }
-                  }
-                break;
-              }
-            case PT_HP:
-              {
-                if (cfg->p2p == P2P_EN)
-                  {
-                    on_hp (pt, pt_len, cry_ctx, udp, rt, cfg->addr, sid, ts);
-                  }
-                break;
-              }
-            }
+          on_rx_dec_pkt (&ctx, NULL, src_ip, src_port, pkt_len, hdr, pt,
+                         pt_len, ts);
         }
       gro_fls_all (tap_fd);
       if (rc < BATCH_MAX && !udp_rx_pending (udp))
@@ -3162,6 +3429,7 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
   if (peer_cnt == 0)
     {
       rt->gsp_dirty = false;
+      rt->gsp_off = 0;
       rt->gsp_last_ts = now;
       return;
     }
@@ -3169,15 +3437,16 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
              (unsigned long)(now - rt->gsp_last_ts)); */
   static uint8_t g_buf[UDP_PL_MAX];
   size_t gsp_len = 0;
-  gsp_bld (cry_ctx, rt, 0, cfg->addr, cfg->p2p == P2P_EN, g_buf, &gsp_len);
+  uint32_t start_off = (rt->cnt > 0) ? (rt->gsp_off % rt->cnt) : 0;
+  gsp_bld (cry_ctx, rt, (int)start_off, cfg->addr, cfg->p2p == P2P_EN, g_buf,
+           &gsp_len);
   if (gsp_len == 0)
     {
       rt->gsp_dirty = false;
+      rt->gsp_off = 0;
       rt->gsp_last_ts = now;
       return;
     }
-  static UdpMsg batch_arr[BATCH_MAX];
-  int bc = 0;
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
       const Re *re = &rt->re_arr[i];
@@ -3189,26 +3458,21 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
         continue;
       if (re->ep_port == 0)
         continue;
-      if (bc >= BATCH_MAX)
-        {
-          udp_tx_arr (udp, batch_arr, bc);
-          rt->gsp_tx_cnt += (uint64_t)bc;
-          rt->ctrl_tx_b += (uint64_t)gsp_len * (uint64_t)bc;
-          bc = 0;
-        }
-      memcpy (batch_arr[bc].dst_ip, re->ep_ip, 16);
-      batch_arr[bc].dst_port = re->ep_port;
-      batch_arr[bc].data = g_buf;
-      batch_arr[bc].data_len = gsp_len;
-      bc++;
+      if (tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, g_buf, gsp_len))
+        ctrl_tx_mark (rt, &rt->gsp_tx_cnt, gsp_len, re->ep_ip, re->ep_port,
+                      now);
     }
-  if (bc > 0)
+  if (rt->cnt > GSP_MAX)
     {
-      udp_tx_arr (udp, batch_arr, bc);
-      rt->gsp_tx_cnt += (uint64_t)bc;
-      rt->ctrl_tx_b += (uint64_t)gsp_len * (uint64_t)bc;
+      uint32_t next_off = start_off + GSP_MAX;
+      rt->gsp_off = (next_off < rt->cnt) ? next_off : 0;
+      rt->gsp_dirty = rt->gsp_off != 0;
     }
-  rt->gsp_dirty = false;
+  else
+    {
+      rt->gsp_off = 0;
+      rt->gsp_dirty = false;
+    }
   rt->gsp_last_ts = now;
 }
 
@@ -3274,7 +3538,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   if (rt->loc_last_ts == 0 || ts < rt->loc_last_ts
       || (ts - rt->loc_last_ts) >= ((uint64_t)UPD_TK * 1000ULL))
     {
-      rt_loc_add (rt, cfg->addr, act_port, ts);
+      rt_loc_add (rt, cfg->addr, act_port, cfg->tp_mask, ts);
       rt->loc_last_ts = ts;
     }
   rt_prn_st (rt, ts);
@@ -3338,8 +3602,9 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                      : (size_t)PKT_HDR_SZ;
           mtu_prb_bld (cry_ctx, probe_id, prb_mtu, t_pl_len, prb_buf,
                        &probe_len);
-          udp_tx (udp, prb_re.ep_ip, prb_re.ep_port, prb_buf, probe_len);
-          rt_tx_ack (rt, prb_re.ep_ip, prb_re.ep_port, ts);
+          if (tp_send_ctrl (udp, rt, cfg, prb_re.ep_ip, prb_re.ep_port,
+                            prb_buf, probe_len))
+            rt_tx_ack (rt, prb_re.ep_ip, prb_re.ep_port, ts);
         }
     }
   ctrl_rate_upd (rt, ts);
@@ -3444,7 +3709,15 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
     uint8_t ip[16];
     uint16_t port;
   } UnmappedEp;
-  UnmappedEp um_arr[256];
+  UnmappedEp *um_arr = NULL;
+  size_t um_cap = 0;
+  size_t base_need = (rt->cnt > 0) ? (size_t)rt->cnt : 1U;
+  if (!loop_arr_rsv ((void **)&um_arr, &um_cap, base_need, sizeof (*um_arr)))
+    {
+      STATUS_PUT ("status: out of memory while building route tables\n");
+      len = (len < cap) ? len : cap;
+      return len;
+    }
 
   for (uint32_t re_idx = 0; re_idx < rt->cnt; re_idx++)
     {
@@ -3478,7 +3751,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               break;
             }
         }
-      if (!is_dup && um_cnt < 256)
+      if (!is_dup)
         {
           memcpy (um_arr[um_cnt].ip, z_re->ep_ip, 16);
           um_arr[um_cnt].port = z_re->ep_port;
@@ -3494,9 +3767,27 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
     char st[10];
     char mtu[64];
   } RRow;
-  uint8_t uniq_lla[256][16];
+  uint8_t (*uniq_lla)[16] = NULL;
+  size_t uniq_cap = 0;
+  RRow *rows = NULL;
+  size_t rows_cap = 0;
+  size_t row_need = (rt->cnt > (UINT32_MAX / 2U)) ? (size_t)rt->cnt
+                                                  : (size_t)rt->cnt * 2U;
+  if (row_need == 0)
+    row_need = 1U;
+  if (!loop_arr_rsv ((void **)&uniq_lla, &uniq_cap, base_need,
+                        sizeof (*uniq_lla))
+      || !loop_arr_rsv ((void **)&rows, &rows_cap, row_need, sizeof (*rows)))
+    {
+      free (rows);
+      free (uniq_lla);
+      free (um_arr);
+      STATUS_PUT ("status: out of memory while building route tables\n");
+      len = (len < cap) ? len : cap;
+      return len;
+    }
   int u_cnt = 0;
-  for (uint32_t j = 0; j < rt->cnt && u_cnt < 256; j++)
+  for (uint32_t j = 0; j < rt->cnt; j++)
     {
       if (rt->re_arr[j].state == RT_DED
           || memcmp (rt->re_arr[j].lla, z_lla, 16) == 0
@@ -3515,10 +3806,9 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         memcpy (uniq_lla[u_cnt++], rt->re_arr[j].lla, 16);
     }
 
-  RRow rows[256];
   int r_cnt = 0, act_map_cnt = 0, m_dst = 3, m_nh = 7, m_st = 5, m_mtu = 3,
       m_metric = 8;
-  for (int u = 0; u < u_cnt && r_cnt < 256; u++)
+  for (int u = 0; u < u_cnt; u++)
     {
       RtDec sel = rt_sel (rt, uniq_lla[u], cfg->p2p == P2P_EN);
       RRow *row = &rows[r_cnt++];
@@ -3616,7 +3906,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         m_metric = (int)strlen (row->metric);
     }
 
-  for (int um_idx = 0; um_idx < um_cnt && r_cnt < 256; um_idx++)
+  for (int um_idx = 0; um_idx < um_cnt; um_idx++)
     {
       RRow *row = &rows[r_cnt++];
       strcpy (row->dst, "-");
@@ -3668,6 +3958,9 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         }
     }
 #undef STATUS_PUT
+  free (rows);
+  free (uniq_lla);
+  free (um_arr);
   return len;
 }
 

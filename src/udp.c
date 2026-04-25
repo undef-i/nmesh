@@ -75,6 +75,85 @@ udp_rx_split_arr_get (Udp *s)
 }
 
 static bool
+udp_ring_cap_ok (uint32_t cap)
+{
+  return cap > 0 && (cap & (cap - 1U)) == 0;
+}
+
+static bool
+udp_pend_rsv (Udp *s, uint32_t need)
+{
+  if (!s)
+    return false;
+  if (need <= s->pend_cap)
+    return true;
+  uint32_t old_cap = s->pend_cap;
+  uint32_t new_cap = old_cap ? old_cap : UDP_PND_MAX;
+  while (new_cap < need)
+    {
+      if (new_cap > (UINT32_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  if (!udp_ring_cap_ok (new_cap))
+    return false;
+  UdpPMsg *new_arr = calloc ((size_t)new_cap, sizeof (*new_arr));
+  if (!new_arr)
+    return false;
+  if (s->pend_arr && old_cap > 0)
+    {
+      uint32_t mask = old_cap - 1U;
+      for (uint32_t i = 0; i < s->pend_cnt; i++)
+        new_arr[i] = s->pend_arr[(s->pend_head + i) & mask];
+      free (s->pend_arr);
+    }
+  s->pend_arr = new_arr;
+  s->pend_cap = new_cap;
+  s->pend_head = 0;
+  return true;
+}
+
+static bool
+udp_rx_split_rsv (Udp *s, uint32_t need)
+{
+  if (!s)
+    return false;
+  if (need <= s->rx_split_cap)
+    return true;
+  uint32_t old_cap = s->rx_split_cap;
+  uint32_t new_cap = old_cap ? old_cap : UDP_RX_SPLIT_MAX;
+  while (new_cap < need)
+    {
+      if (new_cap > (UINT32_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  if (!udp_ring_cap_ok (new_cap))
+    return false;
+  UdpRxSeg *old_arr = udp_rx_split_arr_get (s);
+  UdpRxSeg *new_arr = calloc ((size_t)new_cap, sizeof (*new_arr));
+  if (!new_arr)
+    return false;
+  if (old_arr && old_cap > 0)
+    {
+      uint32_t mask = old_cap - 1U;
+      for (uint32_t i = 0; i < s->rx_split_cnt; i++)
+        new_arr[i] = old_arr[(s->rx_split_head + i) & mask];
+      free (old_arr);
+    }
+  s->rx_split_arr = new_arr;
+  s->rx_split_cap = new_cap;
+  s->rx_split_head = 0;
+  return true;
+}
+
+static bool
 is_err_tns (int re)
 {
   return (re == EAGAIN || re == EWOULDBLOCK || re == ENOBUFS);
@@ -132,23 +211,27 @@ udp_rx_split_add (Udp *s, const uint8_t src_ip[16], uint16_t src_port,
                   const uint8_t *data, size_t data_len)
 {
   static uint64_t ovf_log_ts = 0;
-  UdpRxSeg *rx_split_arr = udp_rx_split_arr_get (s);
-  if (!s || !rx_split_arr || !src_ip || !data || data_len > UDP_PL_MAX
-      || s->rx_split_cnt >= UDP_RX_SPLIT_MAX)
+  if (!s || !src_ip || !data || data_len > UDP_PL_MAX)
+    return false;
+  if (s->rx_split_cnt >= s->rx_split_cap
+      && !udp_rx_split_rsv (s, s->rx_split_cnt + 1U))
     {
       uint64_t now = sys_ts ();
       if (now - ovf_log_ts >= 1000ULL)
         {
           fprintf (stderr,
-                   "udp: rx split backlog overflow cnt=%u max=%u len=%zu\n",
+                   "udp: rx split backlog overflow cnt=%u cap=%u len=%zu\n",
                    s ? (unsigned)s->rx_split_cnt : 0U,
-                   (unsigned)UDP_RX_SPLIT_MAX,
+                   s ? (unsigned)s->rx_split_cap : 0U,
                    data_len);
           ovf_log_ts = now;
         }
       return false;
     }
-  uint32_t idx = (s->rx_split_head + s->rx_split_cnt) % UDP_RX_SPLIT_MAX;
+  UdpRxSeg *rx_split_arr = udp_rx_split_arr_get (s);
+  if (!rx_split_arr || s->rx_split_cap == 0)
+    return false;
+  uint32_t idx = (s->rx_split_head + s->rx_split_cnt) & (s->rx_split_cap - 1U);
   memcpy (rx_split_arr[idx].src_ip, src_ip, 16);
   rx_split_arr[idx].src_port = src_port;
   rx_split_arr[idx].data_len = data_len;
@@ -173,7 +256,7 @@ udp_rx_split_pkt_drn (Udp *s, UdpRxPkt pkt_arr[], int max_cnt)
       pkt_arr[out_cnt].data_len = seg->data_len;
       memcpy (pkt_arr[out_cnt].src_ip, seg->src_ip, 16);
       pkt_arr[out_cnt].src_port = seg->src_port;
-      s->rx_split_head = (s->rx_split_head + 1U) % UDP_RX_SPLIT_MAX;
+      s->rx_split_head = (s->rx_split_head + 1U) & (s->rx_split_cap - 1U);
       s->rx_split_cnt--;
       out_cnt++;
     }
@@ -476,12 +559,16 @@ udp_sock_buf_set (int fd, int opt, int force_opt, int want, const char *name)
 static bool
 udp_pend_add (Udp *s, const UdpMsg *m)
 {
-  if (s->pend_cnt >= UDP_PND_MAX)
+  if (!s || !m)
     return false;
   if (m->data_len > UDP_PL_MAX)
     return false;
-  uint32_t idx = (s->pend_head + s->pend_cnt) % UDP_PND_MAX;
-  UdpPMsg *pm = &s->pend[idx];
+  if (s->pend_cnt >= s->pend_cap && !udp_pend_rsv (s, s->pend_cnt + 1U))
+    return false;
+  if (!s->pend_arr || s->pend_cap == 0)
+    return false;
+  uint32_t idx = (s->pend_head + s->pend_cnt) & (s->pend_cap - 1U);
+  UdpPMsg *pm = &s->pend_arr[idx];
   memcpy (pm->dst_ip, m->dst_ip, 16);
   pm->dst_port = m->dst_port;
   pm->data_len = m->data_len;
@@ -497,7 +584,7 @@ udp_pend_fls (Udp *s)
   int flush_cnt = 0;
   while (s->pend_cnt > 0)
     {
-      UdpPMsg *pm = &s->pend[s->pend_head];
+      UdpPMsg *pm = &s->pend_arr[s->pend_head];
       struct sockaddr_in6 addr;
       memset (&addr, 0, sizeof (addr));
       addr.sin6_family = AF_INET6;
@@ -513,7 +600,7 @@ udp_pend_fls (Udp *s)
             {
               if (g_emsg_cb)
                 g_emsg_cb (pm->dst_ip, pm->dst_port, pm->data_len);
-              s->pend_head = (s->pend_head + 1) % UDP_PND_MAX;
+              s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
               s->pend_cnt--;
               continue;
             }
@@ -527,15 +614,15 @@ udp_pend_fls (Udp *s)
                        errno, ip_str, pm->dst_port, pm->data_len);
               if (g_unr_cb)
                 g_unr_cb (pm->dst_ip, pm->dst_port);
-              s->pend_head = (s->pend_head + 1) % UDP_PND_MAX;
+              s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
               s->pend_cnt--;
               continue;
             }
-          s->pend_head = (s->pend_head + 1) % UDP_PND_MAX;
+          s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
           s->pend_cnt--;
           continue;
         }
-      s->pend_head = (s->pend_head + 1) % UDP_PND_MAX;
+      s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
       s->pend_cnt--;
       flush_cnt++;
     }
@@ -553,6 +640,11 @@ udp_init (Udp *s, uint16_t *port)
     return -1;
   s->gso_en = true;
   s->gro_en = false;
+  if (!udp_pend_rsv (s, UDP_PND_MAX) || !udp_rx_split_rsv (s, UDP_RX_SPLIT_MAX))
+    {
+      udp_free (s);
+      return -1;
+    }
   s->fd = socket (AF_INET6, SOCK_DGRAM, 0);
   if (s->fd < 0)
     {
@@ -655,7 +747,6 @@ udp_init (Udp *s, uint16_t *port)
       s->gro_en = true;
   }
 #endif
-  s->rx_split_arr = calloc (UDP_RX_SPLIT_MAX, sizeof (UdpRxSeg));
   s->rx_split_drn_bufs = calloc (BATCH_MAX, sizeof (*s->rx_split_drn_bufs));
   if (!s->rx_split_arr || !s->rx_split_drn_bufs)
     {
@@ -708,11 +799,15 @@ udp_free (Udp *s)
 {
   if (!s)
     return;
+  free (s->pend_arr);
+  s->pend_arr = NULL;
+  s->pend_cap = 0;
   UdpRxSeg *rx_split_arr = udp_rx_split_arr_get (s);
   if (rx_split_arr)
     {
       free (rx_split_arr);
       s->rx_split_arr = NULL;
+      s->rx_split_cap = 0;
     }
   free (s->rx_split_drn_bufs);
   s->rx_split_drn_bufs = NULL;

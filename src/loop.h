@@ -61,7 +61,7 @@ void tap_pipe_stop (TapPipe *tap_pipe);
 void tap_pipe_join (TapPipe *tap_pipe);
 void tap_pipe_free (TapPipe *tap_pipe);
 void rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port,
-                 uint64_t now);
+                 uint8_t tp_mask, uint64_t now);
 bool tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt,
                    const Cfg *cfg, uint64_t sid, uint64_t now,
                    uint8_t *vnet_frame, size_t vnet_len);

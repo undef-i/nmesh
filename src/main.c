@@ -485,7 +485,10 @@ cmd_stop_run (const char *cfg_abs)
     {
       Cfg cfg;
       if (cfg_load (cfg_abs, &cfg) == 0)
-        tap_iface_cleanup (cfg.ifname);
+        {
+          tap_iface_cleanup (cfg.ifname);
+          cfg_free (&cfg);
+        }
       fprintf (stderr, "main: pidfile missing for %s, scanning /proc\n",
                cfg_abs);
     }
@@ -517,7 +520,10 @@ cmd_stop_run (const char *cfg_abs)
     {
       Cfg cfg;
       if (cfg_load (cfg_abs, &cfg) == 0)
-        snprintf (ifname, sizeof (ifname), "%s", cfg.ifname);
+        {
+          snprintf (ifname, sizeof (ifname), "%s", cfg.ifname);
+          cfg_free (&cfg);
+        }
     }
   if (ifname[0])
     tap_iface_cleanup (ifname);
@@ -697,6 +703,7 @@ status_query_run (const Cfg *cfg)
       return 1;
     }
   char *text = NULL;
+  uint8_t *seen = NULL;
   uint16_t total_len = 0;
   size_t got_len = 0;
   uint64_t ddl = sys_ts () + 2000ULL;
@@ -733,25 +740,36 @@ status_query_run (const Cfg *cfg)
         {
           total_len = pkt_total;
           text = calloc (1, (size_t)total_len + 1U);
-          if (!text)
+          seen = calloc ((size_t)total_len, 1U);
+          if (!text || !seen)
             break;
         }
-      if (pkt_total != total_len || off != got_len
+      if (pkt_total != total_len
           || (size_t)off + chunk_len > (size_t)total_len)
         continue;
       memcpy (text + off, chunk, chunk_len);
-      got_len += chunk_len;
+      for (size_t i = 0; i < chunk_len; i++)
+        {
+          size_t idx = (size_t)off + i;
+          if (seen[idx] == 0)
+            {
+              seen[idx] = 1;
+              got_len++;
+            }
+        }
       if (got_len >= (size_t)total_len)
         break;
     }
   close (fd);
-  if (!text || got_len == 0)
+  if (!text || total_len == 0 || got_len < (size_t)total_len)
     {
+      free (seen);
       free (text);
       fprintf (stderr, "status: no response from 127.0.0.1:%u\n", cfg->port);
       return 1;
     }
   fwrite (text, 1, got_len, stdout);
+  free (seen);
   free (text);
   return 0;
 }
@@ -819,16 +837,26 @@ main (int argc, char **argv)
     }
   bogon_cfg_apply (&cfg);
   if (cmd == CMD_STATUS)
-    return status_query_run (&cfg);
+    {
+      rc = status_query_run (&cfg);
+      cfg_free (&cfg);
+      return rc;
+    }
   if ((cmd == CMD_START || cmd == CMD_RESTART) && cmd_start_precheck (cfg_abs) != 0)
     return 1;
   if (cmd == CMD_START || cmd == CMD_RESTART)
     {
       int bg_rc = cmd_start_bg (cfg_abs, cfg.ifname);
       if (bg_rc < 0)
-        return 1;
+        {
+          cfg_free (&cfg);
+          return 1;
+        }
       if (bg_rc > 0)
-        return 0;
+        {
+          cfg_free (&cfg);
+          return 0;
+        }
     }
 
   printf ("main: loaded config from %s\n", cfg_abs);
@@ -844,6 +872,7 @@ main (int argc, char **argv)
     g_rnd_st = 0x6d2b79f5U;
   printf ("main: session id: %016llx\n", (unsigned long long)sid);
   rc = loop_run (cfg_abs, &cfg, sid, g_daemon_child, daemon_ready_hnd, NULL);
+  cfg_free (&cfg);
   if (rc != 0 && g_daemon_child)
     start_ready_fail ();
   return rc;

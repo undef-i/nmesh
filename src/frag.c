@@ -1,10 +1,12 @@
 #include "frag.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-static FBktMeta g_frag_meta[FRAG_BKT_MAX];
-static FBktData g_frag_data[FRAG_BKT_MAX];
+static FBktMeta *g_frag_meta = NULL;
+static FBktData *g_frag_data = NULL;
+static uint32_t g_frag_cap = 0;
 
 static uint64_t
 sys_ts (void)
@@ -12,6 +14,44 @@ sys_ts (void)
   struct timespec ts;
   clock_gettime (CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static bool
+frag_tab_rsv (uint32_t need)
+{
+  if (need <= g_frag_cap)
+    return true;
+  uint32_t new_cap = g_frag_cap ? g_frag_cap : FRAG_BKT_CAP_INIT;
+  while (new_cap < need)
+    {
+      if (new_cap > (UINT32_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+
+  FBktMeta *new_meta = calloc ((size_t)new_cap, sizeof (*new_meta));
+  if (!new_meta)
+    return false;
+  FBktData *new_data = calloc ((size_t)new_cap, sizeof (*new_data));
+  if (!new_data)
+    {
+      free (new_meta);
+      return false;
+    }
+  if (g_frag_cap > 0)
+    {
+      memcpy (new_meta, g_frag_meta, (size_t)g_frag_cap * sizeof (*new_meta));
+      memcpy (new_data, g_frag_data, (size_t)g_frag_cap * sizeof (*new_data));
+    }
+  free (g_frag_meta);
+  free (g_frag_data);
+  g_frag_meta = new_meta;
+  g_frag_data = new_data;
+  g_frag_cap = new_cap;
+  return true;
 }
 
 static bool
@@ -41,13 +81,13 @@ frag_bkt_bufs_ensure (FBktData *d)
 static int
 frag_bkt_get (const uint8_t src_lla[16], uint32_t msg_id)
 {
-  for (int i = 0; i < FRAG_BKT_MAX; i++)
+  for (uint32_t i = 0; i < g_frag_cap; i++)
     {
       if (!g_frag_meta[i].is_act)
         continue;
       if (g_frag_meta[i].msg_id == msg_id
           && memcmp (g_frag_meta[i].src_lla, src_lla, 16) == 0)
-        return i;
+        return (int)i;
     }
   return -1;
 }
@@ -55,45 +95,38 @@ frag_bkt_get (const uint8_t src_lla[16], uint32_t msg_id)
 static int
 frag_bkt_new (const uint8_t src_lla[16], uint32_t msg_id)
 {
-  uint64_t now = sys_ts ();
-  uint32_t start = msg_id % FRAG_BKT_MAX;
-  int oldest_idx = -1;
-  uint64_t oldest_ts = UINT64_MAX;
+  if (!frag_tab_rsv (g_frag_cap > 0 ? g_frag_cap : FRAG_BKT_CAP_INIT))
+    return -1;
 
-  for (uint32_t step = 0; step < FRAG_BKT_MAX; step++)
+  int idx = -1;
+  for (uint32_t i = 0; i < g_frag_cap; i++)
     {
-      uint32_t idx = (start + step) % FRAG_BKT_MAX;
-      FBktMeta *m = &g_frag_meta[idx];
-
-      if (!m->is_act)
+      if (!g_frag_meta[i].is_act)
         {
-          oldest_idx = (int)idx;
+          idx = (int)i;
           break;
         }
-      if (m->cre_ts < oldest_ts)
-        {
-          oldest_ts = m->cre_ts;
-          oldest_idx = (int)idx;
-        }
     }
-
-  if (oldest_idx >= 0)
+  if (idx < 0)
     {
-      FBktMeta *m = &g_frag_meta[oldest_idx];
-      FBktData *d = &g_frag_data[oldest_idx];
-      if (!frag_bkt_bufs_ensure (d))
+      uint32_t old_cap = g_frag_cap;
+      if (!frag_tab_rsv (old_cap + 1U))
         return -1;
-
-      memset (m, 0, sizeof (*m));
-      memset (d->rx_bmp, 0, (65535U / 8U) + 1U);
-
-      memcpy (m->src_lla, src_lla, 16);
-      m->msg_id = msg_id;
-      m->cre_ts = now;
-      m->is_act = true;
-      return oldest_idx;
+      idx = (int)old_cap;
     }
-  return -1;
+
+  FBktMeta *m = &g_frag_meta[idx];
+  FBktData *d = &g_frag_data[idx];
+  if (!frag_bkt_bufs_ensure (d))
+    return -1;
+
+  memset (m, 0, sizeof (*m));
+  memset (d->rx_bmp, 0, (65535U / 8U) + 1U);
+  memcpy (m->src_lla, src_lla, 16);
+  m->msg_id = msg_id;
+  m->cre_ts = sys_ts ();
+  m->is_act = true;
+  return idx;
 }
 
 uint8_t *
@@ -150,16 +183,13 @@ frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off, bool mf,
 }
 
 void
-frag_reap_tk (uint64_t sys_ts)
+frag_reap_tk (uint64_t now)
 {
-  for (int i = 0; i < FRAG_BKT_MAX; i++)
+  for (uint32_t i = 0; i < g_frag_cap; i++)
     {
       if (!g_frag_meta[i].is_act)
         continue;
-      if (sys_ts < g_frag_meta[i].cre_ts
-          || sys_ts - g_frag_meta[i].cre_ts > 1500ULL)
-        {
-          g_frag_meta[i].is_act = false;
-        }
+      if (now < g_frag_meta[i].cre_ts || now - g_frag_meta[i].cre_ts > 1500ULL)
+        g_frag_meta[i].is_act = false;
     }
 }

@@ -1,22 +1,42 @@
 #include "replay.h"
 #include "utils.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define RX_RP_MAX 512
+#define RX_RP_CAP_INIT 512U
 #define RX_RP_W 256
 #define RX_RP_B (RX_RP_W * 64)
 #define RX_RP_SID_SZ (PKT_NONCE_SZ - sizeof (uint64_t))
+#define RX_RP_LF_NUM 3U
+#define RX_RP_LF_DEN 4U
+#define RX_RP_HOT_N (RX_RP_CAP_INIT / 128U)
+
+typedef enum
+{
+  RX_RP_EMPTY = 0,
+  RX_RP_USED,
+  RX_RP_TOMB,
+} RxRpSt;
 
 typedef struct
 {
-  bool is_act;
+  RxRpSt st;
   uint8_t sid[RX_RP_SID_SZ];
   uint64_t max_cnt;
   uint64_t last_ts;
   uint64_t map[RX_RP_W];
 } RxRp;
 
-static RxRp g_rx_rp[RX_RP_MAX];
+static RxRp *g_rx_rp = NULL;
+static uint32_t g_rx_rp_cap = 0;
+static uint32_t g_rx_rp_used = 0;
+static uint32_t g_rx_rp_tomb = 0;
+static uint64_t g_rx_rp_last_warn_ts;
+static uint32_t g_rx_rp_last_idx = UINT32_MAX;
+static uint32_t g_rx_rp_hot_idx[RX_RP_HOT_N] = { UINT32_MAX, UINT32_MAX,
+                                                 UINT32_MAX, UINT32_MAX };
+static uint32_t g_rx_rp_hot_pos = 0;
 
 static uint64_t
 nonce_cnt_rd (const uint8_t nonce[PKT_NONCE_SZ])
@@ -66,18 +86,238 @@ rx_rp_map_set (uint64_t map[RX_RP_W], uint64_t cnt)
   map[wi] |= (1ULL << bi);
 }
 
+static bool
+rx_rp_sid_eq (const RxRp *slot, const uint8_t sid[RX_RP_SID_SZ])
+{
+  return slot && slot->st == RX_RP_USED
+         && memcmp (slot->sid, sid, RX_RP_SID_SZ) == 0;
+}
+
+static bool
+rx_rp_slot_stale (const RxRp *slot, uint64_t now)
+{
+  return slot && slot->st == RX_RP_USED && now > slot->last_ts
+         && (now - slot->last_ts) > UM_PRB_IMAX;
+}
+
+static void
+rx_rp_hot_invalidate (uint32_t idx)
+{
+  if (g_rx_rp_last_idx == idx)
+    g_rx_rp_last_idx = UINT32_MAX;
+  for (uint32_t i = 0; i < RX_RP_HOT_N; i++)
+    {
+      if (g_rx_rp_hot_idx[i] == idx)
+        g_rx_rp_hot_idx[i] = UINT32_MAX;
+    }
+}
+
+static void
+rx_rp_hot_reset (void)
+{
+  g_rx_rp_last_idx = UINT32_MAX;
+  for (uint32_t i = 0; i < RX_RP_HOT_N; i++)
+    g_rx_rp_hot_idx[i] = UINT32_MAX;
+  g_rx_rp_hot_pos = 0;
+}
+
+static void
+rx_rp_hot_note (uint32_t idx)
+{
+  g_rx_rp_last_idx = idx;
+  for (uint32_t i = 0; i < RX_RP_HOT_N; i++)
+    {
+      if (g_rx_rp_hot_idx[i] == idx)
+        return;
+    }
+  g_rx_rp_hot_idx[g_rx_rp_hot_pos] = idx;
+  g_rx_rp_hot_pos = (g_rx_rp_hot_pos + 1U) % RX_RP_HOT_N;
+}
+
+static void
+rx_rp_slot_tomb (RxRp *slot)
+{
+  if (!slot || slot->st != RX_RP_USED)
+    return;
+  uint32_t idx = UINT32_MAX;
+  if (g_rx_rp && slot >= g_rx_rp && slot < (g_rx_rp + g_rx_rp_cap))
+    idx = (uint32_t)(slot - g_rx_rp);
+  slot->st = RX_RP_TOMB;
+  g_rx_rp_used--;
+  g_rx_rp_tomb++;
+  if (idx != UINT32_MAX)
+    rx_rp_hot_invalidate (idx);
+}
+
 static void
 rx_rp_slot_init (RxRp *slot, const uint8_t sid[RX_RP_SID_SZ], uint64_t cnt,
                  uint64_t now)
 {
   if (!slot)
     return;
-  slot->is_act = true;
+  if (slot->st != RX_RP_USED)
+    {
+      if (slot->st == RX_RP_TOMB && g_rx_rp_tomb > 0)
+        g_rx_rp_tomb--;
+      g_rx_rp_used++;
+    }
+  slot->st = RX_RP_USED;
   memcpy (slot->sid, sid, sizeof (slot->sid));
   slot->max_cnt = cnt;
   slot->last_ts = now;
   rx_rp_map_rst (slot->map);
   rx_rp_map_set (slot->map, cnt);
+}
+
+static uint64_t
+rx_rp_sid_hash (const uint8_t sid[RX_RP_SID_SZ])
+{
+  uint64_t x = 0;
+  memcpy (&x, sid, sizeof (x));
+  x *= 0x9e3779b185ebca87ULL;
+  x ^= x >> 33;
+  return x;
+}
+
+static uint32_t
+rx_rp_cap_fit (uint32_t need)
+{
+  uint32_t cap = g_rx_rp_cap ? g_rx_rp_cap : RX_RP_CAP_INIT;
+  while (cap < need)
+    {
+      if (cap > (UINT32_MAX / 2U))
+        return need;
+      cap *= 2U;
+    }
+  return cap;
+}
+
+static void
+rx_rp_warn_grow_fail (uint32_t new_cap)
+{
+  uint64_t now = sys_ts ();
+  if (now <= g_rx_rp_last_warn_ts
+      || (g_rx_rp_last_warn_ts != 0
+          && (now - g_rx_rp_last_warn_ts) < 5000ULL))
+    return;
+  fprintf (stderr, "replay: failed to expand window table to %u slots\n",
+           (unsigned)new_cap);
+  g_rx_rp_last_warn_ts = now;
+}
+
+static void
+rx_rp_insert_raw (RxRp *tab, uint32_t cap, const RxRp *src)
+{
+  uint32_t mask = cap - 1U;
+  uint32_t idx = (uint32_t)(rx_rp_sid_hash (src->sid) & mask);
+  while (tab[idx].st == RX_RP_USED)
+    idx = (idx + 1U) & mask;
+  tab[idx] = *src;
+}
+
+static bool
+rx_rp_rehash (uint32_t need_cap, uint64_t now)
+{
+  uint32_t new_cap = rx_rp_cap_fit (need_cap);
+  RxRp *new_arr = calloc ((size_t)new_cap, sizeof (*new_arr));
+  if (!new_arr)
+    {
+      rx_rp_warn_grow_fail (new_cap);
+      return false;
+    }
+
+  uint32_t used = 0;
+  for (uint32_t i = 0; i < g_rx_rp_cap; i++)
+    {
+      if (g_rx_rp[i].st != RX_RP_USED || rx_rp_slot_stale (&g_rx_rp[i], now))
+        continue;
+      rx_rp_insert_raw (new_arr, new_cap, &g_rx_rp[i]);
+      used++;
+    }
+
+  free (g_rx_rp);
+  g_rx_rp = new_arr;
+  g_rx_rp_cap = new_cap;
+  g_rx_rp_used = used;
+  g_rx_rp_tomb = 0;
+  rx_rp_hot_reset ();
+  return true;
+}
+
+static bool
+rx_rp_maybe_rehash (uint64_t now, uint32_t add_used)
+{
+  if (g_rx_rp_cap == 0)
+    return rx_rp_rehash (RX_RP_CAP_INIT, now);
+  uint32_t occ = g_rx_rp_used + g_rx_rp_tomb + add_used;
+  if ((uint64_t)occ * RX_RP_LF_DEN >= (uint64_t)g_rx_rp_cap * RX_RP_LF_NUM)
+    return rx_rp_rehash (g_rx_rp_cap * 2U, now);
+  if (g_rx_rp_tomb > g_rx_rp_used && g_rx_rp_tomb > (g_rx_rp_cap / 8U))
+    return rx_rp_rehash (g_rx_rp_cap, now);
+  return true;
+}
+
+static RxRp *
+rx_rp_hot_lookup_idx (uint32_t idx, const uint8_t sid[RX_RP_SID_SZ],
+                      uint64_t now)
+{
+  if (idx >= g_rx_rp_cap)
+    return NULL;
+  RxRp *slot = &g_rx_rp[idx];
+  if (slot->st != RX_RP_USED)
+    return NULL;
+  if (rx_rp_slot_stale (slot, now))
+    {
+      rx_rp_slot_tomb (slot);
+      return NULL;
+    }
+  return rx_rp_sid_eq (slot, sid) ? slot : NULL;
+}
+
+static RxRp *
+rx_rp_probe_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
+{
+  if (found)
+    *found = false;
+  if (g_rx_rp_cap == 0)
+    return NULL;
+
+  uint32_t mask = g_rx_rp_cap - 1U;
+  uint32_t idx = (uint32_t)(rx_rp_sid_hash (sid) & mask);
+  uint32_t first_tomb = UINT32_MAX;
+
+  for (uint32_t n = 0; n < g_rx_rp_cap; n++, idx = (idx + 1U) & mask)
+    {
+      RxRp *slot = &g_rx_rp[idx];
+      if (slot->st == RX_RP_EMPTY)
+        {
+          if (first_tomb != UINT32_MAX)
+            return &g_rx_rp[first_tomb];
+          return slot;
+        }
+      if (slot->st == RX_RP_TOMB)
+        {
+          if (first_tomb == UINT32_MAX)
+            first_tomb = idx;
+          continue;
+        }
+      if (rx_rp_slot_stale (slot, now))
+        {
+          rx_rp_slot_tomb (slot);
+          if (first_tomb == UINT32_MAX)
+            first_tomb = idx;
+          continue;
+        }
+      if (rx_rp_sid_eq (slot, sid))
+        {
+          if (found)
+            *found = true;
+          return slot;
+        }
+    }
+  if (first_tomb != UINT32_MAX)
+    return &g_rx_rp[first_tomb];
+  return NULL;
 }
 
 bool
@@ -87,53 +327,49 @@ rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
   nonce_sid_rd (nonce, sid);
   uint64_t cnt = nonce_cnt_rd (nonce);
   uint64_t now = sys_ts ();
-
-  static int l_idx = 0;
+  bool found = false;
   RxRp *slot = NULL;
 
-  if (g_rx_rp[l_idx].is_act
-      && memcmp (g_rx_rp[l_idx].sid, sid, sizeof (sid)) == 0)
+  if (g_rx_rp_cap == 0 && !rx_rp_rehash (RX_RP_CAP_INIT, now))
+    return false;
+
+  if (g_rx_rp_last_idx < g_rx_rp_cap)
     {
-      slot = &g_rx_rp[l_idx];
+      slot = rx_rp_hot_lookup_idx (g_rx_rp_last_idx, sid, now);
+      found = slot != NULL;
     }
-  else
+  if (!slot)
     {
-      RxRp *stale = NULL;
-      uint64_t stale_ts = UINT64_MAX;
-      for (size_t i = 0; i < RX_RP_MAX; i++)
+      for (uint32_t i = 0; i < RX_RP_HOT_N; i++)
         {
-          if (!g_rx_rp[i].is_act)
+          uint32_t idx = g_rx_rp_hot_idx[i];
+          if (idx == UINT32_MAX || idx == g_rx_rp_last_idx)
+            continue;
+          slot = rx_rp_hot_lookup_idx (idx, sid, now);
+          if (slot)
             {
-              if (!slot)
-                slot = &g_rx_rp[i];
-              continue;
-            }
-          if (memcmp (g_rx_rp[i].sid, sid, sizeof (sid)) == 0)
-            {
-              slot = &g_rx_rp[i];
+              found = true;
               break;
             }
-          if (now > g_rx_rp[i].last_ts
-              && (now - g_rx_rp[i].last_ts) > UM_PRB_IMAX
-              && g_rx_rp[i].last_ts < stale_ts)
-            {
-              stale = &g_rx_rp[i];
-              stale_ts = g_rx_rp[i].last_ts;
-            }
         }
-      if (!slot)
-        slot = stale;
+    }
+  if (!slot)
+    slot = rx_rp_probe_slot (sid, now, &found);
+  if (!slot)
+    return false;
+  if (!found)
+    {
+      if (!rx_rp_maybe_rehash (now, 1U))
+        return false;
+      slot = rx_rp_probe_slot (sid, now, &found);
       if (!slot)
         return false;
-      l_idx = (int)(slot - g_rx_rp);
     }
+  if (!slot)
+    return false;
+  rx_rp_hot_note ((uint32_t)(slot - g_rx_rp));
 
-  if (!slot->is_act)
-    {
-      rx_rp_slot_init (slot, sid, cnt, now);
-      return true;
-    }
-  if (memcmp (slot->sid, sid, sizeof (sid)) != 0)
+  if (!found)
     {
       rx_rp_slot_init (slot, sid, cnt, now);
       return true;
@@ -170,8 +406,6 @@ rx_rp_rst_ep (const uint8_t ip[16], uint16_t port)
 {
   (void)ip;
   (void)port;
-  /* Replay is keyed by authenticated nonce SID+counter.
-   * Endpoint resets must not flush global replay state. */
 }
 
 void

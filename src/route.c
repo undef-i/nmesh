@@ -586,6 +586,7 @@ rt_cpy (Rt *dst, const Rt *src)
   snap.boot_ts = src->boot_ts;
   snap.loc_last_ts = src->loc_last_ts;
   snap.sync_rev = src->sync_rev;
+  snap.gsp_off = src->gsp_off;
   snap.gsp_last_ts = src->gsp_last_ts;
   snap.gsp_tx_cnt = src->gsp_tx_cnt;
   snap.gsp_dt_tx_cnt = src->gsp_dt_tx_cnt;
@@ -645,6 +646,7 @@ re_to_pth (const Re *re, Pth *pth)
   pth->state = re->state;
   pth->is_act = re->is_act;
   pth->is_static = re->is_static;
+  pth->tp_mask = re->tp_mask;
   pth->pong_ts = re->pong_ts;
   pth->rx_ts = re->rx_ts;
   pth->tx_ts = re->tx_ts;
@@ -979,15 +981,57 @@ pp_init (PPool *p, const char *persist_path)
 }
 
 void
+pp_free (PPool *p)
+{
+  if (!p)
+    return;
+  free (p->re_arr);
+  p->re_arr = NULL;
+  p->cnt = 0;
+  p->cap = 0;
+}
+
+static bool
+pp_rsv (PPool *p, int need)
+{
+  if (!p)
+    return false;
+  if (need <= p->cap)
+    return true;
+  int new_cap = (p->cap > 0) ? p->cap : PEER_CAP_INIT;
+  while (new_cap < need)
+    {
+      if (new_cap > (INT32_MAX / 2))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2;
+    }
+  PAnc *new_arr = realloc (p->re_arr, sizeof (*new_arr) * (size_t)new_cap);
+  if (!new_arr)
+    {
+      fprintf (stderr, "pool: failed to expand peer pool to %d entries\n",
+               new_cap);
+      return false;
+    }
+  p->re_arr = new_arr;
+  p->cap = new_cap;
+  return true;
+}
+
+void
 pp_add (PPool *p, const uint8_t ip[16], uint16_t port)
 {
+  if (!p)
+    return;
   for (int peer_idx = 0; peer_idx < p->cnt; peer_idx++)
     {
       if (memcmp (p->re_arr[peer_idx].ip, ip, 16) == 0
           && p->re_arr[peer_idx].port == port)
         return;
     }
-  if (p->cnt >= PEER_MAX)
+  if (!pp_rsv (p, p->cnt + 1))
     return;
   int is_v4 = (ip[0] == 0 && ip[1] == 0 && ip[10] == 0xff && ip[11] == 0xff);
   if (is_v4)
@@ -1118,6 +1162,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         continue;
       if ((is_rel || is_loc_inj) && re->is_act)
         cur_re->is_act = true;
+      cur_re->tp_mask = re->tp_mask;
       if (seq_gt (re->seq, cur_re->seq))
         cur_re->seq = re->seq;
       if (re->adv_m > 0)
@@ -1276,6 +1321,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   out->state = selected->state;
   out->is_act = selected->is_act;
   out->is_static = selected->is_static;
+  out->tp_mask = selected->tp_mask;
   out->pong_ts = selected->pong_ts;
   out->rx_ts = selected->rx_ts;
   out->tx_ts = selected->tx_ts;
@@ -2475,6 +2521,78 @@ rt_src_no_dir (const Rt *t, const uint8_t rt_id[16])
     return false;
   const SrcEnt *se = src_fnd_c (t, rt_id);
   return se ? se->no_dir : false;
+}
+
+uint8_t
+rt_ep_tp_mask (const Rt *t, const uint8_t ip[16], uint16_t port)
+{
+  if (!t || !ip || port == 0)
+    return TP_MASK_UDP | TP_MASK_TCP;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      const Re *re = &t->re_arr[i];
+      if (re->r2d != 0 || re->state == RT_DED)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0 || re->ep_port != port)
+        continue;
+      if (!is_z16 (re->lla) && memcmp (re->lla, t->our_lla, 16) == 0)
+        continue;
+      return re->tp_mask != 0 ? re->tp_mask : (TP_MASK_UDP | TP_MASK_TCP);
+    }
+  return TP_MASK_UDP | TP_MASK_TCP;
+}
+
+bool
+rt_ep_peer_lla (const Rt *t, const uint8_t ip[16], uint16_t port,
+                uint8_t out_lla[16])
+{
+  if (!t || !ip || !out_lla || port == 0)
+    return false;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      const Re *re = &t->re_arr[i];
+      if (re->r2d != 0 || re->state == RT_DED || is_z16 (re->lla))
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0 || re->ep_port != port)
+        continue;
+      if (memcmp (re->lla, t->our_lla, 16) == 0)
+        continue;
+      memcpy (out_lla, re->lla, 16);
+      return true;
+    }
+  return false;
+}
+
+bool
+rt_peer_ep_fnd (const Rt *t, const uint8_t peer_lla[16], uint8_t out_ip[16],
+                uint16_t *out_port)
+{
+  if (!t || !peer_lla || !out_ip || !out_port || is_z16 (peer_lla))
+    return false;
+  const Re *best = NULL;
+  uint64_t best_ts = 0;
+  for (uint32_t i = 0; i < t->cnt; i++)
+    {
+      const Re *re = &t->re_arr[i];
+      if (re->r2d != 0 || re->state == RT_DED)
+        continue;
+      if (memcmp (re->lla, peer_lla, 16) != 0)
+        continue;
+      uint64_t seen = re->rx_ts;
+      if (re->pong_ts > seen)
+        seen = re->pong_ts;
+      if (!best || (re->is_act && !best->is_act)
+          || (re->is_act == best->is_act && seen > best_ts))
+        {
+          best = re;
+          best_ts = seen;
+        }
+    }
+  if (!best || best->ep_port == 0)
+    return false;
+  memcpy (out_ip, best->ep_ip, 16);
+  *out_port = best->ep_port;
+  return true;
 }
 
 bool

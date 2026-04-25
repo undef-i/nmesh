@@ -4,12 +4,120 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <limits.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+void
+cfg_init (Cfg *cfg)
+{
+  if (!cfg)
+    return;
+  memset (cfg, 0, sizeof (*cfg));
+  cfg->port = 50000;
+  cfg->mtu = 1280;
+  cfg->mtu_probe = false;
+  cfg->p2p = P2P_EN;
+  cfg->tap_mode = TAP_MODE_AUTO;
+  strcpy (cfg->ifname, "nmesh");
+}
+
+void
+cfg_free (Cfg *cfg)
+{
+  if (!cfg)
+    return;
+  free (cfg->tp_pref);
+  free (cfg->bogon_arr);
+  memset (cfg, 0, sizeof (*cfg));
+}
+
+static int
+cfg_tp_rsv (Cfg *cfg, uint8_t need)
+{
+  if (!cfg)
+    return -1;
+  if (need <= cfg->tp_pref_cap)
+    return 0;
+  uint8_t new_cap = cfg->tp_pref_cap ? cfg->tp_pref_cap : TP_PREF_CAP_INIT;
+  while (new_cap < need)
+    {
+      if (new_cap > (uint8_t)(UINT8_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap = (uint8_t)(new_cap * 2U);
+    }
+  uint8_t *new_arr = realloc (cfg->tp_pref, sizeof (*new_arr) * new_cap);
+  if (!new_arr)
+    return -1;
+  cfg->tp_pref = new_arr;
+  cfg->tp_pref_cap = new_cap;
+  return 0;
+}
+
+static int
+cfg_bogon_rsv (Cfg *cfg, size_t need)
+{
+  if (!cfg)
+    return -1;
+  if (need <= cfg->bogon_cap)
+    return 0;
+  size_t new_cap = cfg->bogon_cap ? cfg->bogon_cap : BOGON_RULE_CAP_INIT;
+  while (new_cap < need)
+    {
+      if (new_cap > (SIZE_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  BogonRule *new_arr = realloc (cfg->bogon_arr, sizeof (*new_arr) * new_cap);
+  if (!new_arr)
+    return -1;
+  cfg->bogon_arr = new_arr;
+  cfg->bogon_cap = new_cap;
+  return 0;
+}
+
+int
+cfg_cpy (Cfg *dst, const Cfg *src)
+{
+  if (!dst || !src)
+    return -1;
+  cfg_init (dst);
+  *dst = *src;
+  dst->tp_pref = NULL;
+  dst->tp_pref_cap = 0;
+  dst->bogon_arr = NULL;
+  dst->bogon_cap = 0;
+  if (src->tp_pref_len > 0)
+    {
+      if (cfg_tp_rsv (dst, src->tp_pref_len) != 0)
+        {
+          cfg_free (dst);
+          return -1;
+        }
+      memcpy (dst->tp_pref, src->tp_pref, src->tp_pref_len);
+    }
+  if (src->bogon_cnt > 0)
+    {
+      if (cfg_bogon_rsv (dst, src->bogon_cnt) != 0)
+        {
+          cfg_free (dst);
+          return -1;
+        }
+      memcpy (dst->bogon_arr, src->bogon_arr,
+              sizeof (*dst->bogon_arr) * src->bogon_cnt);
+    }
+  return 0;
+}
 
 static char *
 str_trm (char *s)
@@ -267,19 +375,108 @@ bool_prs (const char *s, bool *out)
   return -1;
 }
 
+static int
+tp_defaults_set (Cfg *cfg)
+{
+  if (!cfg)
+    return -1;
+  cfg->tp_mask = TP_MASK_UDP | TP_MASK_TCP;
+  cfg->tp_pref_len = 2;
+  if (cfg_tp_rsv (cfg, cfg->tp_pref_len) != 0)
+    return -1;
+  cfg->tp_pref[0] = TP_PROTO_UDP;
+  cfg->tp_pref[1] = TP_PROTO_TCP;
+  return 0;
+}
+
+static int
+tp_proto_prs (const char *s, TpProto *out)
+{
+  if (!s || !out)
+    return -1;
+  if (strcmp (s, "udp") == 0)
+    {
+      *out = TP_PROTO_UDP;
+      return 0;
+    }
+  if (strcmp (s, "tcp") == 0)
+    {
+      *out = TP_PROTO_TCP;
+      return 0;
+    }
+  return -1;
+}
+
+static int
+tp_cfg_prs (const char *s, Cfg *cfg)
+{
+  if (!s || !cfg)
+    return -1;
+  char buf[128];
+  if (strlen (s) >= sizeof (buf))
+    return -1;
+  snprintf (buf, sizeof (buf), "%s", s);
+
+  uint8_t mask = 0;
+  uint8_t *pref = NULL;
+  uint8_t pref_cap = 0;
+  uint8_t pref_len = 0;
+  char *save = NULL;
+  for (char *tok = strtok_r (buf, ",", &save); tok != NULL;
+       tok = strtok_r (NULL, ",", &save))
+    {
+      tok = str_trm (tok);
+      TpProto proto;
+      if (tp_proto_prs (tok, &proto) != 0)
+        return -1;
+      uint8_t bit = tp_proto_mask (proto);
+      if ((mask & bit) != 0)
+        continue;
+      if (pref_len >= pref_cap)
+        {
+          uint8_t new_cap = pref_cap ? (uint8_t)(pref_cap * 2U)
+                                     : TP_PREF_CAP_INIT;
+          uint8_t *new_pref = realloc (pref, sizeof (*pref) * new_cap);
+          if (!new_pref)
+            {
+              free (pref);
+              return -1;
+            }
+          pref = new_pref;
+          pref_cap = new_cap;
+        }
+      mask |= bit;
+      pref[pref_len++] = (uint8_t)proto;
+    }
+  if (mask == 0 || pref_len == 0)
+    {
+      free (pref);
+      return -1;
+    }
+
+  free (cfg->tp_pref);
+  cfg->tp_mask = mask;
+  cfg->tp_pref_len = pref_len;
+  cfg->tp_pref_cap = pref_cap;
+  cfg->tp_pref = pref;
+  return 0;
+}
+
 int
 cfg_load (const char *path, Cfg *cfg)
 {
-  memset (cfg, 0, sizeof (*cfg));
-  cfg->port = 50000;
-  cfg->mtu = 1280;
-  cfg->mtu_probe = false;
-  cfg->p2p = P2P_EN;
-  cfg->tap_mode = TAP_MODE_AUTO;
-  strcpy (cfg->ifname, "nmesh");
+  cfg_init (cfg);
+  if (tp_defaults_set (cfg) != 0)
+    {
+      cfg_free (cfg);
+      return -1;
+    }
   FILE *fp = fopen (path, "r");
   if (!fp)
-    return -1;
+    {
+      cfg_free (cfg);
+      return -1;
+    }
   char line[512];
   while (fgets (line, sizeof (line), fp))
     {
@@ -296,6 +493,7 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (str_to_v6 (v, cfg->addr) != 0)
             {
+              cfg_free (cfg);
               fclose (fp);
               return -1;
             }
@@ -310,6 +508,7 @@ cfg_load (const char *path, Cfg *cfg)
           unsigned long m_v = strtoul (v, NULL, 10);
           if (m_v < 128UL || m_v > 65535UL)
             {
+              cfg_free (cfg);
               fclose (fp);
               return -1;
             }
@@ -329,6 +528,7 @@ cfg_load (const char *path, Cfg *cfg)
             cfg->tap_mode = TAP_MODE_PIPE;
           else
             {
+              cfg_free (cfg);
               fclose (fp);
               return -1;
             }
@@ -337,15 +537,34 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (bool_prs (v, &cfg->mtu_probe) != 0)
             {
+              cfg_free (cfg);
+              fclose (fp);
+              return -1;
+            }
+        }
+      else if (strcmp (k, "transport") == 0)
+        {
+          if (tp_cfg_prs (v, cfg) != 0)
+            {
+              cfg_free (cfg);
               fclose (fp);
               return -1;
             }
         }
       else if (strcmp (k, "bogon") == 0)
         {
-          if (cfg->bogon_cnt >= BOGON_RULE_MAX
-              || !bogon_rule_parse (v, &cfg->bogon_arr[cfg->bogon_cnt]))
+          if (cfg_bogon_rsv (cfg, cfg->bogon_cnt + 1U) != 0)
             {
+              fprintf (stderr,
+                       "config: out of memory while expanding bogon rules\n");
+              cfg_free (cfg);
+              fclose (fp);
+              return -1;
+            }
+          if (!bogon_rule_parse (v, &cfg->bogon_arr[cfg->bogon_cnt]))
+            {
+              fprintf (stderr, "config: invalid bogon rule: %s\n", v);
+              cfg_free (cfg);
               fclose (fp);
               return -1;
             }
@@ -360,6 +579,7 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (psk_prs (v, cfg->psk) != 0)
             {
+              cfg_free (cfg);
               fclose (fp);
               return -1;
             }
@@ -368,22 +588,49 @@ cfg_load (const char *path, Cfg *cfg)
   fclose (fp);
   uint8_t z16[16] = { 0 };
   if (memcmp (cfg->addr, z16, 16) == 0)
-    return -1;
+    {
+      cfg_free (cfg);
+      return -1;
+    }
   uint8_t z32[32] = { 0 };
   if (memcmp (cfg->psk, z32, 32) == 0)
-    return -1;
+    {
+      cfg_free (cfg);
+      return -1;
+    }
   return 0;
 }
 
 int
 p_arr_ld (const char *path, P *p_arr, int max_cnt)
 {
+  P *tmp = NULL;
+  int cnt = 0;
+  if (p_arr_load (path, &tmp, &cnt) != 0)
+    return 0;
+  if (cnt > max_cnt)
+    cnt = max_cnt;
+  for (int i = 0; i < cnt; i++)
+    p_arr[i] = tmp[i];
+  free (tmp);
+  return cnt;
+}
+
+int
+p_arr_load (const char *path, P **out_arr, int *out_cnt)
+{
+  if (out_arr)
+    *out_arr = NULL;
+  if (out_cnt)
+    *out_cnt = 0;
   FILE *fp = fopen (path, "r");
   if (!fp)
     return 0;
+  P *arr = NULL;
   int p_cnt = 0;
+  int p_cap = 0;
   char line[512];
-  while (fgets (line, sizeof (line), fp) && p_cnt < max_cnt)
+  while (fgets (line, sizeof (line), fp))
     {
       char *l_trm = str_trm (line);
       if (!l_trm[0] || l_trm[0] == '#')
@@ -398,8 +645,35 @@ p_arr_ld (const char *path, P *p_arr, int max_cnt)
         continue;
       P p;
       if (str_to_p (v, &p) == 0)
-        p_arr[p_cnt++] = p;
+        {
+          if (p_cnt >= p_cap)
+            {
+              int new_cap = (p_cap > 0) ? (p_cap * 2) : PEER_CAP_INIT;
+              P *new_arr = realloc (arr, sizeof (*arr) * (size_t)new_cap);
+              if (!new_arr)
+                {
+                  fprintf (stderr,
+                           "config: out of memory while expanding peer list\n");
+                  free (arr);
+                  fclose (fp);
+                  return -1;
+                }
+              arr = new_arr;
+              p_cap = new_cap;
+            }
+          arr[p_cnt++] = p;
+        }
+      else
+        {
+          fprintf (stderr, "config: invalid peer entry ignored: %s\n", v);
+        }
     }
   fclose (fp);
-  return p_cnt;
+  if (out_arr)
+    *out_arr = arr;
+  else
+    free (arr);
+  if (out_cnt)
+    *out_cnt = p_cnt;
+  return 0;
 }
