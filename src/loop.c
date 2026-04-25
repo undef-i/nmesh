@@ -698,8 +698,6 @@ rt_show_rtt (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
           if (re->ep_port != sel->dir.port)
             continue;
           uint32_t m = re_show_rtt (re);
-          if (re->dir_cost > 0 && re->dir_cost < (int64_t)RT_M_INF)
-            m = (uint32_t)re->dir_cost;
           if (m < best)
             best = m;
         }
@@ -898,7 +896,6 @@ rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint64_t now)
       s_re.is_act = true;
       s_re.state = RT_ACT;
       s_re.sm_m = 0;
-      s_re.dir_cost = INT64_MAX;
       s_re.rt_m = 0;
       s_re.adv_m = 0;
       s_re.seq = 1;
@@ -979,7 +976,6 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       ne.is_act = false;
       ne.is_static = true;
       ne.state = RT_PND;
-      ne.dir_cost = INT64_MAX;
       ne.rto = RTO_INIT;
       rt_upd (rt, &ne, ts);
       if (!pool_has_peer (pool, peers[i].ip, peers[i].port)
@@ -1051,7 +1047,6 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
       ne.is_act = false;
       ne.is_static = true;
       ne.state = RT_PND;
-      ne.dir_cost = INT64_MAX;
       ne.rto = RTO_INIT;
       rt_upd (&rt, &ne, init_ts);
       bool is_dup = false;
@@ -3056,20 +3051,10 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                     uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
                     if (rtt == 0)
                       rtt = 1;
-                    int64_t dir_cost = INT64_MAX;
-                    if (peer_rx_ts > 0)
-                      {
-                        dir_cost = (int64_t)peer_rx_ts - (int64_t)req_ts;
-                      }
-                    if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt,
-                                             dir_cost, ts))
+                    (void)peer_rx_ts;
+                    if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, ts))
                       {
                         rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
-                        if (dir_cost != INT64_MAX)
-                          {
-                            rt_dir_cost_upd (rt, peer_lla, src_ip, src_port,
-                                             dir_cost, ts);
-                          }
                       }
                     if (cfg->p2p == P2P_EN && hdr->rel_f == 0
                         && !p_is_me (rt, cfg->addr, src_ip, src_port))

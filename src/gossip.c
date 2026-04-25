@@ -718,7 +718,6 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rel_re.seq = n_seq;
           rel_re.adv_m = adv_m;
           rel_re.r2d = is_adv_rch ? adv_m : (is_s_alive ? REL_M_UNK : RT_M_INF);
-          rel_re.dir_cost = INT64_MAX;
           rel_re.rt_m = rel_re.r2d;
           if (rel_mtu > 0)
             {
@@ -749,7 +748,6 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           dir_re.seq = n_seq;
           dir_re.adv_m = adv_m;
           dir_re.r2d = 0;
-          dir_re.dir_cost = INT64_MAX;
           dir_re.rt_m = RT_M_INF;
           dir_re.sm_m = RT_M_INF;
           if (gsp_mtu > 0)
