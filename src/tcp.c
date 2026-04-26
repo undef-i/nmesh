@@ -34,6 +34,8 @@ static bool tp_ip_is_zero (const uint8_t ip[16]);
 static bool tp_lla_is_zero (const uint8_t lla[16]);
 static uint32_t tp_hash_lla (const uint8_t lla[16]);
 static uint32_t tp_hash_ep (const uint8_t ip[16], uint16_t port);
+static ssize_t tp_sock_write (int fd, const void *buf, size_t len);
+static ssize_t tp_sock_writev (int fd, const struct iovec *iov, int iovcnt);
 
 static uint32_t
 tp_conn_idx (const TpRt *tp, const TpConn *conn)
@@ -44,6 +46,22 @@ tp_conn_idx (const TpRt *tp, const TpConn *conn)
   if (idx < 0 || (uint32_t)idx >= tp->conn_cap)
     return TP_IDX_INV;
   return (uint32_t)idx;
+}
+
+static ssize_t
+tp_sock_write (int fd, const void *buf, size_t len)
+{
+  return send (fd, buf, len, MSG_NOSIGNAL);
+}
+
+static ssize_t
+tp_sock_writev (int fd, const struct iovec *iov, int iovcnt)
+{
+  struct msghdr msg;
+  memset (&msg, 0, sizeof (msg));
+  msg.msg_iov = (struct iovec *)iov;
+  msg.msg_iovlen = (size_t)iovcnt;
+  return sendmsg (fd, &msg, MSG_NOSIGNAL);
 }
 
 static void
@@ -633,7 +651,8 @@ tp_conn_flush (TpRt *tp, int epfd, TpConn *conn)
           tp_ev_upd (epfd, conn);
           return true;
         }
-      ssize_t n = write (conn->fd, node->data + node->off, node->len - node->off);
+      ssize_t n
+        = tp_sock_write (conn->fd, node->data + node->off, node->len - node->off);
       if (n < 0)
         {
           if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -693,7 +712,7 @@ tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
   iov[1].iov_base = (void *)data;
   iov[1].iov_len = len;
   size_t want = sizeof (net_len) + len;
-  ssize_t n = writev (conn->fd, iov, 2);
+  ssize_t n = tp_sock_writev (conn->fd, iov, 2);
   if (n < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)

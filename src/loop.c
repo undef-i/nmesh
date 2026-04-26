@@ -708,6 +708,13 @@ re_show_rtt (const Re *re)
     return RT_M_INF;
   if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK)
     return re->sm_m;
+  for (size_t i = 0; i < RT_METRIC_WIN_BINS; i++)
+    {
+      if (re->rtt_win_id[i] != 0)
+        break;
+      if (i + 1U == RT_METRIC_WIN_BINS)
+        return RT_M_INF;
+    }
   if (re->rt_m > 0 && re->rt_m < RT_M_INF && re->rt_m != RTT_UNK)
     return re->rt_m;
   return RT_M_INF;
@@ -1510,6 +1517,7 @@ typedef struct
   uint8_t tx_ip[16];
   uint16_t tx_port;
   uint16_t pmtu;
+  uint16_t vnet_cap;
   RtDecT type;
   uint8_t rel_f;
   bool use_tcp;
@@ -2201,7 +2209,7 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   if (!g_tso_par.is_on || !udp || !cry_ctx || !rt || !cfg || !tso || !tx_path
       || !tx_path->is_val || tx_path->type == RT_NONE || tx_path->use_tcp)
     return 0;
-  uint16_t max_vnet = tnl_vnet_cap_get (tx_path->pmtu, tx_path->tx_ip);
+  uint16_t max_vnet = tx_path->vnet_cap;
   int seg_cnt = (int)((tso->pl_len + tso->seg_pl - 1U) / tso->seg_pl);
   if (seg_cnt < TAP_TSO_PAR_MIN || seg_cnt > (TAP_TSO_PAR_MAX * 2))
     return 0;
@@ -2493,6 +2501,9 @@ tap_tx_path_fit (Rt *rt, const Cfg *cfg, uint64_t now, const uint8_t *frame_pkt,
     }
   tx_path->use_tcp = tap_tx_use_tcp (rt, cfg, tx_path->tx_ip, tx_path->tx_port);
   tx_path->pmtu = tx_path_pmtu_get (cfg, tx_path->tx_ip, rt_mtu (rt, &dec));
+  tx_path->vnet_cap = tx_path->use_tcp
+                        ? tp_vnet_cap_get ()
+                        : tnl_vnet_cap_get (tx_path->pmtu, tx_path->tx_ip);
   memcpy (fast_path[fp_idx].dest_lla, tx_path->rt_key, 16);
   fast_path[fp_idx].tx_path = *tx_path;
   fast_path[fp_idx].val_ts = now + 200ULL;
@@ -2664,18 +2675,21 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   uint8_t rel_f = tx_path_lcl.rel_f;
   const uint8_t *rel_dst_lla = (rel_f != 0) ? tx_path_lcl.rt_key : NULL;
   uint16_t pmtu = tx_path_lcl.pmtu;
-  uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
+  uint16_t max_vnet = tx_path_lcl.vnet_cap;
   size_t l3_off = ETH_HLEN;
   uint16_t eth_type = 0;
   frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
-  if (mss_apply && (eth_type == 0x0800U || eth_type == 0x86DDU)
+  if (!tx_path_lcl.use_tcp && mss_apply
+      && (eth_type == 0x0800U || eth_type == 0x86DDU)
       && frame_len > l3_off)
     {
       uint16_t max_in_l3 = tnl_inner_l3_cap_get (max_vnet, l3_off);
       if (max_in_l3 >= 88U)
         mss_clp (frame_pkt + l3_off, frame_len - l3_off, max_in_l3);
     }
-  size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, rel_f != 0);
+  size_t chunk_max = tx_path_lcl.use_tcp
+                       ? pkt_frag_pl_cap_get (rel_f != 0)
+                       : tnl_frag_pl_cap_get (max_vnet, rel_f != 0);
   if (chunk_max == 0)
     {
       static uint64_t l_cr_ts = 0;
@@ -2869,7 +2883,7 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             }
         }
       uint16_t max_vnet = has_tx_path
-                             ? tnl_vnet_cap_get (tx_path.pmtu, tx_path.tx_ip)
+                             ? tx_path.vnet_cap
                              : 0;
       int tso_i = 0;
       size_t tso_len = 0;
@@ -2920,7 +2934,7 @@ tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                                           tap_run->fast_path,
                                           &tap_run->l_nh_ts, &tx_path);
       uint16_t max_vnet = has_tx_path
-                             ? tnl_vnet_cap_get (tx_path.pmtu, tx_path.tx_ip)
+                             ? tx_path.vnet_cap
                              : 0;
       int uso_i = 0;
       size_t uso_len = 0;
@@ -3925,7 +3939,10 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             strcpy (row->metric, "-");
           else
             snprintf (row->metric, sizeof (row->metric), "%ums", show_rtt);
-          {
+          if (tap_tx_use_tcp (rt, cfg, sel_ip, sel_port))
+            strcpy (row->mtu, "-");
+          else
+            {
             uint16_t pmtu = rt_mtu (rt, &sel);
             uint16_t prb_mtu = 0, lkg = pmtu, ukb = pmtu;
             bool is_srch = false, is_fixed = true;
@@ -3949,7 +3966,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
                   snprintf (row->mtu, sizeof (row->mtu),
                             "%u (LKG:%u, UKB:%u, base)", pmtu, lkg, ukb);
               }
-          }
+            }
           strcpy (row->st, "active");
         }
       if ((int)strlen (row->nh) > m_nh)
@@ -4005,12 +4022,12 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               ctrl_tot_str, ctrl_tx_str, ctrl_rx_str);
   if (r_cnt > 0)
     {
-      STATUS_PUT ("  %-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, "dst", m_nh,
+      STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, "dst", m_nh,
                   "nexthop", m_st, "state", m_mtu, "mtu", m_metric,
                   "rtt");
       for (int k = 0; k < r_cnt; k++)
         {
-          STATUS_PUT ("  %-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, rows[k].dst,
+          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, rows[k].dst,
                       m_nh, rows[k].nh, m_st, rows[k].st, m_mtu, rows[k].mtu,
                       m_metric, rows[k].metric);
         }

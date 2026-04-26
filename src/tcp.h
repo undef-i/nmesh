@@ -55,7 +55,7 @@ typedef struct
   uint16_t sock_port;
   uint8_t route_ip[16];
   uint16_t route_port;
-  uint8_t hdr_buf[4];
+  uint8_t hdr_buf[sizeof (uint32_t)];
   uint32_t hdr_have;
   uint32_t rx_len;
   uint32_t rx_have;
