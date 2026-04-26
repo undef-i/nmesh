@@ -1824,8 +1824,8 @@ rt_dir_peer_rev_cap (const Re *re)
   return re->peer_rev_mtu;
 }
 
-static uint16_t
-rt_dir_part_mtu (const Rt *t, const Re *re)
+uint16_t
+rt_dir_mtu_get (const Rt *t, const Re *re)
 {
   uint16_t mtu = re_mtu_cur (t, re);
   uint16_t peer_rev_mtu = rt_dir_peer_rev_cap (re);
@@ -1868,7 +1868,7 @@ rt_mtu (const Rt *t, const RtDec *sel)
     {
       const Re *match = rt_dir_match (t, sel);
       if (match)
-        return rt_dir_part_mtu (t, match);
+        return rt_dir_mtu_get (t, match);
       return t->mtu_probe ? RT_MTU_DEF : RT_MTU_DEF;
     }
   if (sel->type == RT_REL)
@@ -2363,7 +2363,7 @@ rt_pmtu_st (const Rt *t, const RtDec *sel, uint16_t *out_path_mtu,
     }
   uint16_t mtu = re_mtu_cur (t, match);
   bool is_srch = false;
-  mtu = rt_dir_part_mtu (t, match);
+  mtu = rt_dir_mtu_get (t, match);
   rt_dir_part_lims (t, match, NULL, NULL, &is_srch);
   bool is_fix = !is_srch;
   if (out_path_mtu)

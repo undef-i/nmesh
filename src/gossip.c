@@ -269,7 +269,8 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
       if (tp_mask_has (re->tp_mask, TP_PROTO_TCP))
         gsp_ent.flags |= GSP_F_TP_TCP;
       gsp_ent.state = (uint8_t)re->state;
-      gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
+      gsp_ent.mtu
+          = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_get (rt, re) : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
       if (memcmp (re->lla, our_lla, 16) == 0
@@ -337,7 +338,8 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
       if (tp_mask_has (re->tp_mask, TP_PROTO_TCP))
         gsp_ent.flags |= GSP_F_TP_TCP;
       gsp_ent.state = (uint8_t)re->state;
-      gsp_ent.mtu = (re->is_act && re->state == RT_ACT) ? re->mtu : 0;
+      gsp_ent.mtu
+          = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_get (rt, re) : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
       if (memcmp (re->lla, our_lla, 16) == 0

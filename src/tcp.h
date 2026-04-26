@@ -15,6 +15,7 @@
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
 #define TP_TXQ_FRAME_BYTES ((uint32_t)(sizeof (uint32_t) + UDP_PL_MAX))
+#define TP_TXQ_STOP_MULT 4U
 #define TP_CONN_TMO                                                           \
   (RTO_INIT * ((1ULL << (TP_CONN_SYN_RETRIES + 1U)) - 1ULL))
 
@@ -34,16 +35,17 @@ typedef enum
   TP_ST_ESTABLISHED,
 } TpSt;
 
-typedef struct TpTxNode
+typedef struct
 {
-  struct TpTxNode *next;
+  uint8_t *buf;
+  uint32_t cap;
+  uint32_t head;
   uint32_t len;
-  uint32_t off;
-  uint8_t data[];
-} TpTxNode;
+} TpTxRing;
 
 typedef struct
 {
+  uint32_t slot_idx;
   int fd;
   TpSt st;
   bool inbound;
@@ -60,19 +62,19 @@ typedef struct
   uint32_t rx_len;
   uint32_t rx_have;
   uint8_t rx_buf[UDP_PL_MAX];
-  TpTxNode *tx_hi_head;
-  TpTxNode *tx_hi_tail;
-  TpTxNode *tx_lo_head;
-  TpTxNode *tx_lo_tail;
+  TpTxRing tx_hi;
+  TpTxRing tx_lo;
   uint32_t tx_q_bytes;
   uint32_t sndbuf_bytes;
+  bool tx_qd;
+  bool tx_bp;
 } TpConn;
 
 typedef struct
 {
   int listen_fd;
   pthread_mutex_t mtx;
-  TpConn *conn_arr;
+  TpConn **conn_arr;
   uint32_t conn_cap;
   uint32_t *fd_idx_arr;
   uint32_t fd_idx_cap;
@@ -80,6 +82,8 @@ typedef struct
   uint32_t peer_hot_cap;
   uint32_t *ep_hot_idx;
   uint32_t ep_hot_cap;
+  uint32_t tx_qd_cnt;
+  uint32_t tx_bp_cnt;
 } TpRt;
 
 typedef void (*TpFrameFn) (const uint8_t *frame, size_t len, const TpSrc *src,
@@ -97,6 +101,7 @@ bool tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg,
                    const uint8_t ip[16], uint16_t port, const uint8_t *data,
                    size_t len);
 bool tp_send_fd (int fd, const uint8_t *data, size_t len);
+bool tp_tx_pending (void);
 bool tp_w_want (void);
 void tp_rt_tick (TpRt *tp, const Rt *rt, const Cfg *cfg);
 void tp_rt_accept_ready (TpRt *tp, int epfd);
