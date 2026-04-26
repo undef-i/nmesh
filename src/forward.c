@@ -167,6 +167,9 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     }
   else
     {
+      size_t frag_vnet_max = frag_vnet_len_max (chunk_max);
+      if (frag_vnet_max == 0 || vnet_len > frag_vnet_max)
+        return false;
       uint32_t mid = g_frag_mid++;
       if (g_frag_mid == 0)
         g_frag_mid = 1;
@@ -183,8 +186,6 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           memcpy (chunk_dst, relay_vnet + off, chunk_len);
           size_t out_len = 0;
           bool mf = (off + chunk_len) < vnet_len;
-          if (off > 0x7fffU)
-            break;
           uint8_t *out_ptr
               = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, (uint16_t)off,
                              mf, 1, dst_tail, hop_c, &out_len);
@@ -246,6 +247,10 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
   size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, true);
   if (chunk_max == 0)
     return false;
+  size_t frag_vnet_max = frag_vnet_len_max (chunk_max);
+  if (frag_vnet_max == 0
+      || (size_t)frag_off + chunk_len > frag_vnet_max)
+    return false;
   uint8_t dst_tail[4];
   memcpy (dst_tail, dest_lla + 12, 4);
   bool is_tx = false;
@@ -258,14 +263,10 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (sub_len > chunk_max)
         sub_len = chunk_max;
       uint32_t abs_off = (uint32_t)frag_off + (uint32_t)sub_off;
-      if (abs_off > UINT16_MAX)
-        break;
       memcpy (chunk_dst_base, chunk + sub_off, sub_len);
       size_t out_len = 0;
       bool is_last_sub = (sub_off + sub_len) == chunk_len;
       bool mf_out = mf_in || !is_last_sub;
-      if (abs_off > 0x7fffU)
-        break;
       uint8_t *out_ptr = frag_bld_zc (cry_ctx, chunk_dst_base, sub_len, mid,
                                       (uint16_t)abs_off, mf_out, 1, dst_tail,
                                       hop_c, &out_len);

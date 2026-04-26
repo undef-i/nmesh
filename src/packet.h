@@ -25,13 +25,18 @@ typedef struct __attribute__ ((packed))
 #define PKT_CH_SZ 2
 #define PKT_NONCE_SZ 16
 #define PKT_MAC_SZ 32
+#define PKT_NONCE_CNT_SZ sizeof (uint64_t)
+#define PKT_NONCE_SID_SZ (PKT_NONCE_SZ - PKT_NONCE_CNT_SZ)
 #define PKT_HDR_SZ (PKT_CH_SZ + PKT_NONCE_SZ + PKT_MAC_SZ)
 #define V6_PL_MAX 9000
 #define UDP_PL_MAX (PKT_HDR_SZ + 16 + V6_PL_MAX)
+#define PKT_PT_MAX (UDP_PL_MAX - PKT_HDR_SZ)
 #define TAP_HR 128
 #define TAP_TR 64
 #define PING_PL_SZ 40
 #define PONG_PL_SZ 48
+#define FRAG_MF_MASK 0x8000U
+#define FRAG_OFF_MASK 0x7fffU
 
 typedef struct __attribute__ ((packed))
 {
@@ -62,9 +67,19 @@ typedef struct __attribute__ ((packed))
 typedef struct __attribute__ ((packed))
 {
   uint32_t req_id;
-  uint16_t off;
-  uint16_t total_len;
+  uint64_t off;
+  uint64_t total_len;
 } StatHdr;
+
+#define STAT_RSP_CHUNK_MAX (PKT_PT_MAX - sizeof (StatHdr))
+
+static inline size_t
+frag_vnet_len_max (size_t chunk_max)
+{
+  if (chunk_max == 0)
+    return 0;
+  return (((size_t)FRAG_OFF_MASK / chunk_max) + 1U) * chunk_max;
+}
 
 #define GSP_F_SEL_DIR 0x01U
 #define GSP_F_NO_DIR 0x02U
@@ -75,6 +90,6 @@ _Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
 _Static_assert (sizeof (GspEnt) == 70, "GspEnt size");
 _Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
-_Static_assert (sizeof (StatHdr) == 8, "StatHdr size");
+_Static_assert (sizeof (StatHdr) == 20, "StatHdr size");
 _Static_assert (PKT_HDR_SZ == 50, "PKT_HDR_SZ");
 _Static_assert (UDP_PL_MAX == (PKT_HDR_SZ + 16 + V6_PL_MAX), "UDP_PL_MAX");

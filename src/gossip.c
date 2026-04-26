@@ -409,13 +409,13 @@ frag_bld_zc (Cry *s, uint8_t *chunk_ptr, size_t chunk_len, uint32_t msg_id,
              uint16_t off, bool mf, uint8_t rel_f, const uint8_t dest_tail[4],
              uint8_t hop_c, size_t *out_len)
 {
-  if ((off & 0x8000U) != 0)
+  if ((off & FRAG_MF_MASK) != 0)
     return NULL;
   uint8_t *payload = chunk_ptr;
   size_t pl_len = chunk_len;
   payload -= sizeof (FragHdr);
   u32_wr (payload, msg_id);
-  uint16_t off_mf = (uint16_t)(off | (mf ? 0x8000U : 0U));
+  uint16_t off_mf = (uint16_t)(off | (mf ? FRAG_MF_MASK : 0U));
   u16_wr (payload + 4, off_mf);
   pl_len += sizeof (FragHdr);
   if (rel_f != 0 && dest_tail != NULL)
@@ -445,9 +445,9 @@ mtu_prb_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu, size_t t_pl_len,
       if (pl_len < sizeof (ProbeHdr))
         pl_len = sizeof (ProbeHdr);
     }
-  if (pl_len > (UDP_PL_MAX - PKT_HDR_SZ))
-    pl_len = (UDP_PL_MAX - PKT_HDR_SZ);
-  uint8_t payload[UDP_PL_MAX - PKT_HDR_SZ];
+  if (pl_len > PKT_PT_MAX)
+    pl_len = PKT_PT_MAX;
+  uint8_t payload[PKT_PT_MAX];
   memset (payload, 0, pl_len);
   u32_wr (payload, probe_id);
   u16_wr (payload + 4, probe_mtu);
@@ -479,16 +479,16 @@ stat_req_bld (Cry *s, uint32_t req_id, uint8_t *buf, size_t *out_len)
 }
 
 uint8_t *
-stat_rsp_bld (Cry *s, uint32_t req_id, uint16_t total_len, uint16_t off,
+stat_rsp_bld (Cry *s, uint32_t req_id, uint64_t total_len, uint64_t off,
               const uint8_t *chunk, size_t chunk_len, uint8_t *buf,
               size_t *out_len)
 {
-  if (!chunk || chunk_len > (UDP_PL_MAX - PKT_HDR_SZ - sizeof (StatHdr)))
+  if (!chunk || chunk_len > STAT_RSP_CHUNK_MAX)
     return NULL;
-  uint8_t payload[UDP_PL_MAX - PKT_HDR_SZ];
+  uint8_t payload[PKT_PT_MAX];
   u32_wr (payload, req_id);
-  u16_wr (payload + 4, off);
-  u16_wr (payload + 6, total_len);
+  u64_wr (payload + 4, off);
+  u64_wr (payload + 12, total_len);
   memcpy (payload + sizeof (StatHdr), chunk, chunk_len);
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_STAT_RSP, 0, 32, hdr);
@@ -549,15 +549,15 @@ gsp_prs_stat_req (const uint8_t *pt, size_t pt_len, uint32_t *req_id)
 
 int
 gsp_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
-                  uint16_t *off, uint16_t *total_len, const uint8_t **chunk,
+                  uint64_t *off, uint64_t *total_len, const uint8_t **chunk,
                   size_t *chunk_len)
 {
   if (!pt || pt_len < sizeof (StatHdr) || !req_id || !off || !total_len
       || !chunk || !chunk_len)
     return -1;
   *req_id = u32_rd (pt);
-  *off = u16_rd (pt + 4);
-  *total_len = u16_rd (pt + 6);
+  *off = u64_rd (pt + 4);
+  *total_len = u64_rd (pt + 12);
   *chunk = pt + sizeof (StatHdr);
   *chunk_len = pt_len - sizeof (StatHdr);
   return 0;
@@ -575,7 +575,7 @@ on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
   if (lla)
     memcpy (lla, pt + 16, 16);
   if (prb_tok)
-    *prb_tok = (pt_len >= PING_PL_SZ) ? u64_rd (pt + 32) : 0;
+    *prb_tok = u64_rd (pt + 32);
   return 0;
 }
 
@@ -583,7 +583,7 @@ int
 on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
          uint8_t *lla, uint64_t *rx_ts, uint64_t *prb_tok)
 {
-  if (!pt || pt_len < PING_PL_SZ)
+  if (!pt || pt_len < PONG_PL_SZ)
     return -1;
   if (o_ts)
     *o_ts = u64_rd (pt);
@@ -592,19 +592,9 @@ on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
   if (lla)
     memcpy (lla, pt + 16, 16);
   if (rx_ts)
-    {
-      if (pt_len >= PONG_PL_SZ)
-        *rx_ts = u64_rd (pt + 32);
-      else
-        *rx_ts = 0;
-    }
+    *rx_ts = u64_rd (pt + 32);
   if (prb_tok)
-    {
-      if (pt_len >= PONG_PL_SZ)
-        *prb_tok = u64_rd (pt + 40);
-      else
-        *prb_tok = 0;
-    }
+    *prb_tok = u64_rd (pt + 40);
   return 0;
 }
 

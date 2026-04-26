@@ -803,14 +803,14 @@ status_rsp_tx_local (Cry *cry_ctx, const uint8_t dst_ip[16], uint16_t dst_port,
   memcpy (dst.sin6_addr.s6_addr, dst_ip, 16);
 
   static uint8_t rsp_buf[UDP_PL_MAX];
-  size_t chunk_cap = UDP_PL_MAX - PKT_HDR_SZ - sizeof (StatHdr);
+  size_t chunk_cap = STAT_RSP_CHUNK_MAX;
   for (size_t off = 0; off < txt_len;)
     {
       size_t chunk_len = txt_len - off;
       if (chunk_len > chunk_cap)
         chunk_len = chunk_cap;
       size_t rsp_len = 0;
-      if (!stat_rsp_bld (cry_ctx, req_id, (uint16_t)txt_len, (uint16_t)off,
+      if (!stat_rsp_bld (cry_ctx, req_id, txt_len, off,
                          (const uint8_t *)txt + off, chunk_len, rsp_buf,
                          &rsp_len))
         break;
@@ -1279,22 +1279,33 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
         stdin_watch = true;
     }
 
-  char cfg_dir[PATH_MAX];
+  char *cfg_dir = NULL;
   char cfg_file[NAME_MAX];
   const char *cfg_name = cfg_path;
   const char *slash = strrchr (cfg_path, '/');
   if (slash)
     {
       size_t dlen = (size_t)(slash - cfg_path);
-      if (dlen >= sizeof (cfg_dir))
-        dlen = sizeof (cfg_dir) - 1;
+      cfg_dir = malloc (dlen + 1U);
+      if (!cfg_dir)
+        {
+          fprintf (stderr,
+                   "main: out of memory while preparing config watcher\n");
+          goto out;
+        }
       memcpy (cfg_dir, cfg_path, dlen);
       cfg_dir[dlen] = '\0';
       cfg_name = slash + 1;
     }
   else
     {
-      snprintf (cfg_dir, sizeof (cfg_dir), ".");
+      cfg_dir = strdup (".");
+      if (!cfg_dir)
+        {
+          fprintf (stderr,
+                   "main: out of memory while preparing config watcher\n");
+          goto out;
+        }
     }
   size_t cfg_name_len = strlen (cfg_name);
   if (cfg_name_len >= sizeof (cfg_file))
@@ -1470,6 +1481,7 @@ out:
   tp_glb_unbind ();
   if (cfg_ifd >= 0)
     close (cfg_ifd);
+  free (cfg_dir);
   if (timer_fd >= 0)
     close (timer_fd);
   if (epfd >= 0)
@@ -1795,6 +1807,29 @@ tap_udp_sum_base (const uint8_t *ip, const uint8_t *udp, bool is_v6)
   return sum;
 }
 
+static uint16_t
+tap_tcp_sum_v4 (const uint8_t *ip4, const uint8_t *tcp, size_t tcp_len)
+{
+  uint32_t sum = 0;
+  sum = tap_sum_add (sum, ip4 + 12, 8);
+  sum += 6U;
+  sum += (uint16_t)tcp_len;
+  sum = tap_sum_add (sum, tcp, tcp_len);
+  return tap_sum_fld (sum);
+}
+
+static uint16_t
+tap_tcp_sum_v6 (const uint8_t *ip6, const uint8_t *tcp, size_t tcp_len)
+{
+  uint32_t sum = 0;
+  sum = tap_sum_add (sum, ip6 + 8, 32);
+  sum += (uint32_t)((tcp_len >> 16) & 0xffffU);
+  sum += (uint32_t)(tcp_len & 0xffffU);
+  sum += 6U;
+  sum = tap_sum_add (sum, tcp, tcp_len);
+  return tap_sum_fld (sum);
+}
+
 static bool
 tap_tso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapTso *tso)
 {
@@ -1904,7 +1939,24 @@ tap_tso_seg (TapTso *tso, uint8_t *dst_vnet, size_t *dst_len)
   if (tso->pl_pos > 0)
     flags &= (uint8_t)~0x80U;
   tcp[13] = flags;
-  (void)ip;
+
+  size_t tcp_len = tso->tcp_hl + chunk_len;
+  tcp[16] = 0;
+  tcp[17] = 0;
+  if (tso->is_v6)
+    {
+      tap_u16_wr (ip + 4, (uint16_t)tcp_len);
+      tap_u16_wr (tcp + 16, tap_tcp_sum_v6 (ip, tcp, tcp_len));
+    }
+  else
+    {
+      uint16_t ip_len = (uint16_t)(tso->ip_hl + tcp_len);
+      tap_u16_wr (ip + 2, ip_len);
+      ip[10] = 0;
+      ip[11] = 0;
+      tap_u16_wr (ip + 10, tap_ip4_sum (ip, tso->ip_hl));
+      tap_u16_wr (tcp + 16, tap_tcp_sum_v4 (ip, tcp, tcp_len));
+    }
 
   *dst_len = VNET_HL + tso->pl_off + chunk_len;
   tso->pl_pos += chunk_len;
@@ -2680,9 +2732,9 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
     }
   else
     {
-      uint32_t n_frags = (uint32_t)((vnet_len + chunk_max - 1) / chunk_max);
-      if (n_frags == 0)
-        n_frags = 1;
+      size_t frag_vnet_max = frag_vnet_len_max (chunk_max);
+      if (frag_vnet_max == 0 || vnet_len > frag_vnet_max)
+        return false;
       uint32_t msg_id = g_frag_mid++;
       if (g_frag_mid == 0)
         g_frag_mid = 1;
@@ -2703,8 +2755,6 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
               = frag_bufs[tx_path_lcl.use_tcp ? 0 : *bc] + TAP_HR + PKT_HDR_SZ
                                 + sizeof (FragHdr) + ((rel_f != 0) ? 4U : 0U);
           memcpy (chunk_dst1, vnet_frame + off, chunk_len);
-          if (off > 0x7fffU)
-            break;
           size_t out_len = 0;
           bool mf = (off + chunk_len) < vnet_len;
           uint8_t *out_ptr = frag_bld_zc (cry_ctx, chunk_dst1, chunk_len, msg_id,
@@ -3096,8 +3146,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                           | (uint32_t)payload[3];
         uint16_t off_mf
             = (uint16_t)(((uint16_t)payload[4] << 8) | payload[5]);
-        uint16_t frag_off = (uint16_t)(off_mf & 0x7fffU);
-        bool mf = (off_mf & 0x8000U) != 0;
+        uint16_t frag_off = (uint16_t)(off_mf & FRAG_OFF_MASK);
+        bool mf = (off_mf & FRAG_MF_MASK) != 0;
         const uint8_t *chunk = payload + sizeof (FragHdr);
         size_t chunk_len = payload_len - sizeof (FragHdr);
         if (hdr->rel_f != 0 && memcmp (dest_lla, cfg->addr, 16) != 0)
@@ -3174,14 +3224,11 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         uint32_t req_id = 0;
         if (gsp_prs_stat_req (pt, pt_len, &req_id) != 0)
           break;
-        uint16_t txt_cap = UINT16_MAX;
-        char *txt = calloc (1, (size_t)txt_cap + 1U);
+        size_t txt_len = status_buf_bld (NULL, 0, rt, cfg, pool);
+        char *txt = calloc (1, txt_len + 1U);
         if (!txt)
           break;
-        size_t txt_len
-            = status_buf_bld (txt, (size_t)txt_cap + 1U, rt, cfg, pool);
-        if (txt_len > txt_cap)
-          txt_len = txt_cap;
+        (void)status_buf_bld (txt, txt_len + 1U, rt, cfg, pool);
         status_rsp_tx_local (cry_ctx, src_ip, src_port, req_id, txt, txt_len);
         free (txt);
         break;
@@ -3613,15 +3660,26 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 static void
 status_append (char *buf, size_t cap, size_t *len, const char *fmt, ...)
 {
-  if (!buf || !len || *len >= cap)
+  if (!len)
     return;
   va_list ap;
   va_start (ap, fmt);
-  int rc = vsnprintf (buf + *len, cap - *len, fmt, ap);
+  int rc;
+  if (!buf || cap == 0)
+    rc = vsnprintf (NULL, 0, fmt, ap);
+  else if (*len >= cap)
+    rc = 0;
+  else
+    rc = vsnprintf (buf + *len, cap - *len, fmt, ap);
   va_end (ap);
   if (rc <= 0)
     return;
   size_t add = (size_t)rc;
+  if (!buf || cap == 0)
+    {
+      *len += add;
+      return;
+    }
   if (add >= cap - *len)
     *len = cap - 1;
   else
@@ -3668,7 +3726,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
                   PPool *pool)
 {
   size_t len = 0;
-  if ((fd < 0 && (!buf || cap == 0)) || !rt || !cfg || !pool)
+  if ((fd < 0 && buf && cap == 0) || !rt || !cfg || !pool)
     return 0;
 #define STATUS_PUT(...)                                                        \
   do                                                                           \
