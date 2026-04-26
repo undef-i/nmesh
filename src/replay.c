@@ -320,23 +320,22 @@ rx_rp_probe_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
   return NULL;
 }
 
-bool
-rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
+static RxRp *
+rx_rp_find_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
 {
-  uint8_t sid[RX_RP_SID_SZ];
-  nonce_sid_rd (nonce, sid);
-  uint64_t cnt = nonce_cnt_rd (nonce);
-  uint64_t now = sys_ts ();
-  bool found = false;
   RxRp *slot = NULL;
+  bool probe_found = false;
 
-  if (g_rx_rp_cap == 0 && !rx_rp_rehash (RX_RP_CAP_INIT, now))
-    return false;
+  if (found)
+    *found = false;
+  if (g_rx_rp_cap == 0)
+    return NULL;
 
   if (g_rx_rp_last_idx < g_rx_rp_cap)
     {
       slot = rx_rp_hot_lookup_idx (g_rx_rp_last_idx, sid, now);
-      found = slot != NULL;
+      if (found)
+        *found = slot != NULL;
     }
   if (!slot)
     {
@@ -348,13 +347,56 @@ rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
           slot = rx_rp_hot_lookup_idx (idx, sid, now);
           if (slot)
             {
-              found = true;
+              if (found)
+                *found = true;
               break;
             }
         }
     }
   if (!slot)
-    slot = rx_rp_probe_slot (sid, now, &found);
+    {
+      slot = rx_rp_probe_slot (sid, now, &probe_found);
+      if (found)
+        *found = probe_found;
+    }
+  if (slot && found && *found)
+    rx_rp_hot_note ((uint32_t)(slot - g_rx_rp));
+  return slot;
+}
+
+bool
+rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
+{
+  uint8_t sid[RX_RP_SID_SZ];
+  nonce_sid_rd (nonce, sid);
+  uint64_t cnt = nonce_cnt_rd (nonce);
+  uint64_t now = sys_ts ();
+  bool found = false;
+  RxRp *slot = rx_rp_find_slot (sid, now, &found);
+  if (!slot || !found)
+    return true;
+  if (cnt > slot->max_cnt)
+    return true;
+  uint64_t df = slot->max_cnt - cnt;
+  if (df >= RX_RP_B)
+    return false;
+  return !rx_rp_map_tst (slot->map, cnt);
+}
+
+bool
+rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ])
+{
+  uint8_t sid[RX_RP_SID_SZ];
+  nonce_sid_rd (nonce, sid);
+  uint64_t cnt = nonce_cnt_rd (nonce);
+  uint64_t now = sys_ts ();
+  bool found = false;
+  RxRp *slot = NULL;
+
+  if (g_rx_rp_cap == 0 && !rx_rp_rehash (RX_RP_CAP_INIT, now))
+    return false;
+
+  slot = rx_rp_find_slot (sid, now, &found);
   if (!slot)
     return false;
   if (!found)
@@ -368,7 +410,6 @@ rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
   if (!slot)
     return false;
   rx_rp_hot_note ((uint32_t)(slot - g_rx_rp));
-
   if (!found)
     {
       rx_rp_slot_init (slot, sid, cnt, now);
