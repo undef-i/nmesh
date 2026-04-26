@@ -156,7 +156,7 @@ udp_rx_split_rsv (Udp *s, uint32_t need)
 static bool
 is_err_tns (int re)
 {
-  return (re == EAGAIN || re == EWOULDBLOCK || re == ENOBUFS);
+  return (re == EAGAIN || re == EWOULDBLOCK);
 }
 
 static bool
@@ -202,6 +202,8 @@ udp_tx_1 (Udp *s, const UdpMsg *m)
         g_unr_cb (m->dst_ip, m->dst_port);
       return 0;
     }
+  if (errno == ENOBUFS)
+    return 0;
   fprintf (stderr, "udp: sendto fallback drop errno=%d\n", errno);
   return 0;
 }
@@ -396,7 +398,7 @@ udp_gso_tx_seq (Udp *s, UdpMsg *msgs, int cnt)
           if (g_unr_cb)
             g_unr_cb (msgs[i].dst_ip, msgs[i].dst_port);
         }
-      else
+      else if (errno != ENOBUFS)
         {
           fprintf (stderr, "udp: gso send drop errno=%d seg=%zu cnt=%d\n",
                    errno, seg_len, grp_cnt);

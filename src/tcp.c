@@ -31,28 +31,25 @@ static bool tp_conn_rsv (TpRt *tp, uint32_t need);
 static bool tp_fd_idx_rsv (TpRt *tp, uint32_t need);
 static bool tp_hot_idx_rsv (TpRt *tp, uint32_t need);
 static void tp_send_cache_note (TpRt *tp, const TpConn *conn);
+static void tp_tx_ring_free (TpTxRing *ring);
 static bool tp_ip_is_zero (const uint8_t ip[16]);
+static bool tp_route_ep_guess (const Rt *rt, const uint8_t ip[16],
+                               uint16_t *port);
 static bool tp_lla_is_zero (const uint8_t lla[16]);
 static uint32_t tp_hash_lla (const uint8_t lla[16]);
 static uint32_t tp_hash_ep (const uint8_t ip[16], uint16_t port);
-static ssize_t tp_sock_write (int fd, const void *buf, size_t len);
 static ssize_t tp_sock_writev (int fd, const struct iovec *iov, int iovcnt);
+static void tp_conn_txq_sync (TpRt *tp, TpConn *conn);
 
 static uint32_t
 tp_conn_idx (const TpRt *tp, const TpConn *conn)
 {
-  if (!tp || !conn || !tp->conn_arr || conn < tp->conn_arr)
+  if (!tp || !conn || !tp->conn_arr)
     return TP_IDX_INV;
-  ptrdiff_t idx = conn - tp->conn_arr;
-  if (idx < 0 || (uint32_t)idx >= tp->conn_cap)
+  uint32_t idx = conn->slot_idx;
+  if (idx >= tp->conn_cap || tp->conn_arr[idx] != conn)
     return TP_IDX_INV;
-  return (uint32_t)idx;
-}
-
-static ssize_t
-tp_sock_write (int fd, const void *buf, size_t len)
-{
-  return send (fd, buf, len, MSG_NOSIGNAL);
+  return idx;
 }
 
 static ssize_t
@@ -109,7 +106,8 @@ tp_conn_limit_warn (TpRt *tp, const char *ctx)
     {
       for (uint32_t i = 0; i < tp->conn_cap; i++)
         {
-          if (tp->conn_arr[i].fd >= 0)
+          TpConn *conn = tp->conn_arr[i];
+          if (conn && conn->fd >= 0)
             live++;
         }
     }
@@ -153,6 +151,36 @@ tp_lla_is_zero (const uint8_t lla[16])
   return tp_ip_is_zero (lla);
 }
 
+static bool
+tp_route_ep_guess (const Rt *rt, const uint8_t ip[16], uint16_t *port)
+{
+  if (!rt || !ip || !port || tp_ip_is_zero (ip))
+    return false;
+  const Re *best = NULL;
+  uint64_t best_seen = 0;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (re->r2d != 0 || re->state == RT_DED || re->ep_port == 0)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0)
+        continue;
+      uint64_t seen = re->rx_ts;
+      if (re->pong_ts > seen)
+        seen = re->pong_ts;
+      if (!best || (re->is_act && !best->is_act)
+          || (re->is_act == best->is_act && seen > best_seen))
+        {
+          best = re;
+          best_seen = seen;
+        }
+    }
+  if (!best)
+    return false;
+  *port = best->ep_port;
+  return true;
+}
+
 static uint32_t
 tp_hash_mix64 (uint64_t x)
 {
@@ -182,18 +210,11 @@ static uint32_t
 tp_conn_txq_stop_bytes (const TpConn *conn)
 {
   uint32_t stop = (conn && conn->sndbuf_bytes > 0) ? conn->sndbuf_bytes : 0U;
+  if (stop > 0 && stop <= (UINT32_MAX / TP_TXQ_STOP_MULT))
+    stop *= TP_TXQ_STOP_MULT;
+  else if (stop > 0)
+    stop = UINT32_MAX;
   return (stop >= TP_TXQ_FRAME_BYTES) ? stop : TP_TXQ_FRAME_BYTES;
-}
-
-static uint32_t
-tp_conn_txq_cap (const TpConn *conn, bool hi)
-{
-  uint32_t stop = tp_conn_txq_stop_bytes (conn);
-  if (!hi)
-    return stop;
-  return (stop <= UINT32_MAX - TP_TXQ_FRAME_BYTES)
-           ? (stop + TP_TXQ_FRAME_BYTES)
-           : UINT32_MAX;
 }
 
 static void
@@ -208,6 +229,30 @@ tp_conn_sock_sync (TpConn *conn)
     conn->sndbuf_bytes = (uint32_t)sndbuf;
   else
     conn->sndbuf_bytes = TP_TXQ_FRAME_BYTES;
+}
+
+static void
+tp_conn_txq_sync (TpRt *tp, TpConn *conn)
+{
+  if (!tp || !conn)
+    return;
+  bool is_qd = conn->tx_q_bytes != 0;
+  if (conn->tx_qd != is_qd)
+    {
+      conn->tx_qd = is_qd;
+      if (is_qd)
+        (void)__atomic_add_fetch (&tp->tx_qd_cnt, 1U, __ATOMIC_RELAXED);
+      else
+        (void)__atomic_sub_fetch (&tp->tx_qd_cnt, 1U, __ATOMIC_RELAXED);
+    }
+  bool is_bp = conn->tx_q_bytes >= tp_conn_txq_stop_bytes (conn);
+  if (conn->tx_bp == is_bp)
+    return;
+  conn->tx_bp = is_bp;
+  if (is_bp)
+    (void)__atomic_add_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
+  else
+    (void)__atomic_sub_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
 }
 
 static bool
@@ -253,7 +298,7 @@ tp_conn_dedup_peer (TpRt *tp, int epfd, const uint8_t our_lla[16],
   TpConn *best = NULL;
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      TpConn *conn = &tp->conn_arr[i];
+      TpConn *conn = tp->conn_arr[i];
       if (!tp_conn_peer_match (conn, peer_lla))
         continue;
       if (!best || tp_conn_cmp (our_lla, conn, best) > 0)
@@ -264,7 +309,7 @@ tp_conn_dedup_peer (TpRt *tp, int epfd, const uint8_t our_lla[16],
 
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      TpConn *conn = &tp->conn_arr[i];
+      TpConn *conn = tp->conn_arr[i];
       if (conn == best || !tp_conn_peer_match (conn, peer_lla))
         continue;
       tp_conn_close (tp, epfd, conn);
@@ -279,7 +324,8 @@ tp_ev_upd (int epfd, const TpConn *conn)
   struct epoll_event ev;
   memset (&ev, 0, sizeof (ev));
   ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
-  if (conn->st == TP_ST_CONNECTING || conn->tx_hi_head || conn->tx_lo_head)
+  if (conn->st == TP_ST_CONNECTING || conn->tx_hi.len > 0
+      || conn->tx_lo.len > 0)
     ev.events |= EPOLLOUT;
   ev.data.u64 = TP_EV_CONN_BASE | (uint32_t)conn->fd;
   (void)epoll_ctl (epfd, EPOLL_CTL_MOD, conn->fd, &ev);
@@ -293,32 +339,166 @@ tp_ev_add (int epfd, const TpConn *conn)
   struct epoll_event ev;
   memset (&ev, 0, sizeof (ev));
   ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
-  if (conn->st == TP_ST_CONNECTING || conn->tx_hi_head || conn->tx_lo_head)
+  if (conn->st == TP_ST_CONNECTING || conn->tx_hi.len > 0
+      || conn->tx_lo.len > 0)
     ev.events |= EPOLLOUT;
   ev.data.u64 = TP_EV_CONN_BASE | (uint32_t)conn->fd;
   (void)epoll_ctl (epfd, EPOLL_CTL_ADD, conn->fd, &ev);
 }
 
-static void
-tp_txq_free (TpTxNode *head)
+static bool
+tp_tx_ring_cap_ok (uint32_t cap)
 {
-  while (head)
-    {
-      TpTxNode *next = head->next;
-      free (head);
-      head = next;
-    }
+  return cap > 0 && (cap & (cap - 1U)) == 0;
 }
 
 static void
-tp_conn_reset (TpConn *conn)
+tp_tx_ring_free (TpTxRing *ring)
 {
-  if (!conn)
+  if (!ring)
     return;
-  tp_txq_free (conn->tx_hi_head);
-  tp_txq_free (conn->tx_lo_head);
-  memset (conn, 0, sizeof (*conn));
+  free (ring->buf);
+  ring->buf = NULL;
+  ring->cap = 0;
+  ring->head = 0;
+  ring->len = 0;
+}
+
+static bool
+tp_tx_ring_rsv (TpTxRing *ring, uint32_t need)
+{
+  if (!ring)
+    return false;
+  if (need <= ring->cap)
+    return true;
+  uint32_t old_cap = ring->cap;
+  uint32_t base_need = need > TP_TXQ_FRAME_BYTES ? need : TP_TXQ_FRAME_BYTES;
+  uint32_t new_cap = old_cap ? old_cap : 1U;
+  while (new_cap < need)
+    {
+      if (new_cap > (UINT32_MAX / 2U))
+        {
+          new_cap = base_need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  while (new_cap < base_need)
+    {
+      if (new_cap > (UINT32_MAX / 2U))
+        {
+          new_cap = base_need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  if (!tp_tx_ring_cap_ok (new_cap))
+    return false;
+  uint8_t *new_buf = malloc (new_cap);
+  if (!new_buf)
+    return false;
+  if (ring->buf && ring->len > 0)
+    {
+      uint32_t tail = (ring->head + ring->len) & (ring->cap - 1U);
+      uint32_t first = ring->len;
+      if (tail <= ring->head)
+        {
+          first = ring->cap - ring->head;
+          if (first > ring->len)
+            first = ring->len;
+        }
+      memcpy (new_buf, ring->buf + ring->head, first);
+      if (ring->len > first)
+        memcpy (new_buf + first, ring->buf, ring->len - first);
+    }
+  free (ring->buf);
+  ring->buf = new_buf;
+  ring->cap = new_cap;
+  ring->head = 0;
+  return true;
+}
+
+static bool
+tp_tx_ring_write (TpTxRing *ring, const uint8_t *buf, uint32_t len)
+{
+  if (!ring || !buf || len == 0 || !ring->buf || ring->cap == 0
+      || len > (ring->cap - ring->len))
+    return false;
+  uint32_t tail = (ring->head + ring->len) & (ring->cap - 1U);
+  uint32_t first = ring->cap - tail;
+  if (first > len)
+    first = len;
+  memcpy (ring->buf + tail, buf, first);
+  if (len > first)
+    memcpy (ring->buf, buf + first, len - first);
+  ring->len += len;
+  return true;
+}
+
+static bool
+tp_tx_ring_write_frame (TpTxRing *ring, const uint8_t *data, size_t len,
+                        size_t skip)
+{
+  if (!ring || !data || len == 0 || len > UDP_PL_MAX)
+    return false;
+  uint32_t net_len = htonl ((uint32_t)len);
+  size_t frame_len = sizeof (net_len) + len;
+  if (skip >= frame_len)
+    return false;
+  if (frame_len - skip > UINT32_MAX)
+    return false;
+  if ((uint32_t)(frame_len - skip) > (ring->cap - ring->len))
+    return false;
+  if (skip < sizeof (net_len))
+    {
+      uint32_t hdr_skip = (uint32_t)skip;
+      uint32_t hdr_len = (uint32_t)sizeof (net_len) - hdr_skip;
+      if (!tp_tx_ring_write (ring, ((const uint8_t *)&net_len) + hdr_skip,
+                             hdr_len))
+        return false;
+      return tp_tx_ring_write (ring, data, (uint32_t)len);
+    }
+  return tp_tx_ring_write (ring, data + (skip - sizeof (net_len)),
+                           (uint32_t)(frame_len - skip));
+}
+
+static void
+tp_tx_ring_drop (TpTxRing *ring, uint32_t len)
+{
+  if (!ring || len == 0 || len > ring->len || ring->cap == 0)
+    return;
+  ring->head = (ring->head + len) & (ring->cap - 1U);
+  ring->len -= len;
+  if (ring->len == 0)
+    ring->head = 0;
+}
+
+static int
+tp_tx_ring_iov (const TpTxRing *ring, struct iovec iov[2])
+{
+  if (!ring || !iov || ring->len == 0 || !ring->buf || ring->cap == 0)
+    return 0;
+  uint32_t first = ring->cap - ring->head;
+  if (first > ring->len)
+    first = ring->len;
+  iov[0].iov_base = ring->buf + ring->head;
+  iov[0].iov_len = first;
+  if (ring->len == first)
+    return 1;
+  iov[1].iov_base = ring->buf;
+  iov[1].iov_len = ring->len - first;
+  return 2;
+}
+
+static TpConn *
+tp_conn_new (uint32_t slot_idx)
+{
+  TpConn *conn = calloc (1, sizeof (*conn));
+  if (!conn)
+    return NULL;
+  conn->slot_idx = slot_idx;
   conn->fd = -1;
+  return conn;
 }
 
 static bool
@@ -414,14 +594,34 @@ tp_conn_fd_unbind (TpRt *tp, const TpConn *conn)
 static void
 tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
 {
-  (void)tp;
-  if (!conn || conn->fd < 0)
+  if (!tp || !conn)
     return;
+  uint32_t idx = tp_conn_idx (tp, conn);
   int fd = conn->fd;
+  tp_conn_txq_sync (tp, conn);
+  if (conn->tx_qd)
+    {
+      conn->tx_qd = false;
+      (void)__atomic_sub_fetch (&tp->tx_qd_cnt, 1U, __ATOMIC_RELAXED);
+    }
+  if (conn->tx_bp)
+    {
+      conn->tx_bp = false;
+      (void)__atomic_sub_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
+    }
   tp_conn_fd_unbind (tp, conn);
-  (void)epoll_ctl (epfd, EPOLL_CTL_DEL, fd, NULL);
-  close (fd);
-  tp_conn_reset (conn);
+  conn->fd = -1;
+  if (idx != TP_IDX_INV)
+    tp->conn_arr[idx] = NULL;
+  tp_send_cache_reset (tp);
+  if (fd >= 0)
+    {
+      (void)epoll_ctl (epfd, EPOLL_CTL_DEL, fd, NULL);
+      close (fd);
+    }
+  tp_tx_ring_free (&conn->tx_hi);
+  tp_tx_ring_free (&conn->tx_lo);
+  free (conn);
 }
 
 static bool
@@ -441,7 +641,7 @@ tp_conn_rsv (TpRt *tp, uint32_t need)
         }
       new_cap *= 2U;
     }
-  TpConn *new_arr = realloc (tp->conn_arr, sizeof (*new_arr) * new_cap);
+  TpConn **new_arr = realloc (tp->conn_arr, sizeof (*new_arr) * new_cap);
   if (!new_arr)
     {
       fprintf (stderr,
@@ -451,9 +651,7 @@ tp_conn_rsv (TpRt *tp, uint32_t need)
     }
   tp->conn_arr = new_arr;
   for (uint32_t i = tp->conn_cap; i < new_cap; i++)
-    memset (&tp->conn_arr[i], 0, sizeof (tp->conn_arr[i]));
-  for (uint32_t i = tp->conn_cap; i < new_cap; i++)
-    tp->conn_arr[i].fd = -1;
+    tp->conn_arr[i] = NULL;
   if (!tp_hot_idx_rsv (tp, new_cap))
     return false;
   tp->conn_cap = new_cap;
@@ -467,18 +665,24 @@ tp_conn_alloc (TpRt *tp)
     return NULL;
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      if (tp->conn_arr[i].fd < 0)
+      if (!tp->conn_arr[i])
         {
-          tp_conn_reset (&tp->conn_arr[i]);
-          return &tp->conn_arr[i];
+          TpConn *conn = tp_conn_new (i);
+          if (!conn)
+            return NULL;
+          tp->conn_arr[i] = conn;
+          return conn;
         }
     }
   tp_conn_limit_warn (tp, "connection");
   uint32_t old_cap = tp->conn_cap;
   if (!tp_conn_rsv (tp, old_cap + 1U))
     return NULL;
-  tp_conn_reset (&tp->conn_arr[old_cap]);
-  return &tp->conn_arr[old_cap];
+  TpConn *conn = tp_conn_new (old_cap);
+  if (!conn)
+    return NULL;
+  tp->conn_arr[old_cap] = conn;
+  return conn;
 }
 
 static TpConn *
@@ -489,8 +693,8 @@ tp_conn_by_fd (TpRt *tp, int fd)
   uint32_t idx = tp->fd_idx_arr[fd];
   if (idx == TP_IDX_INV || idx >= tp->conn_cap)
     return NULL;
-  TpConn *conn = &tp->conn_arr[idx];
-  return conn->fd == fd ? conn : NULL;
+  TpConn *conn = tp->conn_arr[idx];
+  return (conn && conn->fd == fd) ? conn : NULL;
 }
 
 static TpConn *
@@ -500,8 +704,8 @@ tp_conn_by_peer (TpRt *tp, const uint8_t peer_lla[16])
     return NULL;
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      TpConn *conn = &tp->conn_arr[i];
-      if (conn->fd < 0 || !conn->auth)
+      TpConn *conn = tp->conn_arr[i];
+      if (!conn || conn->fd < 0 || !conn->auth)
         continue;
       if (tp_conn_peer_match (conn, peer_lla))
         return conn;
@@ -516,8 +720,8 @@ tp_conn_by_ep (TpRt *tp, const uint8_t ip[16], uint16_t port)
     return NULL;
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      TpConn *conn = &tp->conn_arr[i];
-      if (conn->fd < 0)
+      TpConn *conn = tp->conn_arr[i];
+      if (!conn || conn->fd < 0)
         continue;
       if (memcmp (conn->route_ip, ip, 16) != 0 || conn->route_port != port)
         continue;
@@ -538,7 +742,7 @@ tp_conn_hot_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
                                       & (tp->peer_hot_cap - 1U)];
       if (idx != TP_IDX_INV && idx < tp->conn_cap)
         {
-          TpConn *conn = &tp->conn_arr[idx];
+          TpConn *conn = tp->conn_arr[idx];
           if (conn->st == TP_ST_ESTABLISHED && conn->auth
               && tp_conn_peer_match (conn, peer_lla))
             return conn;
@@ -550,7 +754,7 @@ tp_conn_hot_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
         = tp->ep_hot_idx[tp_hash_ep (ip, port) & (tp->ep_hot_cap - 1U)];
       if (idx != TP_IDX_INV && idx < tp->conn_cap)
         {
-          TpConn *conn = &tp->conn_arr[idx];
+          TpConn *conn = tp->conn_arr[idx];
           if (conn->st == TP_ST_ESTABLISHED
               && memcmp (conn->route_ip, ip, 16) == 0
               && conn->route_port == port)
@@ -560,81 +764,24 @@ tp_conn_hot_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
   return NULL;
 }
 
-static TpTxNode *
-tp_tx_node_new (const uint8_t *data, size_t len, size_t skip)
-{
-  if (!data || len == 0 || len > UDP_PL_MAX)
-    return NULL;
-  uint32_t net_len = htonl ((uint32_t)len);
-  size_t frame_len = sizeof (net_len) + len;
-  if (skip >= frame_len)
-    return NULL;
-  size_t rem = frame_len - skip;
-  TpTxNode *node = malloc (sizeof (*node) + rem);
-  if (!node)
-    return NULL;
-  memset (node, 0, sizeof (*node));
-  node->len = (uint32_t)rem;
-  if (skip < sizeof (net_len))
-    {
-      size_t hdr_off = skip;
-      size_t hdr_rem = sizeof (net_len) - hdr_off;
-      memcpy (node->data, ((const uint8_t *)&net_len) + hdr_off, hdr_rem);
-      memcpy (node->data + hdr_rem, data, len);
-      return node;
-    }
-  memcpy (node->data, data + (skip - sizeof (net_len)), rem);
-  return node;
-}
-
 static bool
 tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len, size_t skip,
                  bool hi)
 {
   if (!conn)
     return false;
-  TpTxNode *node = tp_tx_node_new (data, len, skip);
-  if (!node)
+  size_t frame_len = sizeof (uint32_t) + len;
+  if (skip >= frame_len)
     return false;
-  uint32_t q_cap = tp_conn_txq_cap (conn, hi);
-  if (conn->tx_q_bytes > q_cap || node->len > q_cap - conn->tx_q_bytes)
-    {
-      free (node);
-      return false;
-    }
-  TpTxNode **head = hi ? &conn->tx_hi_head : &conn->tx_lo_head;
-  TpTxNode **tail = hi ? &conn->tx_hi_tail : &conn->tx_lo_tail;
-  if (*tail)
-    (*tail)->next = node;
-  else
-    *head = node;
-  *tail = node;
-  conn->tx_q_bytes += node->len;
+  uint32_t rem = (uint32_t)(frame_len - skip);
+  TpTxRing *ring = hi ? &conn->tx_hi : &conn->tx_lo;
+  uint32_t ring_need = ring->len + rem;
+  if (!tp_tx_ring_rsv (ring, ring_need))
+    return false;
+  if (!tp_tx_ring_write_frame (ring, data, len, skip))
+    return false;
+  conn->tx_q_bytes += rem;
   return true;
-}
-
-static TpTxNode *
-tp_conn_tx_head (TpConn *conn, TpTxNode ***head_out, TpTxNode ***tail_out)
-{
-  if (!conn)
-    return NULL;
-  if (conn->tx_hi_head)
-    {
-      if (head_out)
-        *head_out = &conn->tx_hi_head;
-      if (tail_out)
-        *tail_out = &conn->tx_hi_tail;
-      return conn->tx_hi_head;
-    }
-  if (conn->tx_lo_head)
-    {
-      if (head_out)
-        *head_out = &conn->tx_lo_head;
-      if (tail_out)
-        *tail_out = &conn->tx_lo_tail;
-      return conn->tx_lo_head;
-    }
-  return NULL;
 }
 
 static bool
@@ -644,45 +791,38 @@ tp_conn_flush (TpRt *tp, int epfd, TpConn *conn)
     return false;
   for (;;)
     {
-      TpTxNode **head = NULL;
-      TpTxNode **tail = NULL;
-      TpTxNode *node = tp_conn_tx_head (conn, &head, &tail);
-      if (!node)
+      TpTxRing *ring = conn->tx_hi.len > 0 ? &conn->tx_hi : &conn->tx_lo;
+      if (ring->len == 0)
         {
+          tp_conn_txq_sync (tp, conn);
           tp_ev_upd (epfd, conn);
           return true;
         }
-      ssize_t n
-        = tp_sock_write (conn->fd, node->data + node->off, node->len - node->off);
+      struct iovec iov[2];
+      int iovcnt = tp_tx_ring_iov (ring, iov);
+      ssize_t n = tp_sock_writev (conn->fd, iov, iovcnt);
       if (n < 0)
         {
           if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
+              tp_conn_txq_sync (tp, conn);
               tp_ev_upd (epfd, conn);
               return true;
             }
-          tp_conn_close (tp, epfd, conn);
           return false;
         }
       if (n == 0)
         {
+          tp_conn_txq_sync (tp, conn);
           tp_ev_upd (epfd, conn);
           return true;
         }
+      tp_tx_ring_drop (ring, (uint32_t)n);
       if (conn->tx_q_bytes >= (uint32_t)n)
         conn->tx_q_bytes -= (uint32_t)n;
       else
         conn->tx_q_bytes = 0;
-      node->off += (uint32_t)n;
-      if (node->off < node->len)
-        {
-          tp_ev_upd (epfd, conn);
-          return true;
-        }
-      *head = node->next;
-      if (!*head)
-        *tail = NULL;
-      free (node);
+      tp_conn_txq_sync (tp, conn);
     }
 }
 
@@ -696,41 +836,45 @@ tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
     {
       if (!tp_conn_enqueue (conn, data, len, 0, false))
         return false;
+      tp_conn_txq_sync (tp, conn);
       tp_ev_upd (epfd, conn);
       return true;
     }
-  if (conn->tx_hi_head || conn->tx_lo_head)
+  if (conn->tx_hi.len == 0 && conn->tx_lo.len == 0)
     {
-      if (!tp_conn_enqueue (conn, data, len, 0, hi))
-        return false;
-      tp_ev_upd (epfd, conn);
-      return tp_conn_flush (tp, epfd, conn);
-    }
-  uint32_t net_len = htonl ((uint32_t)len);
-  struct iovec iov[2];
-  iov[0].iov_base = &net_len;
-  iov[0].iov_len = sizeof (net_len);
-  iov[1].iov_base = (void *)data;
-  iov[1].iov_len = len;
-  size_t want = sizeof (net_len) + len;
-  ssize_t n = tp_sock_writev (conn->fd, iov, 2);
-  if (n < 0)
-    {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      uint32_t net_len = htonl ((uint32_t)len);
+      struct iovec iov[2];
+      iov[0].iov_base = &net_len;
+      iov[0].iov_len = sizeof (net_len);
+      iov[1].iov_base = (void *)data;
+      iov[1].iov_len = len;
+      size_t want = sizeof (net_len) + len;
+      ssize_t n = tp_sock_writev (conn->fd, iov, 2);
+      if (n < 0)
         {
-          if (!tp_conn_enqueue (conn, data, len, 0, hi))
+          if (errno != EAGAIN && errno != EWOULDBLOCK)
             return false;
+        }
+      else if ((size_t)n == want)
+        {
+          return true;
+        }
+      else if (n > 0)
+        {
+          if (!tp_conn_enqueue (conn, data, len, (size_t)n, hi))
+            return false;
+          tp_conn_txq_sync (tp, conn);
           tp_ev_upd (epfd, conn);
           return true;
         }
-      return false;
     }
-  if ((size_t)n == want)
-    return true;
-  if (!tp_conn_enqueue (conn, data, len, (size_t)n, hi))
+  if (!tp_conn_enqueue (conn, data, len, 0, hi))
     return false;
+  tp_conn_txq_sync (tp, conn);
   tp_ev_upd (epfd, conn);
-  return true;
+  if (!hi && conn->tx_q_bytes >= tp_conn_txq_stop_bytes (conn))
+    return true;
+  return tp_conn_flush (tp, epfd, conn);
 }
 
 static bool
@@ -744,7 +888,9 @@ tp_send_hello (TpConn *conn)
   size_t ping_len = 0;
   ping_bld (g_tp_cry, g_tp_cfg->addr, sys_ts (), g_tp_sid, 0, ping_buf,
             &ping_len);
-  if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, ping_buf, ping_len, true))
+  bool ok
+    = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, ping_buf, ping_len, true);
+  if (!ok)
     return false;
   conn->hello_tx = true;
   return true;
@@ -765,11 +911,11 @@ tp_conn_route_sync (TpConn *conn, const Rt *rt)
     }
   if (conn->route_port != 0)
     return;
-  if (conn->inbound && g_tp_cfg && !tp_ip_is_zero (conn->sock_ip)
-      && g_tp_cfg->port != 0)
+  if (conn->inbound && !tp_ip_is_zero (conn->sock_ip)
+      && tp_route_ep_guess (rt, conn->sock_ip, &route_port))
     {
       memcpy (conn->route_ip, conn->sock_ip, 16);
-      conn->route_port = g_tp_cfg->port;
+      conn->route_port = route_port;
     }
 }
 
@@ -779,8 +925,6 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
 {
   if (!tp || !conn || !cfg || !g_tp_cry || !frame || len == 0)
     return false;
-  if (len < PKT_HDR_SZ || !rx_rp_chk (frame + PKT_CH_SZ))
-    return false;
   uint8_t pt_buf[UDP_PL_MAX];
   PktHdr hdr;
   uint8_t *pt = NULL;
@@ -788,8 +932,6 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
   if (pkt_dec (g_tp_cry, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr,
                &pt, &pt_len)
       != 0)
-    return false;
-  if (!rx_rp_cmt (frame + PKT_CH_SZ))
     return false;
   uint8_t peer_lla[16] = { 0 };
   if (hdr.pkt_type == PT_PING)
@@ -933,10 +1075,15 @@ tp_rt_free (TpRt *tp)
     return;
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      if (tp->conn_arr && tp->conn_arr[i].fd >= 0)
-        close (tp->conn_arr[i].fd);
-      if (tp->conn_arr)
-        tp_conn_reset (&tp->conn_arr[i]);
+      TpConn *conn = tp->conn_arr ? tp->conn_arr[i] : NULL;
+      if (!conn)
+        continue;
+      if (conn->fd >= 0)
+        close (conn->fd);
+      tp->conn_arr[i] = NULL;
+      tp_tx_ring_free (&conn->tx_hi);
+      tp_tx_ring_free (&conn->tx_lo);
+      free (conn);
     }
   free (tp->conn_arr);
   tp->conn_arr = NULL;
@@ -995,15 +1142,12 @@ tp_send_fd (int fd, const uint8_t *data, size_t len)
       tp_unlock (g_tp_rt);
       return false;
     }
-  if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, true))
-    {
-      tp_conn_close (g_tp_rt, g_tp_epfd, conn);
-      tp_unlock (g_tp_rt);
-      return false;
-    }
+  bool ok = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, true);
+  if (!ok)
+    tp_conn_close (g_tp_rt, g_tp_epfd, conn);
   tp_send_cache_note (g_tp_rt, conn);
   tp_unlock (g_tp_rt);
-  return true;
+  return ok;
 }
 
 static bool
@@ -1033,15 +1177,12 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
     conn = tp_conn_by_ep (g_tp_rt, ip, port);
   if (conn)
     {
-      if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, hi))
-        {
-          tp_conn_close (g_tp_rt, g_tp_epfd, conn);
-          tp_unlock (g_tp_rt);
-          return false;
-        }
+      bool ok = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, hi);
+      if (!ok)
+        tp_conn_close (g_tp_rt, g_tp_epfd, conn);
       tp_send_cache_note (g_tp_rt, conn);
       tp_unlock (g_tp_rt);
-      return true;
+      return ok;
     }
 
   int fd = socket (AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -1068,8 +1209,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
     }
   if (!tp_conn_fd_bind (g_tp_rt, n_conn, fd))
     {
-      tp_conn_reset (n_conn);
-      close (fd);
+      tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
     }
@@ -1130,22 +1270,19 @@ tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
 }
 
 bool
+tp_tx_pending (void)
+{
+  if (!g_tp_rt)
+    return false;
+  return __atomic_load_n (&g_tp_rt->tx_qd_cnt, __ATOMIC_RELAXED) != 0;
+}
+
+bool
 tp_w_want (void)
 {
   if (!g_tp_rt)
     return false;
-  tp_lock (g_tp_rt);
-  for (uint32_t i = 0; i < g_tp_rt->conn_cap; i++)
-    {
-      if (g_tp_rt->conn_arr[i].tx_q_bytes
-          >= tp_conn_txq_stop_bytes (&g_tp_rt->conn_arr[i]))
-        {
-          tp_unlock (g_tp_rt);
-          return true;
-        }
-    }
-  tp_unlock (g_tp_rt);
-  return false;
+  return __atomic_load_n (&g_tp_rt->tx_bp_cnt, __ATOMIC_RELAXED) != 0;
 }
 
 void
@@ -1157,8 +1294,8 @@ tp_rt_tick (TpRt *tp, const Rt *rt, const Cfg *cfg)
   uint64_t now = sys_ts ();
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
-      TpConn *conn = &tp->conn_arr[i];
-      if (conn->fd < 0)
+      TpConn *conn = tp->conn_arr[i];
+      if (!conn || conn->fd < 0)
         continue;
       if (conn->auth)
         tp_conn_route_sync (conn, rt);
@@ -1204,8 +1341,7 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
         }
       if (!tp_conn_fd_bind (tp, conn, fd))
         {
-          tp_conn_reset (conn);
-          close (fd);
+          tp_conn_close (tp, epfd, conn);
           continue;
         }
       conn->st = TP_ST_ESTABLISHED;
@@ -1267,10 +1403,12 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
         }
       if ((events & EPOLLOUT) != 0 && conn->fd >= 0
           && conn->st == TP_ST_ESTABLISHED
-          && (conn->tx_hi_head || conn->tx_lo_head))
+          && (conn->tx_hi.len > 0 || conn->tx_lo.len > 0))
         {
-          if (!tp_conn_flush (tp, epfd, conn))
+          bool ok = tp_conn_flush (tp, epfd, conn);
+          if (!ok)
             {
+              tp_conn_close (tp, epfd, conn);
               tp_unlock (tp);
               return;
             }

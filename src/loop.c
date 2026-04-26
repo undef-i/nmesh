@@ -436,8 +436,7 @@ tap_loop (void *arg)
       uint64_t now = sys_ts ();
       bool tap_ok = true;
       int done_cnt = 0;
-      while (done_cnt < take_cnt && !udp_w_want (tap_pipe->udp)
-             && !tp_w_want ())
+      while (done_cnt < take_cnt && !udp_w_want (tap_pipe->udp))
         {
           uint32_t idx = idx_arr[done_cnt];
           tap_ok = tap_frame_tx (tap_pipe->tap_fd, tap_pipe->udp,
@@ -448,6 +447,8 @@ tap_loop (void *arg)
           if (!tap_ok)
             break;
           done_cnt++;
+          if (tp_tx_pending ())
+            break;
         }
       bool flush_ok = tap_frame_flush (tap_pipe->udp);
       bool want_w = udp_w_want (tap_pipe->udp);
@@ -2422,6 +2423,30 @@ frame_l3_info_get (const uint8_t *frame_pkt, size_t frame_len, size_t *l3_off,
     }
 }
 
+static uint8_t
+frame_l4_proto_get (const uint8_t *frame_pkt, size_t frame_len, size_t l3_off,
+                    uint16_t eth_type)
+{
+  if (!frame_pkt || frame_len <= l3_off)
+    return 0;
+  if (eth_type == ETH_P_IP)
+    {
+      if (frame_len < l3_off + 20U)
+        return 0;
+      uint8_t ihl = (uint8_t)((frame_pkt[l3_off] & 0x0fU) * 4U);
+      if (ihl < 20U || frame_len < l3_off + ihl)
+        return 0;
+      return frame_pkt[l3_off + 9U];
+    }
+  if (eth_type == ETH_P_IPV6)
+    {
+      if (frame_len < l3_off + 40U)
+        return 0;
+      return frame_pkt[l3_off + 6U];
+    }
+  return 0;
+}
+
 static bool
 tap_tx_use_tcp (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
                 uint16_t port)
@@ -2700,6 +2725,13 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   size_t l3_off = ETH_HLEN;
   uint16_t eth_type = 0;
   frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
+  if (tx_path_lcl.use_tcp)
+    {
+      uint8_t l4_proto
+        = frame_l4_proto_get (frame_pkt, frame_len, l3_off, eth_type);
+      if (l4_proto == IPPROTO_UDP && tp_w_want ())
+        return true;
+    }
   if (!tx_path_lcl.use_tcp && mss_apply
       && (eth_type == 0x0800U || eth_type == 0x86DDU)
       && frame_len > l3_off)
@@ -3028,7 +3060,7 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       int rd_cnt = 0;
       for (int i = 0; i < BATCH_MAX; i++)
         {
-          if (udp_w_want (udp) || tp_w_want ())
+          if (udp_w_want (udp))
             break;
           uint8_t *pl_ptr = frame_bufs[i] + TAP_HR;
           ssize_t n = read (tap_fd, pl_ptr, TAP_F_MAX);
@@ -3045,10 +3077,12 @@ on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               rd_cnt = -1;
               break;
             }
+          if (tp_tx_pending ())
+            break;
         }
       if (!tap_frame_flush (udp))
         break;
-      if (rd_cnt < 0 || udp_w_want (udp) || tp_w_want () || hit_eagain
+      if (rd_cnt < 0 || udp_w_want (udp) || tp_tx_pending () || hit_eagain
           || rd_cnt < BATCH_MAX)
         break;
     }

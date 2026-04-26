@@ -256,6 +256,7 @@ void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 void rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 bool rt_dat_upd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 RtDec rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p);
+uint16_t rt_dir_mtu_get (const Rt *t, const Re *re);
 uint16_t rt_mtu (const Rt *t, const RtDec *sel);
 void rt_mtu_probe_set (Rt *t, bool is_on);
 void rt_mtu_probe_idle (Rt *t);
