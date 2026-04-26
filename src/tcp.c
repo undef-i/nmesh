@@ -1,6 +1,7 @@
 #include "tcp.h"
 #include "gossip.h"
 #include "packet.h"
+#include "replay.h"
 #include "utils.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -778,6 +779,8 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
 {
   if (!tp || !conn || !cfg || !g_tp_cry || !frame || len == 0)
     return false;
+  if (len < PKT_HDR_SZ || !rx_rp_chk (frame + PKT_CH_SZ))
+    return false;
   uint8_t pt_buf[UDP_PL_MAX];
   PktHdr hdr;
   uint8_t *pt = NULL;
@@ -785,6 +788,8 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
   if (pkt_dec (g_tp_cry, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr,
                &pt, &pt_len)
       != 0)
+    return false;
+  if (!rx_rp_cmt (frame + PKT_CH_SZ))
     return false;
   uint8_t peer_lla[16] = { 0 };
   if (hdr.pkt_type == PT_PING)

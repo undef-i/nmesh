@@ -472,6 +472,7 @@ tap_loop (void *arg)
 
 static uint64_t um_prb_intv (uint64_t age_ms);
 static bool lla_is_z (const uint8_t lla[16]);
+static bool is_ip_loopback (const uint8_t ip[16]);
 static void pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re,
                       uint64_t ts, uint64_t sid, bool may_rel);
 
@@ -499,10 +500,30 @@ udp_dec_run (Cry *cry_ctx, UdpRxPkt pkt_arr[], UdpDecRes res_arr[],
 {
   for (int i = 0; i < pkt_cnt; i++)
     {
+      uint8_t *raw = pkt_arr[i].data;
+      size_t raw_len = pkt_arr[i].data_len;
+      bool bypass_replay = is_ip_loopback (pkt_arr[i].src_ip)
+                           && raw_len >= PKT_HDR_SZ
+                           && (raw[0] & PKT_TF_TYPE_MASK) == PT_STAT_REQ;
+      if (!bypass_replay)
+        {
+          if (raw_len < PKT_HDR_SZ || !rx_rp_chk (raw + PKT_CH_SZ))
+            {
+              res_arr[i].dec_res = -1;
+              continue;
+            }
+        }
       res_arr[i].dec_res = pkt_dec (cry_ctx, pkt_arr[i].data,
                                     pkt_arr[i].data_len, NULL, 0,
                                     &res_arr[i].hdr, &res_arr[i].pt,
                                     &res_arr[i].pt_len);
+      if (res_arr[i].dec_res != 0)
+        continue;
+      if (!bypass_replay && !rx_rp_cmt (raw + PKT_CH_SZ))
+        {
+          res_arr[i].dec_res = -1;
+          continue;
+        }
     }
 }
 
@@ -3388,6 +3409,14 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   if (rx_src_ep_get (src, NULL, 0, src_ip, &src_port))
     rt_rx_ack (ctx->rt, src_ip, src_port, ts);
 
+  bool bypass_replay = is_ip_loopback (src_ip) && len >= PKT_HDR_SZ
+                       && (frame[0] & PKT_TF_TYPE_MASK) == PT_STAT_REQ;
+  if (!bypass_replay)
+    {
+      if (len < PKT_HDR_SZ || !rx_rp_chk (frame + PKT_CH_SZ))
+        return;
+    }
+
   uint8_t pt_buf[UDP_PL_MAX];
   PktHdr hdr;
   uint8_t *pt = NULL;
@@ -3395,6 +3424,8 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   if (pkt_dec (ctx->cry_ctx, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf),
                &hdr, &pt, &pt_len)
       != 0)
+    return;
+  if (!bypass_replay && !rx_rp_cmt (frame + PKT_CH_SZ))
     return;
   on_rx_dec_pkt (ctx, src, NULL, 0, len, &hdr, pt, pt_len, ts);
   gro_fls_all (ctx->tap_fd);
@@ -3434,7 +3465,6 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       for (int i = 0; i < rc; i++)
         {
-          uint8_t *raw_buf = pkt_arr[i].data;
           uint8_t *src_ip = pkt_arr[i].src_ip;
           uint16_t src_port = pkt_arr[i].src_port;
           size_t pkt_len = pkt_arr[i].data_len;
@@ -3451,10 +3481,6 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             }
 
           if (dec_arr[i].dec_res != 0)
-            continue;
-          bool bypass_replay
-              = is_ip_loopback (src_ip) && hdr->pkt_type == PT_STAT_REQ;
-          if (!bypass_replay && !rx_rp_chk (raw_buf + PKT_CH_SZ))
             continue;
           on_rx_dec_pkt (&ctx, NULL, src_ip, src_port, pkt_len, hdr, pt,
                          pt_len, ts);
