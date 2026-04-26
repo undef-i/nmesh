@@ -298,3 +298,4 @@ void pp_init (PPool *p, const char *persist_path);
 void pp_free (PPool *p);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
 void rt_gsp_dirty_set (Rt *t, const char *r);
+bool rt_gsp_refresh_due (const Rt *t, uint64_t sys_ts);
