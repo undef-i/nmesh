@@ -691,6 +691,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
       ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port, ts);
       re->prb_ts = p_ts;
       re->prb_tok = p_tok;
+      re->prb_tx_cnt++;
     }
 }
 
@@ -740,6 +741,56 @@ re_show_rtt (const Re *re)
   if (re->rt_m > 0 && re->rt_m < RT_M_INF && re->rt_m != RTT_UNK)
     return re->rt_m;
   return RT_M_INF;
+}
+
+static bool
+re_loss_pct_get (const Re *re, uint32_t *out_pct)
+{
+  if (!re || !out_pct || re->prb_tx_cnt == 0 || re->prb_rx_cnt > re->prb_tx_cnt)
+    return false;
+  uint64_t lost = re->prb_tx_cnt - re->prb_rx_cnt;
+  *out_pct = (uint32_t)((lost * 100ULL + (re->prb_tx_cnt / 2ULL))
+                        / re->prb_tx_cnt);
+  return true;
+}
+
+static bool
+rt_show_loss (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel,
+              uint32_t *out_pct)
+{
+  if (!rt || !dst_lla || !sel || !out_pct)
+    return false;
+  if (sel->type == RT_DIR)
+    {
+      for (uint32_t i = 0; i < rt->cnt; i++)
+        {
+          const Re *re = &rt->re_arr[i];
+          if (!re->is_act || re->state == RT_DED || re->r2d != 0)
+            continue;
+          if (memcmp (re->lla, dst_lla, 16) != 0)
+            continue;
+          if (memcmp (re->ep_ip, sel->dir.ip, 16) != 0
+              || re->ep_port != sel->dir.port)
+            continue;
+          return re_loss_pct_get (re, out_pct);
+        }
+      return false;
+    }
+  if (sel->type == RT_REL)
+    {
+      for (uint32_t i = 0; i < rt->cnt; i++)
+        {
+          const Re *re = &rt->re_arr[i];
+          if (!re->is_act || re->state == RT_DED || re->r2d != 0)
+            continue;
+          if (memcmp (re->ep_ip, sel->rel.relay_ip, 16) != 0
+              || re->ep_port != sel->rel.relay_port)
+            continue;
+          return re_loss_pct_get (re, out_pct);
+        }
+      return false;
+    }
+  return false;
 }
 
 static uint32_t
@@ -3907,6 +3958,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
     char metric[32];
     char st[10];
     char mtu[64];
+    char loss[16];
   } RRow;
   uint8_t (*uniq_lla)[16] = NULL;
   size_t uniq_cap = 0;
@@ -3948,7 +4000,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
     }
 
   int r_cnt = 0, act_map_cnt = 0, m_dst = 3, m_nh = 7, m_st = 5, m_mtu = 3,
-      m_metric = 8;
+      m_metric = 8, m_loss = 4;
   for (int u = 0; u < u_cnt; u++)
     {
       RtDec sel = rt_sel (rt, uniq_lla[u], cfg->p2p == P2P_EN);
@@ -3992,6 +4044,8 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         inet_ntop (AF_INET6, sel.rel.relay_lla, nhop_str, sizeof (nhop_str));
 
       uint32_t show_rtt = rt_show_rtt (rt, uniq_lla[u], &sel);
+      uint32_t show_loss = 0;
+      bool has_loss = rt_show_loss (rt, uniq_lla[u], &sel, &show_loss);
       if (sel.type == RT_NONE || sel.type == RT_VP)
         {
           memset (sel_ip, 0, 16);
@@ -4000,6 +4054,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
           strcpy (row->st, sel.type == RT_NONE ? "unmapped" : "via");
           strcpy (row->metric, "-");
           strcpy (row->mtu, "-");
+          strcpy (row->loss, "-");
         }
       else
         {
@@ -4008,6 +4063,10 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             strcpy (row->metric, "-");
           else
             snprintf (row->metric, sizeof (row->metric), "%ums", show_rtt);
+          if (has_loss)
+            snprintf (row->loss, sizeof (row->loss), "%u%%", show_loss);
+          else
+            strcpy (row->loss, "-");
           if (tap_tx_use_tcp (rt, cfg, sel_ip, sel_port))
             strcpy (row->mtu, "-");
           else
@@ -4048,6 +4107,8 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         m_mtu = (int)strlen (row->mtu);
       if ((int)strlen (row->metric) > m_metric)
         m_metric = (int)strlen (row->metric);
+      if ((int)strlen (row->loss) > m_loss)
+        m_loss = (int)strlen (row->loss);
     }
 
   for (int um_idx = 0; um_idx < um_cnt; um_idx++)
@@ -4066,6 +4127,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
       strcpy (row->st, "unmapped");
       strcpy (row->metric, "-");
       strcpy (row->mtu, "-");
+      strcpy (row->loss, "-");
       if ((int)strlen (row->dst) > m_dst)
         m_dst = (int)strlen (row->dst);
       if ((int)strlen (row->nh) > m_nh)
@@ -4076,6 +4138,8 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         m_mtu = (int)strlen (row->mtu);
       if ((int)strlen (row->metric) > m_metric)
         m_metric = (int)strlen (row->metric);
+      if ((int)strlen (row->loss) > m_loss)
+        m_loss = (int)strlen (row->loss);
     }
 
   STATUS_PUT ("fib: active: %d/%u, static: %d, unmapped: %d\n", act_map_cnt,
@@ -4091,14 +4155,15 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               ctrl_tot_str, ctrl_tx_str, ctrl_rx_str);
   if (r_cnt > 0)
     {
-      STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, "dst", m_nh,
-                  "nexthop", m_st, "state", m_mtu, "mtu", m_metric,
-                  "rtt");
+      STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, "dst", m_nh,
+                  "nexthop", m_st, "state", m_mtu, "mtu", m_metric, "rtt",
+                  m_loss, "loss");
       for (int k = 0; k < r_cnt; k++)
         {
-          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst, rows[k].dst,
-                      m_nh, rows[k].nh, m_st, rows[k].st, m_mtu, rows[k].mtu,
-                      m_metric, rows[k].metric);
+          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", m_dst,
+                      rows[k].dst, m_nh, rows[k].nh, m_st, rows[k].st, m_mtu,
+                      rows[k].mtu, m_metric, rows[k].metric, m_loss,
+                      rows[k].loss);
         }
     }
 #undef STATUS_PUT

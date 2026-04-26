@@ -674,6 +674,8 @@ re_to_pth (const Re *re, Pth *pth)
   pth->hld_ts = re->hld_ts;
   pth->prb_ts = re->prb_ts;
   pth->prb_tok = re->prb_tok;
+  pth->prb_tx_cnt = re->prb_tx_cnt;
+  pth->prb_rx_cnt = re->prb_rx_cnt;
   pth->pnd_ts = re->pnd_ts;
   pth->hp_ts = re->hp_ts;
   pth->dat_ts = re->dat_ts;
@@ -1410,6 +1412,8 @@ rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
       re_rx_note (re, sys_ts);
       (void)re_dir_activate (re, sys_ts);
       re_rto_upd (re, rtt_ms);
+      re->prb_tok = 0;
+      re->prb_rx_cnt++;
       rt_map_mark (t);
       return true;
     }
