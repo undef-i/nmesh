@@ -154,6 +154,28 @@ mtu_inf_s (const Rt *rt, const uint8_t src_ip[16], uint16_t src_port)
   return best;
 }
 
+static bool
+gsp_has_mapped_ep (const uint8_t *pt, size_t act_cnt, const uint8_t ip[16],
+                   uint16_t port)
+{
+  if (!pt || !ip || port == 0)
+    return false;
+  for (size_t i = 0; i < act_cnt; i++)
+    {
+      GspEnt ent;
+      gsp_ent_des (&ent, pt + 2 + i * GSP_SZ);
+      static const uint8_t z_lla[16] = { 0 };
+      if (memcmp (ent.lla, z_lla, 16) == 0)
+        continue;
+      if (!IS_LLA_VAL (ent.lla))
+        continue;
+      if (memcmp (ent.ep_ip, ip, 16) != 0 || ent.ep_port != port)
+        continue;
+      return true;
+    }
+  return false;
+}
+
 bool
 is_ip_bgn (const uint8_t ip[16])
 {
@@ -199,29 +221,32 @@ pkt_enc (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
 }
 
 uint8_t *
-ping_bld (Cry *s, const uint8_t our_lla[16], uint64_t ts, uint64_t sid,
-          uint64_t prb_tok, uint8_t *buf, size_t *out_len)
+ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port, uint64_t ts,
+          uint64_t sid, uint64_t prb_tok, uint8_t *buf, size_t *out_len)
 {
   uint8_t payload[PING_PL_SZ];
   u64_wr (payload, ts);
   u64_wr (payload + 8, sid);
   memcpy (payload + 16, our_lla, 16);
-  u64_wr (payload + 32, prb_tok);
+  u16_wr (payload + 32, our_port);
+  u64_wr (payload + 34, prb_tok);
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_PING, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, PING_PL_SZ, buf, out_len);
 }
 
 uint8_t *
-pong_bld (Cry *s, const uint8_t our_lla[16], uint64_t o_ts, uint64_t sid,
-          uint64_t rx_ts, uint64_t prb_tok, uint8_t *buf, size_t *out_len)
+pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port, uint64_t o_ts,
+          uint64_t sid, uint64_t rx_ts, uint64_t prb_tok, uint8_t *buf,
+          size_t *out_len)
 {
   uint8_t payload[PONG_PL_SZ];
   u64_wr (payload, o_ts);
   u64_wr (payload + 8, sid);
   memcpy (payload + 16, our_lla, 16);
-  u64_wr (payload + 32, rx_ts);
-  u64_wr (payload + 40, prb_tok);
+  u16_wr (payload + 32, our_port);
+  u64_wr (payload + 34, rx_ts);
+  u64_wr (payload + 42, prb_tok);
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_PONG, 0, 32, hdr);
   return pkt_enc (s, hdr, payload, PONG_PL_SZ, buf, out_len);
@@ -567,7 +592,7 @@ gsp_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
 
 int
 on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
-         uint8_t *lla, uint64_t *prb_tok)
+         uint8_t *lla, uint16_t *port, uint64_t *prb_tok)
 {
   if (!pt || pt_len < PING_PL_SZ)
     return -1;
@@ -576,14 +601,16 @@ on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
     *sid = u64_rd (pt + 8);
   if (lla)
     memcpy (lla, pt + 16, 16);
+  if (port)
+    *port = u16_rd (pt + 32);
   if (prb_tok)
-    *prb_tok = u64_rd (pt + 32);
+    *prb_tok = u64_rd (pt + 34);
   return 0;
 }
 
 int
 on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
-         uint8_t *lla, uint64_t *rx_ts, uint64_t *prb_tok)
+         uint8_t *lla, uint16_t *port, uint64_t *rx_ts, uint64_t *prb_tok)
 {
   if (!pt || pt_len < PONG_PL_SZ)
     return -1;
@@ -593,10 +620,12 @@ on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
     *sid = u64_rd (pt + 8);
   if (lla)
     memcpy (lla, pt + 16, 16);
+  if (port)
+    *port = u16_rd (pt + 32);
   if (rx_ts)
-    *rx_ts = u64_rd (pt + 32);
+    *rx_ts = u64_rd (pt + 34);
   if (prb_tok)
-    *prb_tok = u64_rd (pt + 40);
+    *prb_tok = u64_rd (pt + 42);
   return 0;
 }
 
@@ -633,6 +662,8 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       if (is_z)
         {
           if (is_ip_bgn (gsp_ent.ep_ip))
+            continue;
+          if (gsp_has_mapped_ep (pt, act_cnt, gsp_ent.ep_ip, gsp_ent.ep_port))
             continue;
           if (allow_dir_hint
               && !p_is_me (rt, our_lla, gsp_ent.ep_ip, gsp_ent.ep_port))
@@ -839,7 +870,8 @@ on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
         {
           uint8_t p_buf[UDP_PL_MAX];
           size_t p_len;
-          ping_bld (s, o_lla, ts, sid, 0, p_buf, &p_len);
+          ping_bld (s, o_lla, cfg ? cfg->port : 0, ts, sid, 0, p_buf,
+                    &p_len);
           if (cfg)
             (void)tp_send_ctrl (udp, rt, cfg, req_re.ep_ip, req_re.ep_port,
                                 p_buf, p_len);

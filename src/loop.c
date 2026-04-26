@@ -685,7 +685,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
   size_t p_len = 0;
   uint64_t p_ts = sys_ts ();
   uint64_t p_tok = ((uint64_t)u32_rnd () << 32) | (uint64_t)u32_rnd ();
-  ping_bld (cry_ctx, cfg->addr, p_ts, sid, p_tok, p_buf, &p_len);
+  ping_bld (cry_ctx, cfg->addr, cfg->port, p_ts, sid, p_tok, p_buf, &p_len);
   if (tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, p_buf, p_len))
     {
       ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port, ts);
@@ -3307,9 +3307,13 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         uint64_t req_ts = 0;
         uint64_t peer_sid = 0;
         uint64_t prb_tok = 0;
+        uint16_t peer_port = 0;
         uint8_t peer_lla[16];
-        if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &prb_tok) != 0)
+        if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
+                     &prb_tok)
+            != 0)
           break;
+        (void)peer_port;
         if (hdr->rel_f == 0
             && !p2p_direct_peer_ok (cfg, rt, peer_lla,
                                     has_src ? src_ip : NULL, src_port))
@@ -3323,8 +3327,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           pp_add (pool, src_ip, src_port);
         static uint8_t pong_buf[UDP_PL_MAX];
         size_t pong_len = 0;
-        pong_bld (cry_ctx, cfg->addr, req_ts, sid, ts, prb_tok, pong_buf,
-                  &pong_len);
+        pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts, prb_tok,
+                  pong_buf, &pong_len);
         if (ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL, src_port,
                        pong_buf, pong_len))
           ctrl_tx_mark (rt, &rt->pong_tx_cnt, pong_len,
@@ -3337,11 +3341,13 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         uint64_t peer_sid = 0;
         uint64_t peer_rx_ts = 0;
         uint64_t prb_tok = 0;
+        uint16_t peer_port = 0;
         uint8_t peer_lla[16];
-        if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_rx_ts,
-                     &prb_tok)
+        if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
+                     &peer_rx_ts, &prb_tok)
             != 0)
           break;
+        (void)peer_port;
         if (hdr->rel_f == 0
             && !p2p_direct_peer_ok (cfg, rt, peer_lla,
                                     has_src ? src_ip : NULL, src_port))
@@ -3528,7 +3534,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 void
 gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
 {
-  if (!rt->gsp_dirty)
+  bool is_refresh = rt_gsp_refresh_due (rt, sys_ts ());
+  if (!rt->gsp_dirty && !is_refresh)
     return;
   uint64_t now = sys_ts ();
   if (rt->gsp_last_ts > 0 && now < rt->gsp_last_ts + 3000ULL)
@@ -3558,7 +3565,9 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
              (unsigned long)(now - rt->gsp_last_ts)); */
   static uint8_t g_buf[UDP_PL_MAX];
   size_t gsp_len = 0;
-  uint32_t start_off = (rt->cnt > 0) ? (rt->gsp_off % rt->cnt) : 0;
+  uint32_t start_off = 0;
+  if (!is_refresh)
+    start_off = (rt->cnt > 0) ? (rt->gsp_off % rt->cnt) : 0;
   gsp_bld (cry_ctx, rt, (int)start_off, cfg->addr, cfg->p2p == P2P_EN, g_buf,
            &gsp_len);
   if (gsp_len == 0)

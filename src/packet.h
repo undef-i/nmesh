@@ -33,8 +33,8 @@ typedef struct __attribute__ ((packed))
 #define PKT_PT_MAX (UDP_PL_MAX - PKT_HDR_SZ)
 #define TAP_HR 128
 #define TAP_TR 64
-#define PING_PL_SZ 40
-#define PONG_PL_SZ 48
+#define PING_PL_SZ 42
+#define PONG_PL_SZ 50
 #define FRAG_MF_MASK 0x8000U
 #define FRAG_OFF_MASK 0x7fffU
 

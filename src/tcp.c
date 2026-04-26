@@ -33,8 +33,6 @@ static bool tp_hot_idx_rsv (TpRt *tp, uint32_t need);
 static void tp_send_cache_note (TpRt *tp, const TpConn *conn);
 static void tp_tx_ring_free (TpTxRing *ring);
 static bool tp_ip_is_zero (const uint8_t ip[16]);
-static bool tp_route_ep_guess (const Rt *rt, const uint8_t ip[16],
-                               uint16_t *port);
 static bool tp_lla_is_zero (const uint8_t lla[16]);
 static uint32_t tp_hash_lla (const uint8_t lla[16]);
 static uint32_t tp_hash_ep (const uint8_t ip[16], uint16_t port);
@@ -149,36 +147,6 @@ static bool
 tp_lla_is_zero (const uint8_t lla[16])
 {
   return tp_ip_is_zero (lla);
-}
-
-static bool
-tp_route_ep_guess (const Rt *rt, const uint8_t ip[16], uint16_t *port)
-{
-  if (!rt || !ip || !port || tp_ip_is_zero (ip))
-    return false;
-  const Re *best = NULL;
-  uint64_t best_seen = 0;
-  for (uint32_t i = 0; i < rt->cnt; i++)
-    {
-      const Re *re = &rt->re_arr[i];
-      if (re->r2d != 0 || re->state == RT_DED || re->ep_port == 0)
-        continue;
-      if (memcmp (re->ep_ip, ip, 16) != 0)
-        continue;
-      uint64_t seen = re->rx_ts;
-      if (re->pong_ts > seen)
-        seen = re->pong_ts;
-      if (!best || (re->is_act && !best->is_act)
-          || (re->is_act == best->is_act && seen > best_seen))
-        {
-          best = re;
-          best_seen = seen;
-        }
-    }
-  if (!best)
-    return false;
-  *port = best->ep_port;
-  return true;
 }
 
 static uint32_t
@@ -886,8 +854,8 @@ tp_send_hello (TpConn *conn)
     return true;
   uint8_t ping_buf[UDP_PL_MAX];
   size_t ping_len = 0;
-  ping_bld (g_tp_cry, g_tp_cfg->addr, sys_ts (), g_tp_sid, 0, ping_buf,
-            &ping_len);
+  ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid, 0,
+            ping_buf, &ping_len);
   bool ok
     = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, ping_buf, ping_len, true);
   if (!ok)
@@ -906,15 +874,6 @@ tp_conn_route_sync (TpConn *conn, const Rt *rt)
   if (rt_peer_ep_fnd (rt, conn->peer_lla, route_ip, &route_port))
     {
       memcpy (conn->route_ip, route_ip, 16);
-      conn->route_port = route_port;
-      return;
-    }
-  if (conn->route_port != 0)
-    return;
-  if (conn->inbound && !tp_ip_is_zero (conn->sock_ip)
-      && tp_route_ep_guess (rt, conn->sock_ip, &route_port))
-    {
-      memcpy (conn->route_ip, conn->sock_ip, 16);
       conn->route_port = route_port;
     }
 }
@@ -939,8 +898,16 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
       uint64_t req_ts = 0;
       uint64_t peer_sid = 0;
       uint64_t prb_tok = 0;
-      if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &prb_tok) != 0)
+      uint16_t peer_port = 0;
+      if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
+                   &prb_tok)
+          != 0)
         return false;
+      if (conn->inbound && !tp_ip_is_zero (conn->sock_ip) && peer_port != 0)
+        {
+          memcpy (conn->route_ip, conn->sock_ip, 16);
+          conn->route_port = peer_port;
+        }
     }
   else if (hdr.pkt_type == PT_PONG)
     {
@@ -948,10 +915,16 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
       uint64_t peer_sid = 0;
       uint64_t peer_rx_ts = 0;
       uint64_t prb_tok = 0;
-      if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_rx_ts,
-                   &prb_tok)
+      uint16_t peer_port = 0;
+      if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
+                   &peer_rx_ts, &prb_tok)
           != 0)
         return false;
+      if (conn->inbound && !tp_ip_is_zero (conn->sock_ip) && peer_port != 0)
+        {
+          memcpy (conn->route_ip, conn->sock_ip, 16);
+          conn->route_port = peer_port;
+        }
     }
   else
     {

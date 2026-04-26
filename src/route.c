@@ -1718,6 +1718,14 @@ rt_gsp_dirty_set (Rt *t, const char *r)
     t->gsp_dirty = true;
 }
 
+bool
+rt_gsp_refresh_due (const Rt *t, uint64_t sys_ts)
+{
+  if (!t || t->gsp_dirty || t->gsp_last_ts == 0 || sys_ts <= t->gsp_last_ts)
+    return false;
+  return (sys_ts - t->gsp_last_ts) >= RT_UPD_INTV;
+}
+
 RtDec
 rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
 {
