@@ -83,6 +83,8 @@ typedef struct
   uint64_t hld_ts;
   uint64_t prb_ts;
   uint64_t prb_tok;
+  uint64_t prb_tx_cnt;
+  uint64_t prb_rx_cnt;
   uint64_t pnd_ts;
   uint64_t hp_ts;
   uint64_t dat_ts;
@@ -129,6 +131,8 @@ typedef struct Pth
   uint64_t hld_ts;
   uint64_t prb_ts;
   uint64_t prb_tok;
+  uint64_t prb_tx_cnt;
+  uint64_t prb_rx_cnt;
   uint64_t pnd_ts;
   uint64_t hp_ts;
   uint64_t dat_ts;
