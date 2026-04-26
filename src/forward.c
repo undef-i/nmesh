@@ -45,6 +45,15 @@ tx_path_pmtu_get (const Cfg *cfg, const uint8_t tx_ip[16], uint16_t path_mtu)
 }
 
 static bool
+tx_path_use_tcp (const Rt *rt, const Cfg *cfg, const uint8_t tx_ip[16],
+                 uint16_t tx_port)
+{
+  if (!rt || !cfg || !tx_ip || tx_port == 0)
+    return false;
+  return cfg_tp_pick (cfg, rt_ep_tp_mask (rt, tx_ip, tx_port)) == TP_PROTO_TCP;
+}
+
+static bool
 rt_nh_get (Rt *rt, const Cfg *cfg, const uint8_t dest_lla[16], RtDec *out_dec,
            uint8_t out_ip[16], uint16_t *out_port)
 {
@@ -130,22 +139,25 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (mtu < pmtu)
         pmtu = mtu;
     }
+  bool use_tcp = tx_path_use_tcp (rt, cfg, tx_ip, tx_port);
   pmtu = tx_path_pmtu_get (cfg, tx_ip, pmtu);
   static uint8_t relay_vnet_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
   uint8_t *relay_vnet = relay_vnet_buf + TAP_HR + PKT_HDR_SZ;
   memcpy (relay_vnet, vnet_frame, vnet_len);
   uint8_t *frame_pkt = relay_vnet + VNET_HL;
-  uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
+  uint16_t max_vnet = use_tcp ? tp_vnet_cap_get () : tnl_vnet_cap_get (pmtu, tx_ip);
   size_t l3_off = ETH_HLEN;
   uint16_t eth_type = 0;
   frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
-  if ((eth_type == 0x0800U || eth_type == 0x86DDU) && frame_len > l3_off)
+  if (!use_tcp && (eth_type == 0x0800U || eth_type == 0x86DDU)
+      && frame_len > l3_off)
     {
       uint16_t max_in_l3 = tnl_inner_l3_cap_get (max_vnet, l3_off);
       if (max_in_l3 >= 88U)
         mss_clp (frame_pkt + l3_off, frame_len - l3_off, max_in_l3);
     }
-  size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, true);
+  size_t chunk_max = use_tcp ? pkt_frag_pl_cap_get (true)
+                             : tnl_frag_pl_cap_get (max_vnet, true);
   if (chunk_max == 0)
     return false;
   bool is_tiny = false;
@@ -242,9 +254,11 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (mtu < pmtu)
         pmtu = mtu;
     }
+  bool use_tcp = tx_path_use_tcp (rt, cfg, tx_ip, tx_port);
   pmtu = tx_path_pmtu_get (cfg, tx_ip, pmtu);
-  uint16_t max_vnet = tnl_vnet_cap_get (pmtu, tx_ip);
-  size_t chunk_max = tnl_frag_pl_cap_get (max_vnet, true);
+  uint16_t max_vnet = use_tcp ? tp_vnet_cap_get () : tnl_vnet_cap_get (pmtu, tx_ip);
+  size_t chunk_max = use_tcp ? pkt_frag_pl_cap_get (true)
+                             : tnl_frag_pl_cap_get (max_vnet, true);
   if (chunk_max == 0)
     return false;
   size_t frag_vnet_max = frag_vnet_len_max (chunk_max);
