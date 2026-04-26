@@ -34,8 +34,8 @@ uint8_t *mtu_prb_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,
 uint8_t *mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,
                       uint8_t *buf, size_t *out_len);
 uint8_t *stat_req_bld (Cry *s, uint32_t req_id, uint8_t *buf, size_t *out_len);
-uint8_t *stat_rsp_bld (Cry *s, uint32_t req_id, uint16_t total_len,
-                       uint16_t off, const uint8_t *chunk, size_t chunk_len,
+uint8_t *stat_rsp_bld (Cry *s, uint32_t req_id, uint64_t total_len,
+                       uint64_t off, const uint8_t *chunk, size_t chunk_len,
                        uint8_t *buf, size_t *out_len);
 int pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
              size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out,
@@ -46,7 +46,7 @@ int gsp_prs_mtu_ack (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
                      uint16_t *probe_mtu);
 int gsp_prs_stat_req (const uint8_t *pt, size_t pt_len, uint32_t *req_id);
 int gsp_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
-                      uint16_t *off, uint16_t *total_len,
+                      uint64_t *off, uint64_t *total_len,
                       const uint8_t **chunk, size_t *chunk_len);
 int on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
              uint8_t *lla, uint64_t *prb_tok);

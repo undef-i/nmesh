@@ -37,21 +37,21 @@ cfg_free (Cfg *cfg)
 }
 
 static int
-cfg_tp_rsv (Cfg *cfg, uint8_t need)
+cfg_tp_rsv (Cfg *cfg, size_t need)
 {
   if (!cfg)
     return -1;
   if (need <= cfg->tp_pref_cap)
     return 0;
-  uint8_t new_cap = cfg->tp_pref_cap ? cfg->tp_pref_cap : TP_PREF_CAP_INIT;
+  size_t new_cap = cfg->tp_pref_cap ? cfg->tp_pref_cap : TP_PREF_CAP_INIT;
   while (new_cap < need)
     {
-      if (new_cap > (uint8_t)(UINT8_MAX / 2U))
+      if (new_cap > (SIZE_MAX / 2U))
         {
           new_cap = need;
           break;
         }
-      new_cap = (uint8_t)(new_cap * 2U);
+      new_cap *= 2U;
     }
   uint8_t *new_arr = realloc (cfg->tp_pref, sizeof (*new_arr) * new_cap);
   if (!new_arr)
@@ -412,15 +412,14 @@ tp_cfg_prs (const char *s, Cfg *cfg)
 {
   if (!s || !cfg)
     return -1;
-  char buf[128];
-  if (strlen (s) >= sizeof (buf))
+  char *buf = strdup (s);
+  if (!buf)
     return -1;
-  snprintf (buf, sizeof (buf), "%s", s);
 
   uint8_t mask = 0;
   uint8_t *pref = NULL;
-  uint8_t pref_cap = 0;
-  uint8_t pref_len = 0;
+  size_t pref_cap = 0;
+  size_t pref_len = 0;
   char *save = NULL;
   for (char *tok = strtok_r (buf, ",", &save); tok != NULL;
        tok = strtok_r (NULL, ",", &save))
@@ -428,17 +427,21 @@ tp_cfg_prs (const char *s, Cfg *cfg)
       tok = str_trm (tok);
       TpProto proto;
       if (tp_proto_prs (tok, &proto) != 0)
-        return -1;
+        {
+          free (buf);
+          free (pref);
+          return -1;
+        }
       uint8_t bit = tp_proto_mask (proto);
       if ((mask & bit) != 0)
         continue;
       if (pref_len >= pref_cap)
         {
-          uint8_t new_cap = pref_cap ? (uint8_t)(pref_cap * 2U)
-                                     : TP_PREF_CAP_INIT;
+          size_t new_cap = pref_cap ? (pref_cap * 2U) : TP_PREF_CAP_INIT;
           uint8_t *new_pref = realloc (pref, sizeof (*pref) * new_cap);
           if (!new_pref)
             {
+              free (buf);
               free (pref);
               return -1;
             }
@@ -450,10 +453,12 @@ tp_cfg_prs (const char *s, Cfg *cfg)
     }
   if (mask == 0 || pref_len == 0)
     {
+      free (buf);
       free (pref);
       return -1;
     }
 
+  free (buf);
   free (cfg->tp_pref);
   cfg->tp_mask = mask;
   cfg->tp_pref_len = pref_len;
@@ -477,8 +482,9 @@ cfg_load (const char *path, Cfg *cfg)
       cfg_free (cfg);
       return -1;
     }
-  char line[512];
-  while (fgets (line, sizeof (line), fp))
+  char *line = NULL;
+  size_t line_cap = 0;
+  while (getline (&line, &line_cap, fp) >= 0)
     {
       char *l_trm = str_trm (line);
       if (!l_trm[0] || l_trm[0] == '#')
@@ -494,6 +500,7 @@ cfg_load (const char *path, Cfg *cfg)
           if (str_to_v6 (v, cfg->addr) != 0)
             {
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -509,6 +516,7 @@ cfg_load (const char *path, Cfg *cfg)
           if (m_v < 128UL || m_v > 65535UL)
             {
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -529,6 +537,7 @@ cfg_load (const char *path, Cfg *cfg)
           else
             {
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -538,6 +547,7 @@ cfg_load (const char *path, Cfg *cfg)
           if (bool_prs (v, &cfg->mtu_probe) != 0)
             {
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -547,6 +557,7 @@ cfg_load (const char *path, Cfg *cfg)
           if (tp_cfg_prs (v, cfg) != 0)
             {
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -558,6 +569,7 @@ cfg_load (const char *path, Cfg *cfg)
               fprintf (stderr,
                        "config: out of memory while expanding bogon rules\n");
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -565,6 +577,7 @@ cfg_load (const char *path, Cfg *cfg)
             {
               fprintf (stderr, "config: invalid bogon rule: %s\n", v);
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
@@ -580,11 +593,13 @@ cfg_load (const char *path, Cfg *cfg)
           if (psk_prs (v, cfg->psk) != 0)
             {
               cfg_free (cfg);
+              free (line);
               fclose (fp);
               return -1;
             }
         }
     }
+  free (line);
   fclose (fp);
   uint8_t z16[16] = { 0 };
   if (memcmp (cfg->addr, z16, 16) == 0)
@@ -602,21 +617,6 @@ cfg_load (const char *path, Cfg *cfg)
 }
 
 int
-p_arr_ld (const char *path, P *p_arr, int max_cnt)
-{
-  P *tmp = NULL;
-  int cnt = 0;
-  if (p_arr_load (path, &tmp, &cnt) != 0)
-    return 0;
-  if (cnt > max_cnt)
-    cnt = max_cnt;
-  for (int i = 0; i < cnt; i++)
-    p_arr[i] = tmp[i];
-  free (tmp);
-  return cnt;
-}
-
-int
 p_arr_load (const char *path, P **out_arr, int *out_cnt)
 {
   if (out_arr)
@@ -629,8 +629,9 @@ p_arr_load (const char *path, P **out_arr, int *out_cnt)
   P *arr = NULL;
   int p_cnt = 0;
   int p_cap = 0;
-  char line[512];
-  while (fgets (line, sizeof (line), fp))
+  char *line = NULL;
+  size_t line_cap = 0;
+  while (getline (&line, &line_cap, fp) >= 0)
     {
       char *l_trm = str_trm (line);
       if (!l_trm[0] || l_trm[0] == '#')
@@ -655,6 +656,7 @@ p_arr_load (const char *path, P **out_arr, int *out_cnt)
                   fprintf (stderr,
                            "config: out of memory while expanding peer list\n");
                   free (arr);
+                  free (line);
                   fclose (fp);
                   return -1;
                 }
@@ -668,6 +670,7 @@ p_arr_load (const char *path, P **out_arr, int *out_cnt)
           fprintf (stderr, "config: invalid peer entry ignored: %s\n", v);
         }
     }
+  free (line);
   fclose (fp);
   if (out_arr)
     *out_arr = arr;

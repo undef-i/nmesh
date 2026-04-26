@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define CRY_NONCE_WIRE_SZ PKT_NONCE_SZ
-#define CRY_NONCE_SID_SZ (CRY_NONCE_WIRE_SZ - sizeof (uint64_t))
+#define CRY_NONCE_SID_SZ PKT_NONCE_SID_SZ
 #define CRY_MAC_SZ PKT_MAC_SZ
 
 typedef struct

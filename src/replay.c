@@ -7,7 +7,7 @@
 #define RX_RP_CAP_INIT 512U
 #define RX_RP_W 256
 #define RX_RP_B (RX_RP_W * 64)
-#define RX_RP_SID_SZ (PKT_NONCE_SZ - sizeof (uint64_t))
+#define RX_RP_SID_SZ PKT_NONCE_SID_SZ
 #define RX_RP_LF_NUM 3U
 #define RX_RP_LF_DEN 4U
 #define RX_RP_HOT_N (RX_RP_CAP_INIT / 128U)
@@ -41,7 +41,7 @@ static uint32_t g_rx_rp_hot_pos = 0;
 static uint64_t
 nonce_cnt_rd (const uint8_t nonce[PKT_NONCE_SZ])
 {
-  size_t off = PKT_NONCE_SZ - sizeof (uint64_t);
+  size_t off = PKT_NONCE_SID_SZ;
   return ((uint64_t)nonce[off] << 56) | ((uint64_t)nonce[off + 1] << 48)
          | ((uint64_t)nonce[off + 2] << 40)
          | ((uint64_t)nonce[off + 3] << 32)

@@ -52,7 +52,7 @@ typedef enum
   CMD_RESTART,
 } CmdMode;
 
-static char g_pidfile[PATH_MAX];
+static char *g_pidfile = NULL;
 static bool g_pidfile_armed = false;
 static int g_start_ready_fd = -1;
 static bool g_daemon_child = false;
@@ -73,39 +73,178 @@ fnv1a64 (const char *s)
   return h;
 }
 
-static int
-cfg_path_abs (const char *in, char out[PATH_MAX])
+static char *
+str_dup (const char *s)
 {
-  if (!in || !out)
-    return -1;
-  if (realpath (in, out))
-    return 0;
-  if (in[0] == '/')
-    {
-      snprintf (out, PATH_MAX, "%s", in);
-      return 0;
-    }
-  char cwd[PATH_MAX];
-  if (!getcwd (cwd, sizeof (cwd)))
-    return -1;
-  if (snprintf (out, PATH_MAX, "%s/%s", cwd, in) >= PATH_MAX)
-    return -1;
-  return 0;
+  if (!s)
+    return NULL;
+  size_t len = strlen (s) + 1U;
+  char *out = malloc (len);
+  if (!out)
+    return NULL;
+  memcpy (out, s, len);
+  return out;
 }
 
-static void
-pidfile_path_get (const char *cfg_abs, char out[PATH_MAX])
+static char *
+path_join_dup (const char *base, const char *name)
+{
+  if (!base || !name)
+    return NULL;
+  size_t base_len = strlen (base);
+  size_t name_len = strlen (name);
+  bool need_sep = (base_len > 0 && base[base_len - 1] != '/');
+  size_t out_len = base_len + (need_sep ? 1U : 0U) + name_len + 1U;
+  char *out = malloc (out_len);
+  if (!out)
+    return NULL;
+  memcpy (out, base, base_len);
+  size_t off = base_len;
+  if (need_sep)
+    {
+      out[off++] = '/';
+    }
+  memcpy (out + off, name, name_len + 1U);
+  return out;
+}
+
+static char *
+readlink_dup (const char *path)
+{
+  if (!path || !path[0])
+    return NULL;
+  size_t cap = 128;
+  for (;;)
+    {
+      char *buf = malloc (cap);
+      if (!buf)
+        return NULL;
+      ssize_t n = readlink (path, buf, cap - 1U);
+      if (n < 0)
+        {
+          free (buf);
+          return NULL;
+        }
+      if ((size_t)n < cap - 1U)
+        {
+          buf[n] = '\0';
+          return buf;
+        }
+      free (buf);
+      if (cap > (SIZE_MAX / 2U))
+        return NULL;
+      cap *= 2U;
+    }
+}
+
+static char *
+file_read_dup (const char *path, size_t *out_len)
+{
+  if (out_len)
+    *out_len = 0;
+  if (!path || !path[0])
+    return NULL;
+  int fd = open (path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return NULL;
+  size_t cap = 256;
+  size_t len = 0;
+  char *buf = malloc (cap + 1U);
+  if (!buf)
+    {
+      close (fd);
+      return NULL;
+    }
+  for (;;)
+    {
+      if (len == cap)
+        {
+          if (cap > (SIZE_MAX / 2U))
+            {
+              free (buf);
+              close (fd);
+              return NULL;
+            }
+          cap *= 2U;
+          char *new_buf = realloc (buf, cap + 1U);
+          if (!new_buf)
+            {
+              free (buf);
+              close (fd);
+              return NULL;
+            }
+          buf = new_buf;
+        }
+      ssize_t n = read (fd, buf + len, cap - len);
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          free (buf);
+          close (fd);
+          return NULL;
+        }
+      if (n == 0)
+        break;
+      len += (size_t)n;
+    }
+  close (fd);
+  buf[len] = '\0';
+  if (out_len)
+    *out_len = len;
+  return buf;
+}
+
+static char *
+cfg_path_abs_dup (const char *in)
+{
+  if (!in || !in[0])
+    return NULL;
+  char *rp = realpath (in, NULL);
+  if (rp)
+    return rp;
+  if (in[0] == '/')
+    return str_dup (in);
+  char *cwd = getcwd (NULL, 0);
+  if (!cwd)
+    return NULL;
+  char *joined = path_join_dup (cwd, in);
+  free (cwd);
+  if (!joined)
+    return NULL;
+  rp = realpath (joined, NULL);
+  if (rp)
+    {
+      free (joined);
+      return rp;
+    }
+  return joined;
+}
+
+static char *
+pidfile_path_dup (const char *cfg_abs)
 {
   uint64_t h = fnv1a64 (cfg_abs);
-  snprintf (out, PATH_MAX, "/tmp/nmesh-%016llx.pid", (unsigned long long)h);
+  int n = snprintf (NULL, 0, "/tmp/nmesh-%016llx.pid",
+                    (unsigned long long)h);
+  if (n <= 0)
+    return NULL;
+  char *out = malloc ((size_t)n + 1U);
+  if (!out)
+    return NULL;
+  snprintf (out, (size_t)n + 1U, "/tmp/nmesh-%016llx.pid",
+            (unsigned long long)h);
+  return out;
 }
 
 static void
 pidfile_cleanup (void)
 {
-  if (!g_pidfile_armed)
+  if (!g_pidfile_armed || !g_pidfile)
     return;
   unlink (g_pidfile);
+  free (g_pidfile);
+  g_pidfile = NULL;
   g_pidfile_armed = false;
 }
 
@@ -152,17 +291,7 @@ start_ready_fail (void)
   start_ready_close ();
 }
 
-static bool
-self_exe_get (char out[PATH_MAX])
-{
-  if (!out)
-    return false;
-  ssize_t n = readlink ("/proc/self/exe", out, PATH_MAX - 1);
-  if (n <= 0 || n >= PATH_MAX)
-    return false;
-  out[n] = '\0';
-  return true;
-}
+static char *self_exe_dup (void) { return readlink_dup ("/proc/self/exe"); }
 
 static void
 daemon_env_clr (void)
@@ -211,9 +340,12 @@ daemon_env_take (void)
   const char *pid_path = getenv (NMESH_PIDFILE_ENV);
   if (pid_path && pid_path[0])
     {
-      snprintf (g_pidfile, sizeof (g_pidfile), "%s", pid_path);
-      g_pidfile_armed = true;
-      atexit (pidfile_cleanup);
+      g_pidfile = str_dup (pid_path);
+      if (g_pidfile)
+        {
+          g_pidfile_armed = true;
+          atexit (pidfile_cleanup);
+        }
     }
   daemon_env_clr ();
 }
@@ -240,16 +372,19 @@ pidfile_write (const char *pid_path, pid_t pid, const char *cfg_abs,
 
 static int
 pidfile_read (const char *pid_path, pid_t *pid, char ifname[IFNAMSIZ],
-              char cfg_abs[PATH_MAX])
+              char **cfg_abs_out)
 {
+  if (cfg_abs_out)
+    *cfg_abs_out = NULL;
   FILE *fp = fopen (pid_path, "r");
   if (!fp)
     return -1;
-  char line[PATH_MAX + 64];
+  char *line = NULL;
+  size_t line_cap = 0;
   pid_t rd_pid = 0;
   char rd_if[IFNAMSIZ] = { 0 };
-  char rd_cfg[PATH_MAX] = { 0 };
-  while (fgets (line, sizeof (line), fp))
+  char *rd_cfg = NULL;
+  while (getline (&line, &line_cap, fp) >= 0)
     {
       char *nl = strchr (line, '\n');
       if (nl)
@@ -259,17 +394,32 @@ pidfile_read (const char *pid_path, pid_t *pid, char ifname[IFNAMSIZ],
       else if (strncmp (line, "ifname=", 7) == 0)
         snprintf (rd_if, sizeof (rd_if), "%s", line + 7);
       else if (strncmp (line, "cfg=", 4) == 0)
-        snprintf (rd_cfg, sizeof (rd_cfg), "%s", line + 4);
+        {
+          free (rd_cfg);
+          rd_cfg = str_dup (line + 4);
+          if (!rd_cfg && line[4] != '\0')
+            {
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+        }
     }
+  free (line);
   fclose (fp);
   if (rd_pid <= 1)
-    return -1;
+    {
+      free (rd_cfg);
+      return -1;
+    }
   if (pid)
     *pid = rd_pid;
   if (ifname)
     snprintf (ifname, IFNAMSIZ, "%s", rd_if);
-  if (cfg_abs)
-    snprintf (cfg_abs, PATH_MAX, "%s", rd_cfg);
+  if (cfg_abs_out)
+    *cfg_abs_out = rd_cfg;
+  else
+    free (rd_cfg);
   return 0;
 }
 
@@ -283,89 +433,88 @@ pid_alive (pid_t pid)
   return errno != ESRCH;
 }
 
-static bool
-path_abs_base (const char *base_dir, const char *in, char out[PATH_MAX])
+static char *
+path_abs_base_dup (const char *base_dir, const char *in)
 {
-  if (!base_dir || !base_dir[0] || !in || !in[0] || !out)
-    return false;
+  if (!base_dir || !base_dir[0] || !in || !in[0])
+    return NULL;
   if (in[0] == '/')
     {
-      if (realpath (in, out))
-        return true;
-      snprintf (out, PATH_MAX, "%s", in);
-      return true;
+      char *rp = realpath (in, NULL);
+      return rp ? rp : str_dup (in);
     }
-  char joined[PATH_MAX];
-  if (snprintf (joined, sizeof (joined), "%s/%s", base_dir, in)
-      >= (int)sizeof (joined))
-    return false;
-  if (realpath (joined, out))
-    return true;
-  snprintf (out, PATH_MAX, "%s", joined);
-  return true;
+  char *joined = path_join_dup (base_dir, in);
+  if (!joined)
+    return NULL;
+  char *rp = realpath (joined, NULL);
+  if (rp)
+    {
+      free (joined);
+      return rp;
+    }
+  return joined;
 }
 
-static ssize_t
-proc_cmdline_rd (pid_t pid, char *buf, size_t cap)
+static char *
+proc_cmdline_dup (pid_t pid, size_t *out_len)
 {
-  if (pid <= 1 || !buf || cap < 2)
-    return -1;
+  if (out_len)
+    *out_len = 0;
+  if (pid <= 1)
+    return NULL;
   char path[64];
   snprintf (path, sizeof (path), "/proc/%d/cmdline", (int)pid);
-  int fd = open (path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return -1;
-  ssize_t n = read (fd, buf, cap - 1);
-  close (fd);
-  if (n <= 0)
-    return -1;
-  buf[n] = '\0';
-  return n;
+  return file_read_dup (path, out_len);
 }
 
-static bool
-proc_cwd_get (pid_t pid, char out[PATH_MAX])
+static char *
+proc_cwd_dup (pid_t pid)
 {
-  if (pid <= 1 || !out)
-    return false;
+  if (pid <= 1)
+    return NULL;
   char path[64];
   snprintf (path, sizeof (path), "/proc/%d/cwd", (int)pid);
-  ssize_t n = readlink (path, out, PATH_MAX - 1);
-  if (n <= 0)
-    return false;
-  out[n] = '\0';
-  return true;
+  return readlink_dup (path);
 }
 
-static bool
-proc_cfg_path_get (pid_t pid, char out[PATH_MAX])
+static char *
+proc_cfg_path_dup (pid_t pid)
 {
-  if (pid <= 1 || !out)
-    return false;
-  char buf[4096];
-  ssize_t n = proc_cmdline_rd (pid, buf, sizeof (buf));
-  if (n <= 0)
-    return false;
-  char cwd[PATH_MAX];
-  if (!proc_cwd_get (pid, cwd))
-    return false;
+  if (pid <= 1)
+    return NULL;
+  size_t n = 0;
+  char *buf = proc_cmdline_dup (pid, &n);
+  if (!buf || n == 0)
+    {
+      free (buf);
+      return NULL;
+    }
+  char *cwd = proc_cwd_dup (pid);
+  if (!cwd)
+    {
+      free (buf);
+      return NULL;
+    }
   const char *cfg_arg = NULL;
-  for (ssize_t i = 0; i < n;)
+  for (size_t i = 0; i < n;)
     {
       const char *arg = buf + i;
       size_t arg_len = strlen (arg);
       if (strcmp (arg, "-c") == 0)
         {
-          ssize_t next = i + (ssize_t)arg_len + 1;
+          size_t next = i + arg_len + 1U;
           if (next < n)
             cfg_arg = buf + next;
           break;
         }
-      i += (ssize_t)arg_len + 1;
+      i += arg_len + 1U;
     }
   if (!cfg_arg || !cfg_arg[0])
     cfg_arg = "nmesh.conf";
-  return path_abs_base (cwd, cfg_arg, out);
+  char *out = path_abs_base_dup (cwd, cfg_arg);
+  free (cwd);
+  free (buf);
+  return out;
 }
 
 static bool
@@ -375,14 +524,14 @@ proc_is_nmesh_pid (pid_t pid)
     return false;
   char exe_link[64];
   snprintf (exe_link, sizeof (exe_link), "/proc/%d/exe", (int)pid);
-  char exe_path[PATH_MAX];
-  ssize_t exe_len = readlink (exe_link, exe_path, sizeof (exe_path) - 1);
-  if (exe_len <= 0)
+  char *exe_path = readlink_dup (exe_link);
+  if (!exe_path)
     return false;
-  exe_path[exe_len] = '\0';
   const char *base = strrchr (exe_path, '/');
   base = base ? (base + 1) : exe_path;
-  return strncmp (base, "nmesh", 5) == 0;
+  bool ok = (strncmp (base, "nmesh", 5) == 0);
+  free (exe_path);
+  return ok;
 }
 
 static bool
@@ -390,21 +539,29 @@ proc_is_nmesh_cfg (pid_t pid, const char *cfg_abs)
 {
   if (!proc_is_nmesh_pid (pid) || !cfg_abs || !cfg_abs[0])
     return false;
-  char proc_cfg[PATH_MAX];
-  if (!proc_cfg_path_get (pid, proc_cfg))
+  char *proc_cfg = proc_cfg_path_dup (pid);
+  if (!proc_cfg)
     return false;
-  return strcmp (proc_cfg, cfg_abs) == 0;
+  bool ok = (strcmp (proc_cfg, cfg_abs) == 0);
+  free (proc_cfg);
+  return ok;
 }
 
 static int
-cfg_pid_scan (const char *cfg_abs, pid_t pid_arr[], int cap)
+cfg_pid_scan (const char *cfg_abs, pid_t **out_arr, size_t *out_cnt)
 {
-  if (!cfg_abs || !pid_arr || cap <= 0)
+  if (out_arr)
+    *out_arr = NULL;
+  if (out_cnt)
+    *out_cnt = 0;
+  if (!cfg_abs || !cfg_abs[0])
     return 0;
   DIR *dp = opendir ("/proc");
   if (!dp)
     return 0;
-  int cnt = 0;
+  pid_t *pid_arr = NULL;
+  size_t cnt = 0;
+  size_t cap = 0;
   struct dirent *ent;
   while ((ent = readdir (dp)) != NULL)
     {
@@ -420,12 +577,29 @@ cfg_pid_scan (const char *cfg_abs, pid_t pid_arr[], int cap)
         continue;
       if (!proc_is_nmesh_cfg (pid, cfg_abs))
         continue;
-      pid_arr[cnt++] = pid;
       if (cnt >= cap)
-        break;
+        {
+          size_t new_cap = (cap > 0) ? (cap * 2U) : 8U;
+          pid_t *new_arr = realloc (pid_arr, sizeof (*pid_arr) * new_cap);
+          if (!new_arr)
+            {
+              free (pid_arr);
+              closedir (dp);
+              return -1;
+            }
+          pid_arr = new_arr;
+          cap = new_cap;
+        }
+      pid_arr[cnt++] = pid;
     }
   closedir (dp);
-  return cnt;
+  if (out_arr)
+    *out_arr = pid_arr;
+  else
+    free (pid_arr);
+  if (out_cnt)
+    *out_cnt = cnt;
+  return 0;
 }
 
 static bool
@@ -475,12 +649,13 @@ pid_stop_force (pid_t pid)
 static int
 cmd_stop_run (const char *cfg_abs)
 {
-  char pid_path[PATH_MAX];
-  pidfile_path_get (cfg_abs, pid_path);
+  char *pid_path = pidfile_path_dup (cfg_abs);
+  if (!pid_path)
+    return 1;
   pid_t pid = 0;
   char ifname[IFNAMSIZ] = { 0 };
-  char cfg_from_pid[PATH_MAX] = { 0 };
-  bool has_pidfile = (pidfile_read (pid_path, &pid, ifname, cfg_from_pid) == 0);
+  char *cfg_from_pid = NULL;
+  bool has_pidfile = (pidfile_read (pid_path, &pid, ifname, &cfg_from_pid) == 0);
   if (!has_pidfile)
     {
       Cfg cfg;
@@ -492,7 +667,7 @@ cmd_stop_run (const char *cfg_abs)
       fprintf (stderr, "main: pidfile missing for %s, scanning /proc\n",
                cfg_abs);
     }
-  const char *cfg_id = cfg_from_pid[0] ? cfg_from_pid : cfg_abs;
+  const char *cfg_id = (cfg_from_pid && cfg_from_pid[0]) ? cfg_from_pid : cfg_abs;
   int killed_cnt = 0;
   bool pidfile_owned = has_pidfile && strcmp (cfg_id, cfg_abs) == 0
                        && proc_is_nmesh_pid (pid);
@@ -507,9 +682,15 @@ cmd_stop_run (const char *cfg_abs)
       fprintf (stderr, "main: pid %d does not match cfg %s\n", (int)pid,
                cfg_id);
     }
-  pid_t pid_arr[32];
-  int scan_cnt = cfg_pid_scan (cfg_abs, pid_arr, 32);
-  for (int i = 0; i < scan_cnt; i++)
+  pid_t *pid_arr = NULL;
+  size_t scan_cnt = 0;
+  if (cfg_pid_scan (cfg_abs, &pid_arr, &scan_cnt) != 0)
+    {
+      free (cfg_from_pid);
+      free (pid_path);
+      return 1;
+    }
+  for (size_t i = 0; i < scan_cnt; i++)
     {
       if (has_pidfile && pid_arr[i] == pid)
         continue;
@@ -528,6 +709,9 @@ cmd_stop_run (const char *cfg_abs)
   if (ifname[0])
     tap_iface_cleanup (ifname);
   unlink (pid_path);
+  free (pid_arr);
+  free (cfg_from_pid);
+  free (pid_path);
   if (killed_cnt > 0)
     fprintf (stderr, "main: stopped %d nmesh instance(s) for %s\n", killed_cnt,
              cfg_abs);
@@ -540,35 +724,52 @@ static int
 cmd_start_bg (const char *cfg_abs, const char *ifname)
 {
   int ready_pipe[2] = { -1, -1 };
-  char exe_path[PATH_MAX];
-  char pid_path[PATH_MAX];
-  pidfile_path_get (cfg_abs, pid_path);
+  char *exe_path = self_exe_dup ();
+  char *pid_path = pidfile_path_dup (cfg_abs);
+  if (!exe_path || !pid_path)
+    {
+      free (exe_path);
+      free (pid_path);
+      return -1;
+    }
   pid_t old_pid = 0;
   char old_if[IFNAMSIZ] = { 0 };
-  char old_cfg[PATH_MAX] = { 0 };
-  if (pidfile_read (pid_path, &old_pid, old_if, old_cfg) == 0
+  char *old_cfg = NULL;
+  if (pidfile_read (pid_path, &old_pid, old_if, &old_cfg) == 0
       && pid_alive (old_pid) && proc_is_nmesh_pid (old_pid)
-      && strcmp ((old_cfg[0] ? old_cfg : cfg_abs), cfg_abs) == 0)
+      && strcmp (((old_cfg && old_cfg[0]) ? old_cfg : cfg_abs), cfg_abs) == 0)
     {
       fprintf (stderr, "main: already running pid=%d for %s\n", (int)old_pid,
                cfg_abs);
+      free (old_cfg);
+      free (pid_path);
+      free (exe_path);
       return -1;
     }
-  pid_t pid_arr[8];
-  int scan_cnt = cfg_pid_scan (cfg_abs, pid_arr, 8);
+  free (old_cfg);
+  pid_t *pid_arr = NULL;
+  size_t scan_cnt = 0;
+  if (cfg_pid_scan (cfg_abs, &pid_arr, &scan_cnt) != 0)
+    {
+      free (pid_path);
+      free (exe_path);
+      return -1;
+    }
   if (scan_cnt > 0)
     {
       fprintf (stderr, "main: already running pid=%d for %s\n", (int)pid_arr[0],
                cfg_abs);
+      free (pid_arr);
+      free (pid_path);
+      free (exe_path);
       return -1;
     }
+  free (pid_arr);
   unlink (pid_path);
   if (pipe2 (ready_pipe, O_CLOEXEC) != 0)
-    return -1;
-  if (!self_exe_get (exe_path))
     {
-      close (ready_pipe[0]);
-      close (ready_pipe[1]);
+      free (pid_path);
+      free (exe_path);
       return -1;
     }
   fflush (stdout);
@@ -578,6 +779,8 @@ cmd_start_bg (const char *cfg_abs, const char *ifname)
     {
       close (ready_pipe[0]);
       close (ready_pipe[1]);
+      free (pid_path);
+      free (exe_path);
       return -1;
     }
   if (pid > 0)
@@ -595,10 +798,14 @@ cmd_start_bg (const char *cfg_abs, const char *ifname)
         {
           fprintf (stderr, "main: nmesh started in background pid=%d\n",
                    (int)pid);
+          free (pid_path);
+          free (exe_path);
           return 1;
         }
       (void)wait_pid_exit (pid, 1000);
       fprintf (stderr, "main: background start failed for %s\n", cfg_abs);
+      free (pid_path);
+      free (exe_path);
       return -1;
     }
   close (ready_pipe[0]);
@@ -630,27 +837,40 @@ cmd_start_bg (const char *cfg_abs, const char *ifname)
 static int
 cmd_start_precheck (const char *cfg_abs)
 {
-  char pid_path[PATH_MAX];
-  pidfile_path_get (cfg_abs, pid_path);
+  char *pid_path = pidfile_path_dup (cfg_abs);
+  if (!pid_path)
+    return -1;
   pid_t old_pid = 0;
   char old_if[IFNAMSIZ] = { 0 };
-  char old_cfg[PATH_MAX] = { 0 };
-  if (pidfile_read (pid_path, &old_pid, old_if, old_cfg) == 0
+  char *old_cfg = NULL;
+  if (pidfile_read (pid_path, &old_pid, old_if, &old_cfg) == 0
       && pid_alive (old_pid) && proc_is_nmesh_pid (old_pid)
-      && strcmp ((old_cfg[0] ? old_cfg : cfg_abs), cfg_abs) == 0)
+      && strcmp (((old_cfg && old_cfg[0]) ? old_cfg : cfg_abs), cfg_abs) == 0)
     {
       fprintf (stderr, "main: already running pid=%d for %s\n", (int)old_pid,
                cfg_abs);
+      free (old_cfg);
+      free (pid_path);
       return -1;
     }
-  pid_t pid_arr[8];
-  int scan_cnt = cfg_pid_scan (cfg_abs, pid_arr, 8);
+  free (old_cfg);
+  pid_t *pid_arr = NULL;
+  size_t scan_cnt = 0;
+  if (cfg_pid_scan (cfg_abs, &pid_arr, &scan_cnt) != 0)
+    {
+      free (pid_path);
+      return -1;
+    }
   if (scan_cnt > 0)
     {
       fprintf (stderr, "main: already running pid=%d for %s\n", (int)pid_arr[0],
                cfg_abs);
+      free (pid_arr);
+      free (pid_path);
       return -1;
     }
+  free (pid_arr);
+  free (pid_path);
   return 0;
 }
 
@@ -704,7 +924,7 @@ status_query_run (const Cfg *cfg)
     }
   char *text = NULL;
   uint8_t *seen = NULL;
-  uint16_t total_len = 0;
+  uint64_t total_len = 0;
   size_t got_len = 0;
   uint64_t ddl = sys_ts () + 2000ULL;
   while (sys_ts () < ddl)
@@ -726,8 +946,8 @@ status_query_run (const Cfg *cfg)
       if (hdr.pkt_type != PT_STAT_RSP)
         continue;
       uint32_t pkt_req_id = 0;
-      uint16_t off = 0;
-      uint16_t pkt_total = 0;
+      uint64_t off = 0;
+      uint64_t pkt_total = 0;
       const uint8_t *chunk = NULL;
       size_t chunk_len = 0;
       if (gsp_prs_stat_rsp (pt, pt_len, &pkt_req_id, &off, &pkt_total, &chunk,
@@ -739,6 +959,8 @@ status_query_run (const Cfg *cfg)
       if (!text)
         {
           total_len = pkt_total;
+          if (total_len > (uint64_t)(SIZE_MAX - 1U))
+            break;
           text = calloc (1, (size_t)total_len + 1U);
           seen = calloc ((size_t)total_len, 1U);
           if (!text || !seen)
@@ -818,21 +1040,29 @@ main (int argc, char **argv)
         }
     }
 
-  char cfg_abs[PATH_MAX];
-  if (cfg_path_abs (cfg_path, cfg_abs) != 0)
+  char *cfg_abs = cfg_path_abs_dup (cfg_path);
+  if (!cfg_abs)
     {
       fprintf (stderr, "main: invalid config path: %s\n", cfg_path);
       return 1;
     }
   if (cmd == CMD_STOP)
-    return cmd_stop_run (cfg_abs);
+    {
+      rc = cmd_stop_run (cfg_abs);
+      free (cfg_abs);
+      return rc;
+    }
   if (cmd == CMD_RESTART && cmd_stop_run (cfg_abs) != 0)
-    return 1;
+    {
+      free (cfg_abs);
+      return 1;
+    }
 
   Cfg cfg;
   if (cfg_load (cfg_abs, &cfg) != 0)
     {
       fprintf (stderr, "main: failed to load config: %s\n", cfg_abs);
+      free (cfg_abs);
       return 1;
     }
   bogon_cfg_apply (&cfg);
@@ -840,21 +1070,28 @@ main (int argc, char **argv)
     {
       rc = status_query_run (&cfg);
       cfg_free (&cfg);
+      free (cfg_abs);
       return rc;
     }
   if ((cmd == CMD_START || cmd == CMD_RESTART) && cmd_start_precheck (cfg_abs) != 0)
-    return 1;
+    {
+      cfg_free (&cfg);
+      free (cfg_abs);
+      return 1;
+    }
   if (cmd == CMD_START || cmd == CMD_RESTART)
     {
       int bg_rc = cmd_start_bg (cfg_abs, cfg.ifname);
       if (bg_rc < 0)
         {
           cfg_free (&cfg);
+          free (cfg_abs);
           return 1;
         }
       if (bg_rc > 0)
         {
           cfg_free (&cfg);
+          free (cfg_abs);
           return 0;
         }
     }
@@ -873,6 +1110,7 @@ main (int argc, char **argv)
   printf ("main: session id: %016llx\n", (unsigned long long)sid);
   rc = loop_run (cfg_abs, &cfg, sid, g_daemon_child, daemon_ready_hnd, NULL);
   cfg_free (&cfg);
+  free (cfg_abs);
   if (rc != 0 && g_daemon_child)
     start_ready_fail ();
   return rc;

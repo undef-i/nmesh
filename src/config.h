@@ -65,8 +65,8 @@ typedef struct
   uint16_t mtu;
   bool mtu_probe;
   uint8_t tp_mask;
-  uint8_t tp_pref_len;
-  uint8_t tp_pref_cap;
+  size_t tp_pref_len;
+  size_t tp_pref_cap;
   uint8_t *tp_pref;
   bool l_exp;
   size_t bogon_cnt;
@@ -87,7 +87,6 @@ int cfg_load (const char *path, Cfg *out);
 void cfg_init (Cfg *cfg);
 void cfg_free (Cfg *cfg);
 int cfg_cpy (Cfg *dst, const Cfg *src);
-int p_arr_ld (const char *path, P *p_arr, int max_cnt);
 int p_arr_load (const char *path, P **out_arr, int *out_cnt);
 int str_to_v6 (const char *s, uint8_t out[16]);
 
@@ -96,7 +95,7 @@ cfg_tp_pick (const Cfg *cfg, uint8_t peer_mask)
 {
   if (!cfg)
     return TP_PROTO_NONE;
-  for (uint8_t i = 0; i < cfg->tp_pref_len; i++)
+  for (size_t i = 0; i < cfg->tp_pref_len; i++)
     {
       TpProto proto = (TpProto)cfg->tp_pref[i];
       if (tp_mask_has (cfg->tp_mask, proto) && tp_mask_has (peer_mask, proto))
