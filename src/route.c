@@ -1416,7 +1416,7 @@ rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
 
 void
 rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
-           uint64_t sys_ts)
+           uint8_t tp_mask, uint64_t sys_ts)
 {
   static const uint8_t z_lla[16] = { 0 };
   bool is_zero_lla = (memcmp (lla, z_lla, 16) == 0);
@@ -1504,6 +1504,8 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
             }
         }
       re_rx_note (&t->re_arr[i], sys_ts);
+      if (tp_mask != 0)
+        t->re_arr[i].tp_mask |= tp_mask;
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
         {
@@ -1552,6 +1554,8 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
             re->pnd_ts = sys_ts;
         }
       re_rx_note (re, sys_ts);
+      if (tp_mask != 0)
+        re->tp_mask |= tp_mask;
       memcpy (re->nhop_lla, lla, 16);
       if (re->mtu == 0)
         {
@@ -1582,6 +1586,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       memcpy (ne.ep_ip, ip, 16);
       ne.ep_port = port;
       ne.r2d = 0;
+      ne.tp_mask = tp_mask;
       ne.is_act = !rt_dir_has_other_ep (t, lla, ip, port);
       ne.state = ne.is_act ? RT_ACT : RT_PND;
       ne.pnd_ts = sys_ts;

@@ -95,6 +95,7 @@ int tp_rt_listen_fd_get (const TpRt *tp);
 void tp_glb_bind (TpRt *tp, int epfd, Cry *cry_ctx, const Cfg *cfg,
                   uint64_t sid);
 void tp_glb_unbind (void);
+bool tp_rtt_get (const uint8_t ip[16], uint16_t port, uint32_t *out_rtt_ms);
 bool tp_send (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len);
 bool tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg,
@@ -103,7 +104,7 @@ bool tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg,
 bool tp_send_fd (int fd, const uint8_t *data, size_t len);
 bool tp_tx_pending (void);
 bool tp_w_want (void);
-void tp_rt_tick (TpRt *tp, const Rt *rt, const Cfg *cfg);
+void tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg);
 void tp_rt_accept_ready (TpRt *tp, int epfd);
 void tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events,
                        const Rt *rt, const Cfg *cfg, TpFrameFn cb,

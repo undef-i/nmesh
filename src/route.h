@@ -255,7 +255,7 @@ void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
 bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
                          uint32_t rtt_ms, uint64_t sys_ts);
 void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
-                uint16_t port, uint64_t sys_ts);
+                uint16_t port, uint8_t tp_mask, uint64_t sys_ts);
 void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 void rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 bool rt_dat_upd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);

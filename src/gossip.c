@@ -699,7 +699,15 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           if (allow_dir_hint
               && !p_is_me (rt, our_lla, gsp_ent.ep_ip, gsp_ent.ep_port))
             {
-              rt_ep_upd (rt, z_lla, gsp_ent.ep_ip, gsp_ent.ep_port, sys_ts);
+              uint8_t tp_mask = 0;
+              if ((gsp_ent.flags & GSP_F_TP_UDP) != 0)
+                tp_mask |= TP_MASK_UDP;
+              if ((gsp_ent.flags & GSP_F_TP_TCP) != 0)
+                tp_mask |= TP_MASK_TCP;
+              if (tp_mask == 0)
+                tp_mask = TP_MASK_UDP | TP_MASK_TCP;
+              rt_ep_upd (rt, z_lla, gsp_ent.ep_ip, gsp_ent.ep_port, tp_mask,
+                         sys_ts);
               if (pool)
                 {
                   pp_add (pool, gsp_ent.ep_ip, gsp_ent.ep_port);
