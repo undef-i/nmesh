@@ -196,6 +196,37 @@ gsp_self_ep_exp_ok (const Re *re, const uint8_t our_lla[16])
   return re->rx_ts != 0;
 }
 
+static bool
+gsp_ent_exp_ok (const Re *re, const uint8_t our_lla[16])
+{
+  static const uint8_t z[16] = { 0 };
+  bool is_z = false;
+  if (!re || !our_lla)
+    return false;
+  if (re->r2d != 0)
+    return false;
+  if (is_ip_bgn (re->ep_ip))
+    return false;
+  is_z = (memcmp (re->lla, z, 16) == 0);
+  if (!is_z && !IS_LLA_VAL (re->lla))
+    return false;
+  return gsp_self_ep_exp_ok (re, our_lla);
+}
+
+uint32_t
+gsp_exp_cnt (const Rt *rt, const uint8_t our_lla[16])
+{
+  uint32_t cnt = 0;
+  if (!rt || !our_lla)
+    return 0;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      if (gsp_ent_exp_ok (&rt->re_arr[i], our_lla))
+        cnt++;
+    }
+  return cnt;
+}
+
 static void
 hdr_bld (uint8_t pkt_type, uint8_t rel_f, uint8_t hop_c,
          uint8_t hdr[PKT_CH_SZ])
@@ -259,23 +290,29 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
+  uint32_t exp_cnt = 0;
+  uint32_t exp_off = 0;
+  uint32_t exp_idx = 0;
   if (!rt)
     {
       *out_len = 0;
       return buf;
     }
+  exp_cnt = gsp_exp_cnt (rt, our_lla);
+  if (exp_cnt == 0)
+    {
+      *out_len = 0;
+      return buf;
+    }
+  exp_off = (s_off > 0) ? ((uint32_t)s_off % exp_cnt) : 0;
   for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < GSP_MAX; re_idx++)
     {
-      const Re *re = &rt->re_arr[(s_off + re_idx) % (int)rt->cnt];
+      const Re *re = &rt->re_arr[re_idx];
       static const uint8_t z[16] = { 0 };
-      if (re->r2d != 0)
-        continue;
-      if (is_ip_bgn (re->ep_ip))
-        continue;
       bool is_z = (memcmp (re->lla, z, 16) == 0);
-      if (!is_z && !IS_LLA_VAL (re->lla))
+      if (!gsp_ent_exp_ok (re, our_lla))
         continue;
-      if (!gsp_self_ep_exp_ok (re, our_lla))
+      if (exp_idx++ < exp_off)
         continue;
       GspEnt gsp_ent;
       memcpy (gsp_ent.lla, re->lla, 16);
@@ -337,14 +374,8 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
       static const uint8_t z[16] = { 0 };
       if (memcmp (re->lla, tgt_lla, 16) != 0)
         continue;
-      if (re->r2d != 0)
-        continue;
-      if (is_ip_bgn (re->ep_ip))
-        continue;
       bool is_z = (memcmp (re->lla, z, 16) == 0);
-      if (!is_z && !IS_LLA_VAL (re->lla))
-        continue;
-      if (!gsp_self_ep_exp_ok (re, our_lla))
+      if (!gsp_ent_exp_ok (re, our_lla))
         continue;
       GspEnt gsp_ent;
       memcpy (gsp_ent.lla, re->lla, 16);

@@ -15,6 +15,7 @@ uint8_t *pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
 uint8_t *gsp_bld (Cry *s, Rt *rt, int s_off,
                   const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
                   size_t *out_len);
+uint32_t gsp_exp_cnt (const Rt *rt, const uint8_t our_lla[16]);
 uint8_t *gsp_dt_bld (Cry *s, Rt *rt,
                      const uint8_t tgt_lla[16], const uint8_t our_lla[16],
                      bool self_dir_ok, uint8_t *buf, size_t *out_len);
