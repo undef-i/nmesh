@@ -37,6 +37,9 @@ static bool tp_lla_is_zero (const uint8_t lla[16]);
 static uint32_t tp_hash_lla (const uint8_t lla[16]);
 static uint32_t tp_hash_ep (const uint8_t ip[16], uint16_t port);
 static ssize_t tp_sock_writev (int fd, const struct iovec *iov, int iovcnt);
+static void tp_fd_cfg (int fd);
+static bool tp_sock_rtt_ms_get (int fd, uint32_t *out_rtt_ms);
+static bool tp_conn_rtt_ms_get (const TpConn *conn, uint32_t *out_rtt_ms);
 static void tp_conn_txq_sync (TpRt *tp, TpConn *conn);
 
 static uint32_t
@@ -58,6 +61,67 @@ tp_sock_writev (int fd, const struct iovec *iov, int iovcnt)
   msg.msg_iov = (struct iovec *)iov;
   msg.msg_iovlen = (size_t)iovcnt;
   return sendmsg (fd, &msg, MSG_NOSIGNAL);
+}
+
+static void
+tp_fd_cfg (int fd)
+{
+  if (fd < 0)
+    return;
+  int one = 1;
+  (void)setsockopt (fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof (one));
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+#ifdef TCP_KEEPIDLE
+  int keepidle = (int)(KA_TMO / 1000ULL);
+  if (keepidle < 1)
+    keepidle = 1;
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle,
+                    sizeof (keepidle));
+#endif
+#ifdef TCP_KEEPINTVL
+  int keepintvl = 5;
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl,
+                    sizeof (keepintvl));
+#endif
+#ifdef TCP_KEEPCNT
+  int keepcnt = 3;
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof (keepcnt));
+#endif
+#ifdef TCP_USER_TIMEOUT
+  int user_tmo = (int)KA_TMO;
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_tmo,
+                    sizeof (user_tmo));
+#endif
+}
+
+static bool
+tp_sock_rtt_ms_get (int fd, uint32_t *out_rtt_ms)
+{
+#ifdef TCP_INFO
+  if (fd < 0 || !out_rtt_ms)
+    return false;
+  struct tcp_info info;
+  socklen_t info_len = sizeof (info);
+  memset (&info, 0, sizeof (info));
+  if (getsockopt (fd, IPPROTO_TCP, TCP_INFO, &info, &info_len) != 0
+      || info.tcpi_rtt == 0)
+    return false;
+  uint32_t rtt_ms = (uint32_t)((info.tcpi_rtt + 999U) / 1000U);
+  *out_rtt_ms = rtt_ms > 0 ? rtt_ms : 1U;
+  return true;
+#else
+  (void)fd;
+  (void)out_rtt_ms;
+  return false;
+#endif
+}
+
+static bool
+tp_conn_rtt_ms_get (const TpConn *conn, uint32_t *out_rtt_ms)
+{
+  if (!conn || conn->fd < 0 || conn->st != TP_ST_ESTABLISHED || !conn->auth)
+    return false;
+  return tp_sock_rtt_ms_get (conn->fd, out_rtt_ms);
 }
 
 static void
@@ -1104,6 +1168,18 @@ tp_glb_unbind (void)
 }
 
 bool
+tp_rtt_get (const uint8_t ip[16], uint16_t port, uint32_t *out_rtt_ms)
+{
+  if (!g_tp_rt || !ip || port == 0 || !out_rtt_ms)
+    return false;
+  tp_lock (g_tp_rt);
+  TpConn *conn = tp_conn_by_ep (g_tp_rt, ip, port);
+  bool ok = tp_conn_rtt_ms_get (conn, out_rtt_ms);
+  tp_unlock (g_tp_rt);
+  return ok;
+}
+
+bool
 tp_send_fd (int fd, const uint8_t *data, size_t len)
 {
   if (!g_tp_rt)
@@ -1164,8 +1240,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
       tp_unlock (g_tp_rt);
       return false;
     }
-  int one = 1;
-  (void)setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+  tp_fd_cfg (fd);
   int syncnt = TP_CONN_SYN_RETRIES;
   (void)setsockopt (fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof (syncnt));
   struct sockaddr_in6 sa;
@@ -1259,7 +1334,7 @@ tp_w_want (void)
 }
 
 void
-tp_rt_tick (TpRt *tp, const Rt *rt, const Cfg *cfg)
+tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg)
 {
   if (!tp)
     return;
@@ -1272,6 +1347,17 @@ tp_rt_tick (TpRt *tp, const Rt *rt, const Cfg *cfg)
         continue;
       if (conn->auth)
         tp_conn_route_sync (conn, rt);
+      if (conn->auth && rt && cfg && conn->route_port != 0
+          && conn->st == TP_ST_ESTABLISHED
+          && tp_mask_has (cfg->tp_mask, TP_PROTO_TCP)
+          && tp_mask_has (rt_ep_tp_mask (rt, conn->route_ip, conn->route_port),
+                          TP_PROTO_TCP))
+        {
+          uint32_t rtt_ms = 0;
+          if (tp_conn_rtt_ms_get (conn, &rtt_ms))
+            rt_rtt_upd (rt, conn->peer_lla, conn->route_ip, conn->route_port,
+                        rtt_ms, now);
+        }
       if (conn->st == TP_ST_CONNECTING && now > conn->ts
           && (now - conn->ts) > TP_CONN_TMO)
         tp_conn_close (tp, g_tp_epfd, conn);
@@ -1304,8 +1390,7 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
           tp_unlock (tp);
           return;
         }
-      int one = 1;
-      (void)setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+      tp_fd_cfg (fd);
       TpConn *conn = tp_conn_alloc (tp);
       if (!conn)
         {
