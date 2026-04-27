@@ -3586,6 +3586,7 @@ void
 gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
 {
   bool is_refresh = rt_gsp_refresh_due (rt, sys_ts ());
+  uint32_t exp_cnt = gsp_exp_cnt (rt, cfg->addr);
   if (!rt->gsp_dirty && !is_refresh)
     return;
   uint64_t now = sys_ts ();
@@ -3612,13 +3613,20 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
       rt->gsp_last_ts = now;
       return;
     }
+  if (exp_cnt == 0)
+    {
+      rt->gsp_dirty = false;
+      rt->gsp_off = 0;
+      rt->gsp_last_ts = now;
+      return;
+    }
   /* printf ("gsp: flush: start (last %lu ms ago)\n",
              (unsigned long)(now - rt->gsp_last_ts)); */
   static uint8_t g_buf[UDP_PL_MAX];
   size_t gsp_len = 0;
   uint32_t start_off = 0;
   if (!is_refresh)
-    start_off = (rt->cnt > 0) ? (rt->gsp_off % rt->cnt) : 0;
+    start_off = rt->gsp_off % exp_cnt;
   gsp_bld (cry_ctx, rt, (int)start_off, cfg->addr, cfg->p2p == P2P_EN, g_buf,
            &gsp_len);
   if (gsp_len == 0)
@@ -3643,10 +3651,10 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
         ctrl_tx_mark (rt, &rt->gsp_tx_cnt, gsp_len, re->ep_ip, re->ep_port,
                       now);
     }
-  if (rt->cnt > GSP_MAX)
+  if (exp_cnt > GSP_MAX)
     {
       uint32_t next_off = start_off + GSP_MAX;
-      rt->gsp_off = (next_off < rt->cnt) ? next_off : 0;
+      rt->gsp_off = (next_off < exp_cnt) ? next_off : 0;
       rt->gsp_dirty = rt->gsp_off != 0;
     }
   else
