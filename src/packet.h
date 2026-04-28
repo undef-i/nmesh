@@ -48,6 +48,7 @@ typedef struct __attribute__ ((packed))
   uint16_t mtu;
   uint32_t seq;
   uint32_t adv_m;
+  uint8_t adv_loss;
   uint8_t nhop_lla[16];
   uint64_t ver;
 } GspEnt;
@@ -87,7 +88,7 @@ frag_vnet_len_max (size_t chunk_max)
 #define GSP_F_TP_TCP 0x08U
 #define GSP_SZ sizeof (GspEnt)
 _Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
-_Static_assert (sizeof (GspEnt) == 70, "GspEnt size");
+_Static_assert (sizeof (GspEnt) == 71, "GspEnt size");
 _Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
 _Static_assert (sizeof (StatHdr) == 20, "StatHdr size");

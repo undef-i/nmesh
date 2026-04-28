@@ -757,13 +757,50 @@ re_show_rtt (const Re *re)
 }
 
 static bool
-re_loss_pct_get (const Re *re, uint32_t *out_pct)
+loss_pct_compose (uint32_t lhs_pct, uint32_t rhs_pct, uint32_t *out_pct)
 {
-  if (!re || !out_pct || re->prb_tx_cnt == 0 || re->prb_rx_cnt > re->prb_tx_cnt)
+  if (!out_pct || lhs_pct > 100 || rhs_pct > 100)
     return false;
-  uint64_t lost = re->prb_tx_cnt - re->prb_rx_cnt;
-  *out_pct = (uint32_t)((lost * 100ULL + (re->prb_tx_cnt / 2ULL))
-                        / re->prb_tx_cnt);
+  uint32_t keep_pct = (uint32_t)(((uint64_t)(100U - lhs_pct)
+                                  * (uint64_t)(100U - rhs_pct)
+                                  + 50ULL)
+                                 / 100ULL);
+  *out_pct = 100U - keep_pct;
+  return true;
+}
+
+static bool
+rt_rel_rem_loss (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel,
+                 uint32_t *out_pct)
+{
+  if (!rt || !dst_lla || !sel || !out_pct || sel->type != RT_REL)
+    return false;
+  bool found = false;
+  uint32_t best = UINT32_MAX;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (!re->is_act || re->state == RT_DED)
+        continue;
+      if (re->r2d == 0)
+        continue;
+      if (memcmp (re->lla, dst_lla, 16) != 0)
+        continue;
+      if (memcmp (re->ep_ip, sel->rel.relay_ip, 16) != 0)
+        continue;
+      if (re->ep_port != sel->rel.relay_port)
+        continue;
+      if (re->adv_loss > 100)
+        continue;
+      if (!found || re->adv_loss < best)
+        {
+          best = re->adv_loss;
+          found = true;
+        }
+    }
+  if (!found)
+    return false;
+  *out_pct = best;
   return true;
 }
 
@@ -785,7 +822,7 @@ rt_show_loss (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel,
           if (memcmp (re->ep_ip, sel->dir.ip, 16) != 0
               || re->ep_port != sel->dir.port)
             continue;
-          return re_loss_pct_get (re, out_pct);
+          return rt_loss_pct_get (re, out_pct);
         }
       return false;
     }
@@ -799,7 +836,13 @@ rt_show_loss (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel,
           if (memcmp (re->ep_ip, sel->rel.relay_ip, 16) != 0
               || re->ep_port != sel->rel.relay_port)
             continue;
-          return re_loss_pct_get (re, out_pct);
+          uint32_t loc_pct = 0;
+          uint32_t rem_pct = 0;
+          if (!rt_loss_pct_get (re, &loc_pct))
+            return false;
+          if (!rt_rel_rem_loss (rt, dst_lla, sel, &rem_pct))
+            return false;
+          return loss_pct_compose (loc_pct, rem_pct, out_pct);
         }
       return false;
     }
