@@ -135,7 +135,16 @@ re_mtu_search_kick (Re *re)
   re->prb_tx_ts = 0;
 }
 
-
+bool
+rt_loss_pct_get (const Re *re, uint32_t *out_pct)
+{
+  if (!re || !out_pct || re->prb_tx_cnt == 0 || re->prb_rx_cnt > re->prb_tx_cnt)
+    return false;
+  uint64_t lost = re->prb_tx_cnt - re->prb_rx_cnt;
+  *out_pct = (uint32_t)((lost * 100ULL + (re->prb_tx_cnt / 2ULL))
+                        / re->prb_tx_cnt);
+  return true;
+}
 
 static void
 re_mtu_sync (Rt *t, Re *re)
@@ -650,6 +659,7 @@ re_to_pth (const Re *re, Pth *pth)
   pth->sid = re->sid;
   pth->seq = re->seq;
   pth->adv_m = re->adv_m;
+  pth->adv_loss = re->adv_loss;
   pth->rt_m = re->rt_m;
   memcpy (pth->nhop_lla, re->nhop_lla, 16);
   pth->state = re->state;
@@ -1178,6 +1188,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         cur_re->seq = re->seq;
       if (re->adv_m > 0)
         cur_re->adv_m = re->adv_m;
+      cur_re->adv_loss = re->adv_loss;
       if (is_rel)
         {
           if (re->rt_m > 0)
@@ -1327,6 +1338,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   out->sid = selected->sid;
   out->seq = selected->seq;
   out->adv_m = selected->adv_m;
+  out->adv_loss = selected->adv_loss;
   out->rt_m = selected->rt_m;
   memcpy (out->nhop_lla, selected->nhop_lla, 16);
   out->state = selected->state;
@@ -1617,6 +1629,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.sm_m = 0;
       ne.rt_m = re_dir_seed_m (&ne);
       ne.adv_m = ne.rt_m;
+      ne.adv_loss = 0;
       ne.seq = 1;
       ne.mtu = re_mtu_boot (t, &ne);
       ne.mtu_lkg = ne.mtu;

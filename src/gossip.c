@@ -70,8 +70,9 @@ gsp_ent_ser (uint8_t *dst, const GspEnt *src)
   u16_wr (dst + 36, src->mtu);
   u32_wr (dst + 38, src->seq);
   u32_wr (dst + 42, src->adv_m);
-  memcpy (dst + 46, src->nhop_lla, 16);
-  u64_wr (dst + 62, src->ver);
+  dst[46] = src->adv_loss;
+  memcpy (dst + 47, src->nhop_lla, 16);
+  u64_wr (dst + 63, src->ver);
 }
 
 static void
@@ -85,8 +86,9 @@ gsp_ent_des (GspEnt *dst, const uint8_t *src)
   dst->mtu = u16_rd (src + 36);
   dst->seq = u32_rd (src + 38);
   dst->adv_m = u32_rd (src + 42);
-  memcpy (dst->nhop_lla, src + 46, 16);
-  dst->ver = u64_rd (src + 62);
+  dst->adv_loss = src[46];
+  memcpy (dst->nhop_lla, src + 47, 16);
+  dst->ver = u64_rd (src + 63);
 }
 
 static bool
@@ -348,6 +350,10 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
           = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_get (rt, re) : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
+      {
+        uint32_t loss_pct = 0;
+        gsp_ent.adv_loss = rt_loss_pct_get (re, &loss_pct) ? (uint8_t)loss_pct : 0;
+      }
       if (memcmp (re->lla, our_lla, 16) == 0
           && (gsp_ent.adv_m == 0 || gsp_ent.adv_m >= RT_M_INF))
         gsp_ent.adv_m = RT_M_INF;
@@ -413,6 +419,10 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
           = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_get (rt, re) : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
+      {
+        uint32_t loss_pct = 0;
+        gsp_ent.adv_loss = rt_loss_pct_get (re, &loss_pct) ? (uint8_t)loss_pct : 0;
+      }
       if (memcmp (re->lla, our_lla, 16) == 0
           && (gsp_ent.adv_m == 0 || gsp_ent.adv_m >= RT_M_INF))
         gsp_ent.adv_m = RT_M_INF;
@@ -805,6 +815,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rel_re.ver = gsp_ent.ver;
           rel_re.seq = n_seq;
           rel_re.adv_m = adv_m;
+          rel_re.adv_loss = gsp_ent.adv_loss;
           rel_re.r2d = is_adv_rch ? adv_m : (is_s_alive ? REL_M_UNK : RT_M_INF);
           rel_re.rt_m = rel_re.r2d;
           if (rel_mtu > 0)
@@ -842,6 +853,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           dir_re.ver = gsp_ent.ver;
           dir_re.seq = n_seq;
           dir_re.adv_m = adv_m;
+          dir_re.adv_loss = gsp_ent.adv_loss;
           dir_re.r2d = 0;
           dir_re.rt_m = RT_M_INF;
           dir_re.sm_m = RT_M_INF;
