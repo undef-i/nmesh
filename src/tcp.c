@@ -42,6 +42,27 @@ static bool tp_sock_rtt_ms_get (int fd, uint32_t *out_rtt_ms);
 static bool tp_conn_rtt_ms_get (const TpConn *conn, uint32_t *out_rtt_ms);
 static void tp_conn_txq_sync (TpRt *tp, TpConn *conn);
 
+static bool
+tp_inbound_static_ok (const Rt *rt, const uint8_t peer_lla[16],
+                      const uint8_t ip[16], uint16_t port)
+{
+  if (!rt || !peer_lla || !ip || port == 0 || tp_lla_is_zero (peer_lla)
+      || tp_ip_is_zero (ip))
+    return false;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (re->state == RT_DED || re->r2d != 0 || !re->is_static)
+        continue;
+      if (memcmp (re->lla, peer_lla, 16) != 0)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0 || re->ep_port != port)
+        continue;
+      return true;
+    }
+  return false;
+}
+
 static uint32_t
 tp_conn_idx (const TpRt *tp, const TpConn *conn)
 {
@@ -51,6 +72,13 @@ tp_conn_idx (const TpRt *tp, const TpConn *conn)
   if (idx >= tp->conn_cap || tp->conn_arr[idx] != conn)
     return TP_IDX_INV;
   return idx;
+}
+
+static bool
+tp_conn_slot_live (const TpRt *tp, uint32_t slot_idx, const TpConn *conn)
+{
+  return tp && conn && tp->conn_arr && slot_idx < tp->conn_cap
+         && tp->conn_arr[slot_idx] == conn;
 }
 
 static ssize_t
@@ -957,51 +985,50 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
       != 0)
     return false;
   uint8_t peer_lla[16] = { 0 };
+  uint64_t peer_sid = 0;
+  uint16_t peer_port = 0;
+  uint64_t prb_tok = 0;
   if (hdr.pkt_type == PT_PING)
     {
       uint64_t req_ts = 0;
-      uint64_t peer_sid = 0;
-      uint64_t prb_tok = 0;
-      uint16_t peer_port = 0;
       if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
                    &prb_tok)
-          != 0)
+          != 0
+          || prb_tok != 0)
         return false;
-      if (conn->inbound && !tp_ip_is_zero (conn->sock_ip) && peer_port != 0)
-        {
-          memcpy (conn->route_ip, conn->sock_ip, 16);
-          conn->route_port = peer_port;
-        }
     }
   else if (hdr.pkt_type == PT_PONG)
     {
       uint64_t req_ts = 0;
-      uint64_t peer_sid = 0;
       uint64_t peer_rx_ts = 0;
-      uint64_t prb_tok = 0;
-      uint16_t peer_port = 0;
       if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
                    &peer_rx_ts, &prb_tok)
-          != 0)
+          != 0
+          || prb_tok != 0)
         return false;
-      if (conn->inbound && !tp_ip_is_zero (conn->sock_ip) && peer_port != 0)
-        {
-          memcpy (conn->route_ip, conn->sock_ip, 16);
-          conn->route_port = peer_port;
-        }
     }
   else
     {
       return false;
     }
 
+  if (conn->inbound && cfg && cfg->p2p != P2P_EN
+      && !tp_inbound_static_ok (rt, peer_lla, conn->sock_ip, peer_port))
+    {
+      tp_conn_close (tp, epfd, conn);
+      return false;
+    }
+  if (conn->inbound && !tp_ip_is_zero (conn->sock_ip) && peer_port != 0)
+    {
+      memcpy (conn->route_ip, conn->sock_ip, 16);
+      conn->route_port = peer_port;
+    }
+  uint32_t slot_idx = conn->slot_idx;
   memcpy (conn->peer_lla, peer_lla, 16);
   conn->auth = true;
   tp_conn_route_sync (conn, rt);
   tp_conn_dedup_peer (tp, epfd, cfg->addr, peer_lla);
-  if (conn->fd < 0)
-    return false;
-  return true;
+  return tp_conn_slot_live (tp, slot_idx, conn);
 }
 
 static TpProto
@@ -1011,6 +1038,31 @@ tp_pick_proto (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
   if (!cfg || !ip || port == 0)
     return TP_PROTO_NONE;
   return cfg_tp_pick (cfg, rt_ep_tp_mask (rt, ip, port));
+}
+
+static bool
+tp_probe_allow (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
+                uint16_t port)
+{
+  if (!cfg || !ip || port == 0)
+    return false;
+  if (!tp_mask_has (cfg->tp_mask, TP_PROTO_TCP))
+    return false;
+  if (tp_pick_proto (rt, cfg, ip, port) == TP_PROTO_TCP)
+    return true;
+  if (!rt)
+    return false;
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (re->r2d != 0 || re->state == RT_DED || !re->is_static)
+        continue;
+      if (memcmp (re->ep_ip, ip, 16) != 0 || re->ep_port != port)
+        continue;
+      if (!IS_LLA_VAL (re->lla))
+        return true;
+    }
+  return false;
 }
 
 int
@@ -1180,6 +1232,20 @@ tp_rtt_get (const uint8_t ip[16], uint16_t port, uint32_t *out_rtt_ms)
 }
 
 bool
+tp_alive_get (const uint8_t peer_lla[16], const uint8_t ip[16], uint16_t port)
+{
+  if (!g_tp_rt || !peer_lla || !ip || port == 0 || tp_lla_is_zero (peer_lla))
+    return false;
+  tp_lock (g_tp_rt);
+  TpConn *conn = tp_conn_by_peer (g_tp_rt, peer_lla);
+  bool ok = conn && conn->fd >= 0 && conn->st == TP_ST_ESTABLISHED
+            && conn->auth && memcmp (conn->route_ip, ip, 16) == 0
+            && conn->route_port == port;
+  tp_unlock (g_tp_rt);
+  return ok;
+}
+
+bool
 tp_send_fd (int fd, const uint8_t *data, size_t len)
 {
   if (!g_tp_rt)
@@ -1315,6 +1381,99 @@ tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len)
 {
   return tp_send_kind (udp, rt, cfg, ip, port, data, len, true);
+}
+
+bool
+tp_probe (const Rt *rt, const Cfg *cfg, const uint8_t ip[16], uint16_t port)
+{
+  if (!rt || !cfg || !ip || port == 0)
+    return false;
+  if (!tp_probe_allow (rt, cfg, ip, port))
+    return false;
+  if (!g_tp_rt || g_tp_epfd < 0 || !g_tp_cry || !g_tp_cfg)
+    return false;
+
+  tp_lock (g_tp_rt);
+  uint8_t peer_lla[16] = { 0 };
+  bool has_peer = rt_ep_peer_lla (rt, ip, port, peer_lla);
+  TpConn *conn = tp_conn_hot_lookup (g_tp_rt, ip, port, peer_lla, has_peer);
+  if (!conn && has_peer)
+    conn = tp_conn_by_peer (g_tp_rt, peer_lla);
+  if (!conn)
+    conn = tp_conn_by_ep (g_tp_rt, ip, port);
+  if (conn)
+    {
+      bool ok = true;
+      if (conn->st == TP_ST_CONNECTING)
+        {
+          int err = 0;
+          socklen_t err_len = sizeof (err);
+          if (getsockopt (conn->fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0
+              && err == 0)
+            conn->st = TP_ST_ESTABLISHED;
+        }
+      if (conn->st == TP_ST_ESTABLISHED && !conn->hello_tx)
+        ok = tp_send_hello (conn);
+      tp_send_cache_note (g_tp_rt, conn);
+      tp_unlock (g_tp_rt);
+      return ok;
+    }
+
+  int fd = socket (AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    {
+      tp_unlock (g_tp_rt);
+      return false;
+    }
+  tp_fd_cfg (fd);
+  int syncnt = TP_CONN_SYN_RETRIES;
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof (syncnt));
+  struct sockaddr_in6 sa;
+  memset (&sa, 0, sizeof (sa));
+  sa.sin6_family = AF_INET6;
+  sa.sin6_port = htons (port);
+  memcpy (sa.sin6_addr.s6_addr, ip, 16);
+  TpConn *n_conn = tp_conn_alloc (g_tp_rt);
+  if (!n_conn)
+    {
+      close (fd);
+      tp_unlock (g_tp_rt);
+      return false;
+    }
+  if (!tp_conn_fd_bind (g_tp_rt, n_conn, fd))
+    {
+      tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
+      tp_unlock (g_tp_rt);
+      return false;
+    }
+  n_conn->st = TP_ST_CONNECTING;
+  n_conn->ts = sys_ts ();
+  n_conn->inbound = false;
+  memcpy (n_conn->route_ip, ip, 16);
+  n_conn->route_port = port;
+  if (has_peer)
+    memcpy (n_conn->peer_lla, peer_lla, 16);
+  int rc = connect (fd, (struct sockaddr *)&sa, sizeof (sa));
+  if (rc == 0)
+    {
+      n_conn->st = TP_ST_ESTABLISHED;
+      if (!tp_send_hello (n_conn))
+        {
+          tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
+          tp_unlock (g_tp_rt);
+          return false;
+        }
+      tp_send_cache_note (g_tp_rt, n_conn);
+    }
+  else if (errno != EINPROGRESS)
+    {
+      tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
+      tp_unlock (g_tp_rt);
+      return false;
+    }
+  tp_ev_add (g_tp_epfd, n_conn);
+  tp_unlock (g_tp_rt);
+  return true;
 }
 
 bool
@@ -1530,20 +1689,23 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
           return;
         }
       conn->ts = sys_ts ();
-      if (!conn->auth
-          && !tp_conn_auth (tp, epfd, conn, rt, cfg, conn->rx_buf,
-                            conn->rx_len))
+      if (!conn->auth)
         {
-          if (conn->fd < 0)
+          uint32_t slot_idx = conn->slot_idx;
+          if (!tp_conn_auth (tp, epfd, conn, rt, cfg, conn->rx_buf,
+                             conn->rx_len))
             {
+              if (!tp_conn_slot_live (tp, slot_idx, conn))
+                {
+                  tp_unlock (tp);
+                  return;
+                }
+              conn->rx_len = 0;
+              conn->rx_have = 0;
               tp_unlock (tp);
-              return;
+              events = EPOLLIN;
+              continue;
             }
-          conn->rx_len = 0;
-          conn->rx_have = 0;
-          tp_unlock (tp);
-          events = EPOLLIN;
-          continue;
         }
       if (conn->fd >= 0 && conn->auth)
         {

@@ -13,12 +13,13 @@ uint8_t *pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                    uint64_t o_ts, uint64_t sid, uint64_t rx_ts,
                    uint64_t prb_tok, uint8_t *buf, size_t *out_len);
 uint8_t *gsp_bld (Cry *s, Rt *rt, int s_off,
-                  const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
-                  size_t *out_len);
+                  const uint8_t our_lla[16], bool self_dir_ok,
+                  bool dst_no_dir, uint8_t *buf, size_t *out_len);
 uint32_t gsp_exp_cnt (const Rt *rt, const uint8_t our_lla[16]);
 uint8_t *gsp_dt_bld (Cry *s, Rt *rt,
                      const uint8_t tgt_lla[16], const uint8_t our_lla[16],
-                     bool self_dir_ok, uint8_t *buf, size_t *out_len);
+                     bool self_dir_ok, bool dst_no_dir, uint8_t *buf,
+                     size_t *out_len);
 uint8_t *hp_bld (Cry *s, const uint8_t req_lla[16], const uint8_t tgt_lla[16],
                  uint8_t *buf, size_t *out_len);
 uint8_t *data_bld_zc_cnt (Cry *s, uint8_t *ipv6_ptr_start,
