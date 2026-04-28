@@ -214,7 +214,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           off += chunk_len;
         }
     }
-  if (dec.type == RT_REL && cfg->p2p == P2P_EN)
+  if (dec.type == RT_REL && cfg->p2p == P2P_EN
+      && !tx_path_use_tcp (rt, cfg, dec.rel.relay_ip, dec.rel.relay_port))
     {
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
@@ -297,7 +298,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       is_tx = true;
       sub_off += sub_len;
     }
-  if (is_tx && dec.type == RT_REL && cfg->p2p == P2P_EN)
+  if (is_tx && dec.type == RT_REL && cfg->p2p == P2P_EN
+      && !tx_path_use_tcp (rt, cfg, dec.rel.relay_ip, dec.rel.relay_port))
     {
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;

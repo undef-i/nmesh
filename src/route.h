@@ -283,13 +283,15 @@ bool rt_pmtu_st (const Rt *t, const RtDec *sel, uint16_t *out_path_mtu,
 bool rt_pmtu_lims (const Rt *t, const RtDec *sel, uint16_t *out_lkg,
                    uint16_t *out_ukb, MtuSt *state);
 int rt_act_get (Rt *t, Re *buf, int buf_len, int s_off);
-void rt_prn_st (Rt *t, uint64_t sys_ts);
+void rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts);
 void rt_src_gc (Rt *t, uint64_t sys_ts);
 bool rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
              uint64_t n_ver, bool *req_seq);
 void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
                  uint64_t ver, bool no_dir, uint64_t sys_ts);
 bool rt_src_no_dir (const Rt *t, const uint8_t rt_id[16]);
+bool rt_src_no_dir_known (const Rt *t, const uint8_t rt_id[16],
+                          bool *out_no_dir);
 uint8_t rt_ep_tp_mask (const Rt *t, const uint8_t ip[16], uint16_t port);
 bool rt_ep_peer_lla (const Rt *t, const uint8_t ip[16], uint16_t port,
                      uint8_t out_lla[16]);

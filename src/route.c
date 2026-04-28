@@ -1,4 +1,5 @@
 #include "route.h"
+#include "tcp.h"
 #include "udp.h"
 #include "utils.h"
 #include "packet.h"
@@ -459,6 +460,14 @@ re_is_recent (const Re *re, uint64_t sys_ts)
   if (win > RT_STL_TS)
     win = RT_STL_TS;
   return age <= win;
+}
+
+static bool
+re_use_tcp (const Cfg *cfg, const Re *re)
+{
+  if (!cfg || !re || re->r2d != 0 || re->ep_port == 0)
+    return false;
+  return cfg_tp_pick (cfg, re->tp_mask) == TP_PROTO_TCP;
 }
 
 static bool
@@ -1653,6 +1662,8 @@ rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
   for (uint32_t i = 0; i < t->cnt; i++)
     {
       Re *re = &t->re_arr[i];
+      if (re->r2d != 0)
+        continue;
       if (memcmp (re->ep_ip, ip, 16) != 0)
         continue;
       if (re->ep_port != port)
@@ -2449,7 +2460,7 @@ rt_act_get (Rt *t, Re *buf, int buf_len, int s_off)
 }
 
 void
-rt_prn_st (Rt *t, uint64_t sys_ts)
+rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
 {
   uint32_t old_cnt = t->cnt;
   uint32_t wr_idx = 0;
@@ -2465,6 +2476,27 @@ rt_prn_st (Rt *t, uint64_t sys_ts)
       re_map_dcy (re, sys_ts);
       if (!is_rel && re_metric_refresh (re, sys_ts))
         is_mod = true;
+      if (!is_rel && re_use_tcp (cfg, re))
+        {
+          if (tp_alive_get (re->lla, re->ep_ip, re->ep_port))
+            {
+              re_rx_ack (re, sys_ts);
+              if (re->rt_m == 0 || re->rt_m >= RT_M_INF)
+                re->rt_m = re_dir_seed_m (re);
+              t->re_arr[wr_idx++] = *re;
+              continue;
+            }
+          if (re->is_act || re->state == RT_ACT)
+            {
+              re->is_act = false;
+              re->state = RT_PND;
+              re->rt_m = RT_M_INF;
+              re->sm_m = RT_M_INF;
+              re_metric_win_clear (re);
+              re->pnd_ts = sys_ts;
+              is_mod = true;
+            }
+        }
       if (sys_ts > re->rx_ts)
         {
           uint64_t age = sys_ts - re->rx_ts;
@@ -2538,6 +2570,21 @@ rt_src_no_dir (const Rt *t, const uint8_t rt_id[16])
     return false;
   const SrcEnt *se = src_fnd_c (t, rt_id);
   return se ? se->no_dir : false;
+}
+
+bool
+rt_src_no_dir_known (const Rt *t, const uint8_t rt_id[16], bool *out_no_dir)
+{
+  if (out_no_dir)
+    *out_no_dir = false;
+  if (!t || !rt_id)
+    return false;
+  const SrcEnt *se = src_fnd_c (t, rt_id);
+  if (!se)
+    return false;
+  if (out_no_dir)
+    *out_no_dir = se->no_dir;
+  return true;
 }
 
 uint8_t

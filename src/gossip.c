@@ -283,10 +283,23 @@ pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port, uint64_t o_ts,
   return pkt_enc (s, hdr, payload, PONG_PL_SZ, buf, out_len);
 }
 
+static void
+gsp_ent_mask_dir (GspEnt *ent)
+{
+  if (!ent)
+    return;
+  memset (ent->ep_ip, 0, 16);
+  ent->ep_port = 0;
+  ent->mtu = 0;
+  memset (ent->nhop_lla, 0, 16);
+  ent->flags &= (uint8_t)~GSP_F_SEL_DIR;
+  ent->flags |= GSP_F_NO_DIR;
+}
+
 uint8_t *
 gsp_bld (Cry *s, Rt *rt, int s_off,
-         const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
-         size_t *out_len)
+         const uint8_t our_lla[16], bool self_dir_ok, bool dst_no_dir,
+         uint8_t *buf, size_t *out_len)
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
@@ -340,6 +353,8 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
         gsp_ent.adv_m = RT_M_INF;
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
+      if (dst_no_dir && memcmp (re->lla, our_lla, 16) != 0)
+        gsp_ent_mask_dir (&gsp_ent);
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
       gsp_ent_ser (pl_buf + wr_off, &gsp_ent);
       act_cnt++;
@@ -358,8 +373,8 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
 
 uint8_t *
 gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
-            const uint8_t our_lla[16], bool self_dir_ok, uint8_t *buf,
-            size_t *out_len)
+            const uint8_t our_lla[16], bool self_dir_ok, bool dst_no_dir,
+            uint8_t *buf, size_t *out_len)
 {
   uint8_t pl_buf[2 + GSP_MAX * GSP_SZ];
   int act_cnt = 0;
@@ -403,6 +418,8 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
         gsp_ent.adv_m = RT_M_INF;
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
+      if (dst_no_dir && memcmp (re->lla, our_lla, 16) != 0)
+        gsp_ent_mask_dir (&gsp_ent);
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
       gsp_ent_ser (pl_buf + wr_off, &gsp_ent);
       act_cnt++;
