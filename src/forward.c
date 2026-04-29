@@ -141,7 +141,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     }
   bool use_tcp = tx_path_use_tcp (rt, cfg, tx_ip, tx_port);
   pmtu = tx_path_pmtu_get (cfg, tx_ip, pmtu);
-  static uint8_t relay_vnet_buf[UDP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
+  static uint8_t relay_vnet_buf[TP_PL_MAX + TAP_HR] __attribute__ ((aligned (32)));
   uint8_t *relay_vnet = relay_vnet_buf + TAP_HR + PKT_HDR_SZ;
   memcpy (relay_vnet, vnet_frame, vnet_len);
   uint8_t *frame_pkt = relay_vnet + VNET_HL;

@@ -23,6 +23,9 @@ static Cry *g_tp_cry = NULL;
 static const Cfg *g_tp_cfg = NULL;
 static uint64_t g_tp_sid = 0;
 static uint64_t g_tp_conn_last_warn_ts = 0;
+static pthread_t g_tp_owner_tid;
+static bool g_tp_owner_set = false;
+static _Thread_local uint32_t g_tp_batch_depth = 0;
 
 static void tp_conn_close (TpRt *tp, int epfd, TpConn *conn);
 static bool tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn,
@@ -36,11 +39,16 @@ static bool tp_ip_is_zero (const uint8_t ip[16]);
 static bool tp_lla_is_zero (const uint8_t lla[16]);
 static uint32_t tp_hash_lla (const uint8_t lla[16]);
 static uint32_t tp_hash_ep (const uint8_t ip[16], uint16_t port);
-static ssize_t tp_sock_writev (int fd, const struct iovec *iov, int iovcnt);
+static ssize_t tp_sock_writev (int fd, const struct iovec *iov, int iovcnt,
+                               bool more);
 static void tp_fd_cfg (int fd);
 static bool tp_sock_rtt_ms_get (int fd, uint32_t *out_rtt_ms);
 static bool tp_conn_rtt_ms_get (const TpConn *conn, uint32_t *out_rtt_ms);
 static void tp_conn_txq_sync (TpRt *tp, TpConn *conn);
+static void tp_flush_deferred (void);
+static bool tp_owner_thread (void);
+
+#define TP_TXQ_BATCH_FRAMES 16U
 
 static bool
 tp_inbound_static_ok (const Rt *rt, const uint8_t peer_lla[16],
@@ -82,13 +90,18 @@ tp_conn_slot_live (const TpRt *tp, uint32_t slot_idx, const TpConn *conn)
 }
 
 static ssize_t
-tp_sock_writev (int fd, const struct iovec *iov, int iovcnt)
+tp_sock_writev (int fd, const struct iovec *iov, int iovcnt, bool more)
 {
   struct msghdr msg;
   memset (&msg, 0, sizeof (msg));
   msg.msg_iov = (struct iovec *)iov;
   msg.msg_iovlen = (size_t)iovcnt;
-  return sendmsg (fd, &msg, MSG_NOSIGNAL);
+  int flags = MSG_NOSIGNAL;
+#ifdef MSG_MORE
+  if (more)
+    flags |= MSG_MORE;
+#endif
+  return sendmsg (fd, &msg, flags);
 }
 
 static void
@@ -223,6 +236,12 @@ tp_unlock (TpRt *tp)
 }
 
 static bool
+tp_owner_thread (void)
+{
+  return g_tp_owner_set && pthread_equal (pthread_self (), g_tp_owner_tid);
+}
+
+static bool
 tp_ip_is_zero (const uint8_t ip[16])
 {
   if (!ip)
@@ -275,6 +294,16 @@ tp_conn_txq_stop_bytes (const TpConn *conn)
   else if (stop > 0)
     stop = UINT32_MAX;
   return (stop >= TP_TXQ_FRAME_BYTES) ? stop : TP_TXQ_FRAME_BYTES;
+}
+
+static uint32_t
+tp_conn_txq_batch_bytes (const TpConn *conn)
+{
+  uint32_t batch = TP_TXQ_FRAME_BYTES * TP_TXQ_BATCH_FRAMES;
+  uint32_t stop = tp_conn_txq_stop_bytes (conn);
+  if (batch > stop)
+    batch = stop;
+  return batch >= TP_TXQ_FRAME_BYTES ? batch : TP_TXQ_FRAME_BYTES;
 }
 
 static void
@@ -499,7 +528,7 @@ static bool
 tp_tx_ring_write_frame (TpTxRing *ring, const uint8_t *data, size_t len,
                         size_t skip)
 {
-  if (!ring || !data || len == 0 || len > UDP_PL_MAX)
+  if (!ring || !data || len == 0 || len > TP_PL_MAX)
     return false;
   uint32_t net_len = htonl ((uint32_t)len);
   size_t frame_len = sizeof (net_len) + len;
@@ -849,6 +878,7 @@ tp_conn_flush (TpRt *tp, int epfd, TpConn *conn)
 {
   if (!tp || !conn || conn->fd < 0 || conn->st != TP_ST_ESTABLISHED)
     return false;
+  conn->tx_defer = false;
   for (;;)
     {
       TpTxRing *ring = conn->tx_hi.len > 0 ? &conn->tx_hi : &conn->tx_lo;
@@ -860,7 +890,8 @@ tp_conn_flush (TpRt *tp, int epfd, TpConn *conn)
         }
       struct iovec iov[2];
       int iovcnt = tp_tx_ring_iov (ring, iov);
-      ssize_t n = tp_sock_writev (conn->fd, iov, iovcnt);
+      bool more = ring == &conn->tx_hi && conn->tx_lo.len > 0;
+      ssize_t n = tp_sock_writev (conn->fd, iov, iovcnt, more);
       if (n < 0)
         {
           if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -890,7 +921,7 @@ static bool
 tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
                   size_t len, bool hi)
 {
-  if (!tp || !conn || conn->fd < 0 || !data || len == 0 || len > UDP_PL_MAX)
+  if (!tp || !conn || conn->fd < 0 || !data || len == 0 || len > TP_PL_MAX)
     return false;
   if (conn->st != TP_ST_ESTABLISHED)
     {
@@ -900,7 +931,7 @@ tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
       tp_ev_upd (epfd, conn);
       return true;
     }
-  if (conn->tx_hi.len == 0 && conn->tx_lo.len == 0)
+  if (hi && conn->tx_hi.len == 0 && conn->tx_lo.len == 0)
     {
       uint32_t net_len = htonl ((uint32_t)len);
       struct iovec iov[2];
@@ -909,7 +940,7 @@ tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
       iov[1].iov_base = (void *)data;
       iov[1].iov_len = len;
       size_t want = sizeof (net_len) + len;
-      ssize_t n = tp_sock_writev (conn->fd, iov, 2);
+      ssize_t n = tp_sock_writev (conn->fd, iov, 2, false);
       if (n < 0)
         {
           if (errno != EAGAIN && errno != EWOULDBLOCK)
@@ -932,8 +963,18 @@ tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
     return false;
   tp_conn_txq_sync (tp, conn);
   tp_ev_upd (epfd, conn);
-  if (!hi && conn->tx_q_bytes >= tp_conn_txq_stop_bytes (conn))
-    return true;
+  if (!hi)
+    {
+      if (g_tp_batch_depth != 0)
+        {
+          conn->tx_defer = true;
+          if (conn->tx_q_bytes < tp_conn_txq_batch_bytes (conn))
+            return true;
+          conn->tx_defer = false;
+          return tp_conn_flush (tp, epfd, conn);
+        }
+      return tp_conn_flush (tp, epfd, conn);
+    }
   return tp_conn_flush (tp, epfd, conn);
 }
 
@@ -1207,6 +1248,8 @@ tp_glb_bind (TpRt *tp, int epfd, Cry *cry_ctx, const Cfg *cfg, uint64_t sid)
   g_tp_cry = cry_ctx;
   g_tp_cfg = cfg;
   g_tp_sid = sid;
+  g_tp_owner_tid = pthread_self ();
+  g_tp_owner_set = true;
 }
 
 void
@@ -1217,6 +1260,7 @@ tp_glb_unbind (void)
   g_tp_cry = NULL;
   g_tp_cfg = NULL;
   g_tp_sid = 0;
+  g_tp_owner_set = false;
 }
 
 bool
@@ -1263,6 +1307,47 @@ tp_send_fd (int fd, const uint8_t *data, size_t len)
   tp_send_cache_note (g_tp_rt, conn);
   tp_unlock (g_tp_rt);
   return ok;
+}
+
+static void
+tp_flush_deferred (void)
+{
+  if (!g_tp_rt || g_tp_epfd < 0)
+    return;
+  tp_lock (g_tp_rt);
+  for (uint32_t i = 0; i < g_tp_rt->conn_cap; i++)
+    {
+      TpConn *conn = g_tp_rt->conn_arr[i];
+      if (!conn || conn->fd < 0 || conn->st != TP_ST_ESTABLISHED)
+        continue;
+      if (!conn->tx_defer)
+        continue;
+      if (!tp_conn_flush (g_tp_rt, g_tp_epfd, conn))
+        tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+    }
+  tp_unlock (g_tp_rt);
+}
+
+void
+tp_batch_begin (void)
+{
+  if (!g_tp_rt || g_tp_epfd < 0)
+    return;
+  if (g_tp_batch_depth == UINT32_MAX)
+    return;
+  g_tp_batch_depth++;
+}
+
+void
+tp_batch_end (void)
+{
+  if (!g_tp_rt || g_tp_epfd < 0 || g_tp_batch_depth == 0)
+    return;
+  g_tp_batch_depth--;
+  if (g_tp_batch_depth != 0)
+    return;
+  if (tp_owner_thread ())
+    tp_flush_deferred ();
 }
 
 static bool
@@ -1481,6 +1566,8 @@ tp_tx_pending (void)
 {
   if (!g_tp_rt)
     return false;
+  if (g_tp_batch_depth != 0)
+    return __atomic_load_n (&g_tp_rt->tx_bp_cnt, __ATOMIC_RELAXED) != 0;
   return __atomic_load_n (&g_tp_rt->tx_qd_cnt, __ATOMIC_RELAXED) != 0;
 }
 
@@ -1577,7 +1664,7 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
 {
   if (!tp || !cb)
     return;
-  uint8_t frame_buf[UDP_PL_MAX];
+  uint8_t frame_buf[TP_PL_MAX];
   for (;;)
     {
       TpSrc src;
@@ -1661,7 +1748,7 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
           memcpy (&net_len, conn->hdr_buf, sizeof (net_len));
           conn->rx_len = ntohl (net_len);
           conn->hdr_have = 0;
-          if (conn->rx_len == 0 || conn->rx_len > UDP_PL_MAX)
+          if (conn->rx_len == 0 || conn->rx_len > TP_PL_MAX)
             {
               tp_conn_close (tp, epfd, conn);
               tp_unlock (tp);

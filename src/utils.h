@@ -115,7 +115,7 @@ tnl_vnet_cap_get (uint16_t path_mtu, const uint8_t tx_ip[16])
 static inline uint16_t
 tp_vnet_cap_get (void)
 {
-  return (uint16_t)PKT_PT_MAX;
+  return (uint16_t)TP_VNET_MAX;
 }
 
 static inline uint16_t
