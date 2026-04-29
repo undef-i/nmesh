@@ -31,6 +31,8 @@ typedef struct __attribute__ ((packed))
 #define V6_PL_MAX 9000
 #define UDP_PL_MAX (PKT_HDR_SZ + 16 + V6_PL_MAX)
 #define PKT_PT_MAX (UDP_PL_MAX - PKT_HDR_SZ)
+#define TP_VNET_MAX UINT16_MAX
+#define TP_PL_MAX (PKT_HDR_SZ + TP_VNET_MAX)
 #define TAP_HR 128
 #define TAP_TR 64
 #define PING_PL_SZ 42

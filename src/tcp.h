@@ -14,7 +14,7 @@
 #define TP_CONN_CAP_INIT 512U
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
-#define TP_TXQ_FRAME_BYTES ((uint32_t)(sizeof (uint32_t) + UDP_PL_MAX))
+#define TP_TXQ_FRAME_BYTES ((uint32_t)(sizeof (uint32_t) + TP_PL_MAX))
 #define TP_TXQ_STOP_MULT 4U
 #define TP_CONN_TMO                                                           \
   (RTO_INIT * ((1ULL << (TP_CONN_SYN_RETRIES + 1U)) - 1ULL))
@@ -61,13 +61,14 @@ typedef struct
   uint32_t hdr_have;
   uint32_t rx_len;
   uint32_t rx_have;
-  uint8_t rx_buf[UDP_PL_MAX];
+  uint8_t rx_buf[TP_PL_MAX];
   TpTxRing tx_hi;
   TpTxRing tx_lo;
   uint32_t tx_q_bytes;
   uint32_t sndbuf_bytes;
   bool tx_qd;
   bool tx_bp;
+  bool tx_defer;
 } TpConn;
 
 typedef struct
@@ -106,6 +107,8 @@ bool tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg,
 bool tp_probe (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
                uint16_t port);
 bool tp_send_fd (int fd, const uint8_t *data, size_t len);
+void tp_batch_begin (void);
+void tp_batch_end (void);
 bool tp_tx_pending (void);
 bool tp_w_want (void);
 void tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg);
