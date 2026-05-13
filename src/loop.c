@@ -535,7 +535,7 @@ static uint64_t
 re_keepalive_intv (const Re *re, uint64_t ts)
 {
   uint64_t prb_intv = KA_TMO;
-  if (re && re->r2d == 0 && re->pnd_ts > 0 && ts > re->pnd_ts
+  if (re && re->r2d == 0 && re->pnd_ts > 0 && ts >= re->pnd_ts
       && (ts - re->pnd_ts) < KA_TMO)
     prb_intv = um_prb_intv (ts - re->pnd_ts);
   return prb_intv;
@@ -724,7 +724,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
           uint64_t intv = (re->state == RT_ACT && re->rt_m < RT_M_INF)
                               ? KA_TMO
                               : um_prb_intv (re_probe_age_ms (re, ts));
-          if (re->hp_ts != 0 && ts > re->hp_ts && (ts - re->hp_ts) < intv)
+          if (re->hp_ts != 0 && ts >= re->hp_ts && (ts - re->hp_ts) < intv)
             return;
           uint8_t hp_buf[UDP_PL_MAX];
           size_t hp_len = 0;
@@ -1855,6 +1855,7 @@ typedef struct
   pthread_cond_t done_cv;
   bool is_on;
   bool is_busy;
+  bool result_held;
   bool stop;
   bool ok;
   TapTso tso;
@@ -2517,6 +2518,14 @@ tap_tso_par_loop (void *arg)
 }
 
 static void
+tap_tso_par_result_release (void)
+{
+  pthread_mutex_lock (&g_tso_par.mtx);
+  g_tso_par.result_held = false;
+  pthread_mutex_unlock (&g_tso_par.mtx);
+}
+
+static void
 tap_tso_par_boot (void)
 {
   long cpu_cnt = sysconf (_SC_NPROCESSORS_ONLN);
@@ -2579,7 +2588,7 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
 
   bool par_fast = max_vnet > 0 && tso->seg_pl <= max_vnet;
   pthread_mutex_lock (&g_tso_par.mtx);
-  if (g_tso_par.is_busy)
+  if (g_tso_par.is_busy || g_tso_par.result_held)
     {
       pthread_mutex_unlock (&g_tso_par.mtx);
       return 0;
@@ -2602,6 +2611,7 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   TapTso tso_head = *tso;
   int head_cnt = 0;
   size_t tso_len = 0;
+  bool head_ok = true;
   while (head_cnt < mid
          && tap_tso_seg (&tso_head, local_bufs[head_cnt] + TAP_HR, &tso_len))
     {
@@ -2611,20 +2621,29 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
                                   cnt_base + (uint64_t)head_cnt,
                                   local_bufs[head_cnt] + TAP_HR, tso_len,
                                   batch_arr, bc))
-            return -1;
+            {
+              head_ok = false;
+              break;
+            }
         }
       else if (max_vnet > 0 && tso_len <= max_vnet)
         {
           if (!tap_data_fast (udp, cry_ctx, tx_path, now,
                               local_bufs[head_cnt] + TAP_HR, tso_len,
                               batch_arr, bc))
-            return -1;
+            {
+              head_ok = false;
+              break;
+            }
         }
       else if (!tap_data_tx (udp, cry_ctx, rt, cfg, sid, now,
                              local_bufs[head_cnt] + TAP_HR, tso_len, frag_bufs,
                              batch_arr, bc, fast_path, l_nh_ts, tx_path, false,
                              false, false))
-        return -1;
+        {
+          head_ok = false;
+          break;
+        }
       head_cnt++;
     }
 
@@ -2632,19 +2651,30 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   while (g_tso_par.is_busy)
     pthread_cond_wait (&g_tso_par.done_cv, &g_tso_par.mtx);
   bool worker_ok = g_tso_par.ok;
-  pthread_mutex_unlock (&g_tso_par.mtx);
 
-  if (!worker_ok || head_cnt != mid)
-    return -1;
+  if (!worker_ok || !head_ok || head_cnt != mid)
+    {
+      pthread_mutex_unlock (&g_tso_par.mtx);
+      return -1;
+    }
+  g_tso_par.result_held = true;
+  pthread_mutex_unlock (&g_tso_par.mtx);
   if (par_fast)
     {
       if (g_tso_par.msg_cnt != tail_cnt)
-        return -1;
+        {
+          tap_tso_par_result_release ();
+          return -1;
+        }
       for (int i = 0; i < tail_cnt; i++)
         {
           if (!tap_msg_add (udp, &g_tso_par.msg_arr[i], now, batch_arr, bc))
-            return -1;
+            {
+              tap_tso_par_result_release ();
+              return -1;
+            }
         }
+      tap_tso_par_result_release ();
       return 1;
     }
   for (int i = 0; i < tail_cnt; i++)
@@ -2654,15 +2684,22 @@ tap_tso_tx_par (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
           if (!tap_data_fast (udp, cry_ctx, tx_path, now,
                               g_tso_par.buf_arr[i] + TAP_HR,
                               g_tso_par.len_arr[i], batch_arr, bc))
-            return -1;
+            {
+              tap_tso_par_result_release ();
+              return -1;
+            }
         }
       else if (!tap_data_tx (udp, cry_ctx, rt, cfg, sid, now,
                              g_tso_par.buf_arr[i] + TAP_HR,
                              g_tso_par.len_arr[i], frag_bufs, batch_arr, bc,
                              fast_path, l_nh_ts, tx_path, false, false,
                              false))
-        return -1;
+        {
+          tap_tso_par_result_release ();
+          return -1;
+        }
     }
+  tap_tso_par_result_release ();
   return 1;
 }
 
@@ -2779,6 +2816,56 @@ frame_l4_proto_get (const uint8_t *frame_pkt, size_t frame_len, size_t l3_off,
       if (frame_len < l3_off + 40U)
         return 0;
       return frame_pkt[l3_off + 6U];
+    }
+  return 0;
+}
+
+static uint32_t
+tap_flow_hash_mix (uint32_t h, const uint8_t *buf, size_t len)
+{
+  for (size_t i = 0; i < len; i++)
+    {
+      h ^= buf[i];
+      h *= 16777619U;
+    }
+  return h;
+}
+
+static uint32_t
+tap_flow_hash_get (const uint8_t *frame_pkt, size_t frame_len, size_t l3_off,
+                   uint16_t eth_type)
+{
+  if (!frame_pkt || frame_len <= l3_off)
+    return 0;
+  uint32_t h = 2166136261U;
+  if (eth_type == ETH_P_IP)
+    {
+      if (frame_len < l3_off + 20U)
+        return 0;
+      const uint8_t *ip4 = frame_pkt + l3_off;
+      uint8_t ihl = (uint8_t)((ip4[0] & 0x0fU) * 4U);
+      if (ihl < 20U || frame_len < l3_off + ihl)
+        return 0;
+      uint8_t proto = ip4[9];
+      h = tap_flow_hash_mix (h, ip4 + 12, 8);
+      h = tap_flow_hash_mix (h, &proto, 1);
+      if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+          && frame_len >= l3_off + ihl + 4U)
+        h = tap_flow_hash_mix (h, ip4 + ihl, 4);
+      return h != 0 ? h : 1U;
+    }
+  if (eth_type == ETH_P_IPV6)
+    {
+      if (frame_len < l3_off + 40U)
+        return 0;
+      const uint8_t *ip6 = frame_pkt + l3_off;
+      uint8_t proto = ip6[6];
+      h = tap_flow_hash_mix (h, ip6 + 8, 32);
+      h = tap_flow_hash_mix (h, &proto, 1);
+      if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+          && frame_len >= l3_off + 40U + 4U)
+        h = tap_flow_hash_mix (h, ip6 + 40U, 4);
+      return h != 0 ? h : 1U;
     }
   return 0;
 }
@@ -3061,6 +3148,10 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   size_t l3_off = ETH_HLEN;
   uint16_t eth_type = 0;
   frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
+  uint32_t flow_hash = tx_path_lcl.use_tcp
+                         ? tap_flow_hash_get (frame_pkt, frame_len, l3_off,
+                                              eth_type)
+                         : 0;
   if (tx_path_lcl.use_tcp)
     {
       uint8_t l4_proto
@@ -3106,7 +3197,8 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
       uint8_t *out_ptr = data_bld_zc (cry_ctx, vnet_frame, vnet_len, rel_f, 32, &out_len);
       if (tx_path_lcl.use_tcp)
         {
-          if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+          if (tp_send_flow (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len,
+                            flow_hash))
             {
               if (tx_ack_apply)
                 rt_tx_ack (rt, tx_ip, tx_port, now);
@@ -3171,7 +3263,8 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
             }
           if (tx_path_lcl.use_tcp)
             {
-              if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
+              if (tp_send_flow (udp, rt, cfg, tx_ip, tx_port, out_ptr,
+                                out_len, flow_hash))
                 {
                   if (tx_ack_apply)
                     rt_tx_ack (rt, tx_ip, tx_port, now);
@@ -4006,16 +4099,16 @@ ctrl_rate_upd (Rt *rt, uint64_t ts)
 {
   if (!rt)
     return;
-  if (rt->ctrl_last_ts == 0 || ts <= rt->ctrl_last_ts)
+  if (rt->ctrl_last_ts == 0 || ts < rt->ctrl_last_ts)
     {
       rt->ctrl_last_ts = ts;
       rt->ctrl_last_tx_b = rt->ctrl_tx_b;
       rt->ctrl_last_rx_b = rt->ctrl_rx_b;
       return;
     }
-  uint64_t diff_ms = ts - rt->ctrl_last_ts;
-  if (diff_ms == 0)
+  if (ts == rt->ctrl_last_ts)
     return;
+  uint64_t diff_ms = ts - rt->ctrl_last_ts;
   rt->ctrl_now_tx_bps
       = ((rt->ctrl_tx_b - rt->ctrl_last_tx_b) * 1000ULL) / diff_ms;
   rt->ctrl_now_rx_bps
@@ -4073,7 +4166,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (needs_probe)
         {
           uint64_t intv = um_prb_intv (re_probe_age_ms (re, ts));
-          if (re->pnd_ts > 0 && ts > re->pnd_ts && (ts - re->pnd_ts) < intv)
+          if (re->pnd_ts > 0 && ts >= re->pnd_ts && (ts - re->pnd_ts) < intv)
             continue;
           pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, true);
           re->pnd_ts = ts;
@@ -4085,7 +4178,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       if (tap_tx_use_tcp (rt, cfg, re->ep_ip, re->ep_port))
         continue;
       uint64_t prb_intv = re_keepalive_intv (re, ts);
-      bool prb_due = !(re->prb_ts > 0 && ts > re->prb_ts
+      bool prb_due = !(re->prb_ts > 0 && ts >= re->prb_ts
                        && (ts - re->prb_ts) < prb_intv);
       if (!prb_due)
         continue;

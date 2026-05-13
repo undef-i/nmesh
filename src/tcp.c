@@ -33,12 +33,18 @@ static bool tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn,
 static bool tp_conn_rsv (TpRt *tp, uint32_t need);
 static bool tp_fd_idx_rsv (TpRt *tp, uint32_t need);
 static bool tp_hot_idx_rsv (TpRt *tp, uint32_t need);
+static bool tp_flow_idx_rsv (TpRt *tp, uint32_t need);
+static void tp_flow_idx_forget_conn (TpRt *tp, uint32_t conn_idx);
+static void tp_flow_idx_prune (TpRt *tp, uint64_t now);
+static bool tp_conn_rx_rsv (TpConn *conn, uint32_t need);
+static uint32_t tp_conn_rx_frame_max (const TpConn *conn);
 static void tp_send_cache_note (TpRt *tp, const TpConn *conn);
 static void tp_tx_ring_free (TpTxRing *ring);
 static bool tp_ip_is_zero (const uint8_t ip[16]);
 static bool tp_lla_is_zero (const uint8_t lla[16]);
 static uint32_t tp_hash_lla (const uint8_t lla[16]);
 static uint32_t tp_hash_ep (const uint8_t ip[16], uint16_t port);
+static uint32_t tp_flow_hash_norm (uint32_t flow_hash);
 static ssize_t tp_sock_writev (int fd, const struct iovec *iov, int iovcnt,
                                bool more);
 static void tp_fd_cfg (int fd);
@@ -201,8 +207,9 @@ static void
 tp_conn_limit_warn (TpRt *tp, const char *ctx)
 {
   uint64_t now = sys_ts ();
-  if (now <= g_tp_conn_last_warn_ts
-      || (now - g_tp_conn_last_warn_ts) < TP_WARN_INTV)
+  if (g_tp_conn_last_warn_ts != 0
+      && (now <= g_tp_conn_last_warn_ts
+          || (now - g_tp_conn_last_warn_ts) < TP_WARN_INTV))
     return;
   int live = 0;
   if (tp)
@@ -283,6 +290,12 @@ static uint32_t
 tp_hash_ep (const uint8_t ip[16], uint16_t port)
 {
   return tp_hash_lla (ip) ^ ((uint32_t)port * 0x9e3779b1U);
+}
+
+static uint32_t
+tp_flow_hash_norm (uint32_t flow_hash)
+{
+  return flow_hash != 0 ? flow_hash : 0x9e3779b9U;
 }
 
 static uint32_t
@@ -384,24 +397,31 @@ tp_conn_dedup_peer (TpRt *tp, int epfd, const uint8_t our_lla[16],
   if (!tp || !our_lla || !peer_lla || tp_lla_is_zero (peer_lla))
     return;
 
-  TpConn *best = NULL;
   for (uint32_t i = 0; i < tp->conn_cap; i++)
     {
       TpConn *conn = tp->conn_arr[i];
       if (!tp_conn_peer_match (conn, peer_lla))
         continue;
-      if (!best || tp_conn_cmp (our_lla, conn, best) > 0)
-        best = conn;
-    }
-  if (!best)
-    return;
-
-  for (uint32_t i = 0; i < tp->conn_cap; i++)
-    {
-      TpConn *conn = tp->conn_arr[i];
-      if (conn == best || !tp_conn_peer_match (conn, peer_lla))
-        continue;
-      tp_conn_close (tp, epfd, conn);
+      TpConn *best = conn;
+      for (uint32_t j = i + 1U; j < tp->conn_cap; j++)
+        {
+          TpConn *cand = tp->conn_arr[j];
+          if (!tp_conn_peer_match (cand, peer_lla))
+            continue;
+          if (cand->lane_hash != conn->lane_hash)
+            continue;
+          if (tp_conn_cmp (our_lla, cand, best) > 0)
+            best = cand;
+        }
+      for (uint32_t j = i; j < tp->conn_cap; j++)
+        {
+          TpConn *cand = tp->conn_arr[j];
+          if (cand == best || !tp_conn_peer_match (cand, peer_lla))
+            continue;
+          if (cand->lane_hash != best->lane_hash)
+            continue;
+          tp_conn_close (tp, epfd, cand);
+        }
     }
 }
 
@@ -579,6 +599,27 @@ tp_tx_ring_iov (const TpTxRing *ring, struct iovec iov[2])
   return 2;
 }
 
+static bool
+tp_conn_rx_rsv (TpConn *conn, uint32_t need)
+{
+  if (!conn || need == 0 || need > TP_PL_MAX)
+    return false;
+  if (need <= conn->rx_cap && conn->rx_buf)
+    return true;
+  uint8_t *new_buf = realloc (conn->rx_buf, need);
+  if (!new_buf)
+    return false;
+  conn->rx_buf = new_buf;
+  conn->rx_cap = need;
+  return true;
+}
+
+static uint32_t
+tp_conn_rx_frame_max (const TpConn *conn)
+{
+  return (conn && conn->auth) ? (uint32_t)TP_PL_MAX : (uint32_t)UDP_PL_MAX;
+}
+
 static TpConn *
 tp_conn_new (uint32_t slot_idx)
 {
@@ -654,6 +695,68 @@ tp_hot_idx_rsv (TpRt *tp, uint32_t need)
 }
 
 static bool
+tp_flow_idx_rsv (TpRt *tp, uint32_t need)
+{
+  if (!tp)
+    return false;
+  if (need <= tp->flow_cap)
+    return true;
+  uint32_t new_cap = tp->flow_cap ? tp->flow_cap : TP_CONN_CAP_INIT;
+  while (new_cap < need)
+    {
+      if (new_cap > (UINT32_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  TpFlowEnt *new_arr = realloc (tp->flow_arr, sizeof (*new_arr) * new_cap);
+  if (!new_arr)
+    return false;
+  tp->flow_arr = new_arr;
+  tp->flow_cap = new_cap;
+  return true;
+}
+
+static void
+tp_flow_idx_prune (TpRt *tp, uint64_t now)
+{
+  if (!tp || !tp->flow_arr)
+    return;
+  for (uint32_t i = 0; i < tp->flow_cnt; i++)
+    {
+      TpFlowEnt *ent = &tp->flow_arr[i];
+      bool stale = ent->ts != 0 && now > ent->ts
+                   && (now - ent->ts) > TP_FLOW_IDLE_TMO;
+      bool dead = ent->conn_idx >= tp->conn_cap
+                  || !tp->conn_arr[ent->conn_idx];
+      if (!stale && !dead)
+        continue;
+      tp->flow_arr[i] = tp->flow_arr[tp->flow_cnt - 1U];
+      tp->flow_cnt--;
+      i--;
+    }
+}
+
+static void
+tp_flow_idx_forget_conn (TpRt *tp, uint32_t conn_idx)
+{
+  if (!tp || !tp->flow_arr)
+    return;
+  uint32_t out = 0;
+  for (uint32_t i = 0; i < tp->flow_cnt; i++)
+    {
+      if (tp->flow_arr[i].conn_idx == conn_idx)
+        continue;
+      if (out != i)
+        tp->flow_arr[out] = tp->flow_arr[i];
+      out++;
+    }
+  tp->flow_cnt = out;
+}
+
+static bool
 tp_conn_fd_bind (TpRt *tp, TpConn *conn, int fd)
 {
   if (!tp || !conn || fd < 0)
@@ -701,6 +804,8 @@ tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
   tp_conn_fd_unbind (tp, conn);
   conn->fd = -1;
   if (idx != TP_IDX_INV)
+    tp_flow_idx_forget_conn (tp, idx);
+  if (idx != TP_IDX_INV)
     tp->conn_arr[idx] = NULL;
   tp_send_cache_reset (tp);
   if (fd >= 0)
@@ -710,6 +815,7 @@ tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
     }
   tp_tx_ring_free (&conn->tx_hi);
   tp_tx_ring_free (&conn->tx_lo);
+  free (conn->rx_buf);
   free (conn);
 }
 
@@ -832,7 +938,7 @@ tp_conn_hot_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
       if (idx != TP_IDX_INV && idx < tp->conn_cap)
         {
           TpConn *conn = tp->conn_arr[idx];
-          if (conn->st == TP_ST_ESTABLISHED && conn->auth
+          if (conn && conn->st == TP_ST_ESTABLISHED && conn->auth
               && tp_conn_peer_match (conn, peer_lla))
             return conn;
         }
@@ -844,11 +950,153 @@ tp_conn_hot_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
       if (idx != TP_IDX_INV && idx < tp->conn_cap)
         {
           TpConn *conn = tp->conn_arr[idx];
-          if (conn->st == TP_ST_ESTABLISHED
+          if (conn && conn->st == TP_ST_ESTABLISHED
               && memcmp (conn->route_ip, ip, 16) == 0
               && conn->route_port == port)
             return conn;
         }
+    }
+  return NULL;
+}
+
+static bool
+tp_conn_route_match (const TpConn *conn, const uint8_t ip[16], uint16_t port,
+                     const uint8_t peer_lla[16], bool has_peer)
+{
+  if (!conn || conn->fd < 0 || !ip || port == 0)
+    return false;
+  if (memcmp (conn->route_ip, ip, 16) != 0 || conn->route_port != port)
+    return false;
+  if (has_peer && !tp_conn_peer_match (conn, peer_lla))
+    return false;
+  return true;
+}
+
+static bool
+tp_flow_ent_match (const TpFlowEnt *ent, const uint8_t ip[16], uint16_t port,
+                   const uint8_t peer_lla[16], bool has_peer,
+                   uint32_t flow_hash)
+{
+  if (!ent || !ip || port == 0 || flow_hash == 0)
+    return false;
+  if (ent->flow_hash != flow_hash || ent->has_peer != has_peer)
+    return false;
+  if (has_peer)
+    {
+      if (memcmp (ent->peer_lla, peer_lla, 16) != 0)
+        return false;
+    }
+  else if (ent->route_port != port || memcmp (ent->route_ip, ip, 16) != 0)
+    return false;
+  return true;
+}
+
+static bool
+tp_conn_flow_peer_match (const TpConn *conn, const uint8_t ip[16],
+                         uint16_t port, const uint8_t peer_lla[16],
+                         bool has_peer)
+{
+  return has_peer ? tp_conn_peer_match (conn, peer_lla)
+                  : tp_conn_route_match (conn, ip, port, peer_lla, has_peer);
+}
+
+static TpConn *
+tp_flow_idx_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
+                    const uint8_t peer_lla[16], bool has_peer,
+                    uint32_t flow_hash, uint64_t now)
+{
+  if (!tp || !tp->flow_arr)
+    return NULL;
+  tp_flow_idx_prune (tp, now);
+  for (uint32_t i = 0; i < tp->flow_cnt; i++)
+    {
+      TpFlowEnt *ent = &tp->flow_arr[i];
+      if (!tp_flow_ent_match (ent, ip, port, peer_lla, has_peer, flow_hash))
+        continue;
+      if (ent->conn_idx < tp->conn_cap)
+        {
+          TpConn *conn = tp->conn_arr[ent->conn_idx];
+          if (tp_conn_flow_peer_match (conn, ip, port, peer_lla, has_peer))
+            {
+              ent->ts = now;
+              return conn;
+            }
+        }
+      tp->flow_arr[i] = tp->flow_arr[tp->flow_cnt - 1U];
+      tp->flow_cnt--;
+      i--;
+    }
+  return NULL;
+}
+
+static bool
+tp_flow_idx_note (TpRt *tp, const uint8_t ip[16], uint16_t port,
+                  const uint8_t peer_lla[16], bool has_peer,
+                  uint32_t flow_hash, const TpConn *conn, uint64_t now)
+{
+  if (!tp || !ip || port == 0 || flow_hash == 0 || !conn)
+    return false;
+  uint32_t conn_idx = tp_conn_idx (tp, conn);
+  if (conn_idx == TP_IDX_INV)
+    return false;
+  for (uint32_t i = 0; i < tp->flow_cnt; i++)
+    {
+      TpFlowEnt *ent = &tp->flow_arr[i];
+      if (!tp_flow_ent_match (ent, ip, port, peer_lla, has_peer, flow_hash))
+        continue;
+      ent->conn_idx = conn_idx;
+      ent->ts = now;
+      return true;
+    }
+  if (!tp_flow_idx_rsv (tp, tp->flow_cnt + 1U))
+    return false;
+  TpFlowEnt *ent = &tp->flow_arr[tp->flow_cnt++];
+  memset (ent, 0, sizeof (*ent));
+  memcpy (ent->route_ip, ip, 16);
+  if (has_peer)
+    memcpy (ent->peer_lla, peer_lla, 16);
+  ent->route_port = port;
+  ent->flow_hash = flow_hash;
+  ent->conn_idx = conn_idx;
+  ent->ts = now;
+  ent->has_peer = has_peer;
+  return true;
+}
+
+static TpConn *
+tp_conn_lane_pick (TpRt *tp, const uint8_t ip[16], uint16_t port,
+                   const uint8_t peer_lla[16], bool has_peer)
+{
+  if (!tp || !ip || port == 0)
+    return NULL;
+  TpConn *best = NULL;
+  for (uint32_t i = 0; i < tp->conn_cap; i++)
+    {
+      TpConn *conn = tp->conn_arr[i];
+      if (!tp_conn_flow_peer_match (conn, ip, port, peer_lla, has_peer))
+        continue;
+      if (conn->tx_bp)
+        continue;
+      if (!best || conn->tx_q_bytes < best->tx_q_bytes)
+        best = conn;
+    }
+  return best;
+}
+
+static TpConn *
+tp_conn_flow_lookup (TpRt *tp, const uint8_t ip[16], uint16_t port,
+                     const uint8_t peer_lla[16], bool has_peer,
+                     uint32_t flow_hash)
+{
+  if (!tp || !ip || port == 0 || flow_hash == 0)
+    return NULL;
+  for (uint32_t i = 0; i < tp->conn_cap; i++)
+    {
+      TpConn *conn = tp->conn_arr[i];
+      if (!tp_conn_flow_peer_match (conn, ip, port, peer_lla, has_peer))
+        continue;
+      if (conn->lane_hash == flow_hash)
+        return conn;
     }
   return NULL;
 }
@@ -864,6 +1112,8 @@ tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len, size_t skip,
     return false;
   uint32_t rem = (uint32_t)(frame_len - skip);
   TpTxRing *ring = hi ? &conn->tx_hi : &conn->tx_lo;
+  if (rem > UINT32_MAX - ring->len || rem > UINT32_MAX - conn->tx_q_bytes)
+    return false;
   uint32_t ring_need = ring->len + rem;
   if (!tp_tx_ring_rsv (ring, ring_need))
     return false;
@@ -1067,6 +1317,11 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
   uint32_t slot_idx = conn->slot_idx;
   memcpy (conn->peer_lla, peer_lla, 16);
   conn->auth = true;
+  if (!tp_conn_rx_rsv (conn, TP_PL_MAX))
+    {
+      tp_conn_close (tp, epfd, conn);
+      return false;
+    }
   tp_conn_route_sync (conn, rt);
   tp_conn_dedup_peer (tp, epfd, cfg->addr, peer_lla);
   return tp_conn_slot_live (tp, slot_idx, conn);
@@ -1213,6 +1468,7 @@ tp_rt_free (TpRt *tp)
       tp->conn_arr[i] = NULL;
       tp_tx_ring_free (&conn->tx_hi);
       tp_tx_ring_free (&conn->tx_lo);
+      free (conn->rx_buf);
       free (conn);
     }
   free (tp->conn_arr);
@@ -1227,6 +1483,10 @@ tp_rt_free (TpRt *tp)
   free (tp->ep_hot_idx);
   tp->ep_hot_idx = NULL;
   tp->ep_hot_cap = 0;
+  free (tp->flow_arr);
+  tp->flow_arr = NULL;
+  tp->flow_cnt = 0;
+  tp->flow_cap = 0;
   tp_send_cache_reset (tp);
   if (tp->listen_fd >= 0)
     close (tp->listen_fd);
@@ -1303,10 +1563,14 @@ tp_send_fd (int fd, const uint8_t *data, size_t len)
     }
   bool ok = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, true);
   if (!ok)
-    tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+    {
+      tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+      tp_unlock (g_tp_rt);
+      return false;
+    }
   tp_send_cache_note (g_tp_rt, conn);
   tp_unlock (g_tp_rt);
-  return ok;
+  return true;
 }
 
 static void
@@ -1352,7 +1616,8 @@ tp_batch_end (void)
 
 static bool
 tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
-              uint16_t port, const uint8_t *data, size_t len, bool hi)
+              uint16_t port, const uint8_t *data, size_t len, bool hi,
+              uint32_t flow_hash)
 {
   if (!udp || !rt || !cfg || !ip || port == 0 || !data || len == 0)
     return false;
@@ -1370,19 +1635,47 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
   tp_lock (g_tp_rt);
   uint8_t peer_lla[16] = { 0 };
   bool has_peer = rt_ep_peer_lla (rt, ip, port, peer_lla);
-  TpConn *conn = tp_conn_hot_lookup (g_tp_rt, ip, port, peer_lla, has_peer);
-  if (!conn && has_peer)
-    conn = tp_conn_by_peer (g_tp_rt, peer_lla);
-  if (!conn)
-    conn = tp_conn_by_ep (g_tp_rt, ip, port);
+  uint64_t now = sys_ts ();
+  flow_hash = hi ? 0 : tp_flow_hash_norm (flow_hash);
+  TpConn *conn = flow_hash != 0
+                   ? tp_flow_idx_lookup (g_tp_rt, ip, port, peer_lla,
+                                         has_peer, flow_hash, now)
+                   : tp_conn_hot_lookup (g_tp_rt, ip, port, peer_lla,
+                                         has_peer);
+  if (!conn && flow_hash != 0)
+    {
+      conn = tp_conn_flow_lookup (g_tp_rt, ip, port, peer_lla, has_peer,
+                                  flow_hash);
+      if (conn)
+        (void)tp_flow_idx_note (g_tp_rt, ip, port, peer_lla, has_peer,
+                                flow_hash, conn, now);
+    }
+  if (!conn && flow_hash != 0)
+    {
+      conn = tp_conn_lane_pick (g_tp_rt, ip, port, peer_lla, has_peer);
+      if (conn)
+        (void)tp_flow_idx_note (g_tp_rt, ip, port, peer_lla, has_peer,
+                                flow_hash, conn, now);
+    }
+  if (flow_hash == 0)
+    {
+      if (!conn && has_peer)
+        conn = tp_conn_by_peer (g_tp_rt, peer_lla);
+      if (!conn)
+        conn = tp_conn_by_ep (g_tp_rt, ip, port);
+    }
   if (conn)
     {
       bool ok = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, hi);
       if (!ok)
-        tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+        {
+          tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+          tp_unlock (g_tp_rt);
+          return false;
+        }
       tp_send_cache_note (g_tp_rt, conn);
       tp_unlock (g_tp_rt);
-      return ok;
+      return true;
     }
 
   int fd = socket (AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -1413,12 +1706,16 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
       return false;
     }
   n_conn->st = TP_ST_CONNECTING;
-  n_conn->ts = sys_ts ();
+  n_conn->ts = now;
   n_conn->inbound = false;
   memcpy (n_conn->route_ip, ip, 16);
   n_conn->route_port = port;
+  n_conn->lane_hash = flow_hash;
   if (has_peer)
     memcpy (n_conn->peer_lla, peer_lla, 16);
+  if (flow_hash != 0)
+    (void)tp_flow_idx_note (g_tp_rt, ip, port, peer_lla, has_peer, flow_hash,
+                            n_conn, now);
   int rc = connect (fd, (struct sockaddr *)&sa, sizeof (sa));
   if (rc == 0)
     {
@@ -1458,14 +1755,22 @@ bool
 tp_send (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
          uint16_t port, const uint8_t *data, size_t len)
 {
-  return tp_send_kind (udp, rt, cfg, ip, port, data, len, false);
+  return tp_send_kind (udp, rt, cfg, ip, port, data, len, false, 0);
+}
+
+bool
+tp_send_flow (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
+              uint16_t port, const uint8_t *data, size_t len,
+              uint32_t flow_hash)
+{
+  return tp_send_kind (udp, rt, cfg, ip, port, data, len, false, flow_hash);
 }
 
 bool
 tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len)
 {
-  return tp_send_kind (udp, rt, cfg, ip, port, data, len, true);
+  return tp_send_kind (udp, rt, cfg, ip, port, data, len, true, 0);
 }
 
 bool
@@ -1606,13 +1911,19 @@ tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg)
         }
       if (conn->st == TP_ST_CONNECTING && now > conn->ts
           && (now - conn->ts) > TP_CONN_TMO)
-        tp_conn_close (tp, g_tp_epfd, conn);
-      if (conn->auth && cfg && conn->route_port != 0
+        {
+          tp_conn_close (tp, g_tp_epfd, conn);
+          continue;
+        }
+      if (conn->auth && rt && cfg && conn->route_port != 0
           && (!tp_mask_has (cfg->tp_mask, TP_PROTO_TCP)
               || !tp_mask_has (rt_ep_tp_mask (rt, conn->route_ip,
                                               conn->route_port),
                                TP_PROTO_TCP)))
-        tp_conn_close (tp, g_tp_epfd, conn);
+        {
+          tp_conn_close (tp, g_tp_epfd, conn);
+          continue;
+        }
     }
   tp_unlock (tp);
 }
@@ -1748,7 +2059,14 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
           memcpy (&net_len, conn->hdr_buf, sizeof (net_len));
           conn->rx_len = ntohl (net_len);
           conn->hdr_have = 0;
-          if (conn->rx_len == 0 || conn->rx_len > TP_PL_MAX)
+          uint32_t rx_frame_max = tp_conn_rx_frame_max (conn);
+          if (conn->rx_len == 0 || conn->rx_len > rx_frame_max)
+            {
+              tp_conn_close (tp, epfd, conn);
+              tp_unlock (tp);
+              return;
+            }
+          if (!tp_conn_rx_rsv (conn, conn->rx_len))
             {
               tp_conn_close (tp, epfd, conn);
               tp_unlock (tp);

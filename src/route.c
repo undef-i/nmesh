@@ -460,7 +460,7 @@ re_dir_seed_m (const Re *re)
 static bool
 re_is_recent (const Re *re, uint64_t sys_ts)
 {
-  if (!re || re->rx_ts == 0 || sys_ts <= re->rx_ts)
+  if (!re || re->rx_ts == 0 || sys_ts < re->rx_ts)
     return false;
   uint64_t age = sys_ts - re->rx_ts;
   uint64_t win = re->rto;
@@ -2365,7 +2365,7 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
               continue;
             }
           if (re->is_act && re->state == RT_ACT && re->rx_ts > 0
-              && sys_ts > re->rx_ts && (sys_ts - re->rx_ts) <= KA_TMO)
+              && sys_ts >= re->rx_ts && (sys_ts - re->rx_ts) <= KA_TMO)
             {
               re->tx_ts = sys_ts;
               continue;
