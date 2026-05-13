@@ -196,9 +196,9 @@ static void
 rx_rp_warn_grow_fail (uint32_t new_cap)
 {
   uint64_t now = sys_ts ();
-  if (now <= g_rx_rp_last_warn_ts
-      || (g_rx_rp_last_warn_ts != 0
-          && (now - g_rx_rp_last_warn_ts) < 5000ULL))
+  if (g_rx_rp_last_warn_ts != 0
+      && (now <= g_rx_rp_last_warn_ts
+          || (now - g_rx_rp_last_warn_ts) < 5000ULL))
     return;
   fprintf (stderr, "replay: failed to expand window table to %u slots\n",
            (unsigned)new_cap);

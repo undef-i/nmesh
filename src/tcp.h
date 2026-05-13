@@ -14,6 +14,7 @@
 #define TP_CONN_CAP_INIT 512U
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
+#define TP_FLOW_IDLE_TMO (RT_PRB_INTV * 2ULL)
 #define TP_TXQ_FRAME_BYTES ((uint32_t)(sizeof (uint32_t) + TP_PL_MAX))
 #define TP_TXQ_STOP_MULT 4U
 #define TP_CONN_TMO                                                           \
@@ -45,6 +46,17 @@ typedef struct
 
 typedef struct
 {
+  uint8_t route_ip[16];
+  uint8_t peer_lla[16];
+  uint16_t route_port;
+  uint32_t flow_hash;
+  uint32_t conn_idx;
+  uint64_t ts;
+  bool has_peer;
+} TpFlowEnt;
+
+typedef struct
+{
   uint32_t slot_idx;
   int fd;
   TpSt st;
@@ -57,11 +69,13 @@ typedef struct
   uint16_t sock_port;
   uint8_t route_ip[16];
   uint16_t route_port;
+  uint32_t lane_hash;
   uint8_t hdr_buf[sizeof (uint32_t)];
+  uint8_t *rx_buf;
+  uint32_t rx_cap;
   uint32_t hdr_have;
   uint32_t rx_len;
   uint32_t rx_have;
-  uint8_t rx_buf[TP_PL_MAX];
   TpTxRing tx_hi;
   TpTxRing tx_lo;
   uint32_t tx_q_bytes;
@@ -83,6 +97,9 @@ typedef struct
   uint32_t peer_hot_cap;
   uint32_t *ep_hot_idx;
   uint32_t ep_hot_cap;
+  TpFlowEnt *flow_arr;
+  uint32_t flow_cnt;
+  uint32_t flow_cap;
   uint32_t tx_qd_cnt;
   uint32_t tx_bp_cnt;
 } TpRt;
@@ -101,6 +118,9 @@ bool tp_alive_get (const uint8_t peer_lla[16], const uint8_t ip[16],
                    uint16_t port);
 bool tp_send (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len);
+bool tp_send_flow (Udp *udp, const Rt *rt, const Cfg *cfg,
+                   const uint8_t ip[16], uint16_t port, const uint8_t *data,
+                   size_t len, uint32_t flow_hash);
 bool tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg,
                    const uint8_t ip[16], uint16_t port, const uint8_t *data,
                    size_t len);
