@@ -39,6 +39,7 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -56,6 +57,8 @@ static char *g_pidfile = NULL;
 static bool g_pidfile_armed = false;
 static int g_start_ready_fd = -1;
 static bool g_daemon_child = false;
+static volatile sig_atomic_t g_supervisor_stop = 0;
+static volatile sig_atomic_t g_supervisor_child = -1;
 
 #define NMESH_DAEMON_FLAG_ENV "NMESH_DAEMON_CHILD"
 #define NMESH_READY_FD_ENV "NMESH_READY_FD"
@@ -304,21 +307,29 @@ daemon_env_clr (void)
 static int
 daemon_env_set (int ready_fd, const char *pid_path)
 {
-  if (ready_fd < 0 || !pid_path || !pid_path[0])
-    return -1;
-  int flg = fcntl (ready_fd, F_GETFD, 0);
-  if (flg < 0)
-    return -1;
-  if (fcntl (ready_fd, F_SETFD, flg & ~FD_CLOEXEC) != 0)
-    return -1;
-  char fd_buf[32];
-  snprintf (fd_buf, sizeof (fd_buf), "%d", ready_fd);
   if (setenv (NMESH_DAEMON_FLAG_ENV, "1", 1) != 0)
     return -1;
-  if (setenv (NMESH_READY_FD_ENV, fd_buf, 1) != 0)
-    return -1;
-  if (setenv (NMESH_PIDFILE_ENV, pid_path, 1) != 0)
-    return -1;
+  if (ready_fd >= 0)
+    {
+      int flg = fcntl (ready_fd, F_GETFD, 0);
+      if (flg < 0)
+        return -1;
+      if (fcntl (ready_fd, F_SETFD, flg & ~FD_CLOEXEC) != 0)
+        return -1;
+      char fd_buf[32];
+      snprintf (fd_buf, sizeof (fd_buf), "%d", ready_fd);
+      if (setenv (NMESH_READY_FD_ENV, fd_buf, 1) != 0)
+        return -1;
+    }
+  else
+    unsetenv (NMESH_READY_FD_ENV);
+  if (pid_path && pid_path[0])
+    {
+      if (setenv (NMESH_PIDFILE_ENV, pid_path, 1) != 0)
+        return -1;
+    }
+  else
+    unsetenv (NMESH_PIDFILE_ENV);
   return 0;
 }
 
@@ -547,6 +558,36 @@ proc_is_nmesh_cfg (pid_t pid, const char *cfg_abs)
   return ok;
 }
 
+static bool
+proc_is_nmesh_start (pid_t pid)
+{
+  if (!proc_is_nmesh_pid (pid))
+    return false;
+  size_t n = 0;
+  char *buf = proc_cmdline_dup (pid, &n);
+  if (!buf || n == 0)
+    {
+      free (buf);
+      return false;
+    }
+  bool ok = false;
+  bool first = true;
+  for (size_t i = 0; i < n;)
+    {
+      const char *arg = buf + i;
+      size_t arg_len = strlen (arg);
+      if (!first && strcmp (arg, "start") == 0)
+        {
+          ok = true;
+          break;
+        }
+      first = false;
+      i += arg_len + 1U;
+    }
+  free (buf);
+  return ok;
+}
+
 static int
 cfg_pid_scan (const char *cfg_abs, pid_t **out_arr, size_t *out_cnt)
 {
@@ -646,6 +687,231 @@ pid_stop_force (pid_t pid)
   return wait_pid_exit (pid, 1000) || !pid_alive (pid);
 }
 
+static bool
+pid_group_stop_force (pid_t pid)
+{
+  if (pid <= 1)
+    return false;
+  if (!pid_alive (pid))
+    return true;
+  pid_t pgid = getpgid (pid);
+  if (pgid <= 1)
+    return pid_stop_force (pid);
+  if (kill (-pgid, SIGTERM) != 0)
+    {
+      if (errno == ESRCH)
+        return true;
+      return false;
+    }
+  if (wait_pid_exit (pid, 3000))
+    return true;
+  if (kill (-pgid, SIGKILL) != 0 && errno != ESRCH)
+    return false;
+  return wait_pid_exit (pid, 1000) || !pid_alive (pid);
+}
+
+static void
+supervisor_sig_hnd (int sig)
+{
+  (void)sig;
+  g_supervisor_stop = 1;
+  pid_t child = (pid_t)g_supervisor_child;
+  if (child > 1)
+    kill (child, SIGTERM);
+}
+
+static void
+supervisor_sig_init (void)
+{
+  struct sigaction sa;
+  memset (&sa, 0, sizeof (sa));
+  sa.sa_handler = supervisor_sig_hnd;
+  sigemptyset (&sa.sa_mask);
+  (void)sigaction (SIGTERM, &sa, NULL);
+  (void)sigaction (SIGINT, &sa, NULL);
+  (void)sigaction (SIGHUP, &sa, NULL);
+}
+
+static pid_t
+supervisor_child_spawn (const char *exe_path, const char *cfg_abs,
+                        int ready_fd)
+{
+  pid_t pid = fork ();
+  if (pid < 0)
+    return -1;
+  if (pid == 0)
+    {
+      if (ready_fd >= 0 && daemon_env_set (ready_fd, NULL) != 0)
+        _exit (1);
+      if (ready_fd < 0 && daemon_env_set (-1, NULL) != 0)
+        _exit (1);
+      char *const child_argv[] = { (char *)exe_path, "-c", (char *)cfg_abs,
+                                   NULL };
+      execv (exe_path, child_argv);
+      daemon_env_clr ();
+      _exit (1);
+    }
+  return pid;
+}
+
+static bool
+supervisor_child_initial_ready (pid_t child, int child_ready_fd,
+                                int parent_ready_fd, int *status_out)
+{
+  if (status_out)
+    *status_out = 0;
+  bool ready = false;
+  for (;;)
+    {
+      int st = 0;
+      pid_t wr = waitpid (child, &st, WNOHANG);
+      if (wr == child)
+        {
+          if (status_out)
+            *status_out = st;
+          break;
+        }
+      if (wr < 0 && errno != EINTR)
+        break;
+      struct pollfd pfd;
+      memset (&pfd, 0, sizeof (pfd));
+      pfd.fd = child_ready_fd;
+      pfd.events = POLLIN | POLLHUP;
+      int pr = poll (&pfd, 1, 100);
+      if (pr < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          break;
+        }
+      if (pr == 0)
+        continue;
+      if ((pfd.revents & POLLIN) != 0)
+        {
+          char sig = 0;
+          ssize_t nr = read (child_ready_fd, &sig, 1);
+          if (nr == 1 && sig == 'R')
+            {
+              if (parent_ready_fd >= 0)
+                {
+                  char ok = 'R';
+                  (void)write (parent_ready_fd, &ok, 1);
+                }
+              ready = true;
+            }
+          break;
+        }
+      if ((pfd.revents & POLLHUP) != 0)
+        break;
+    }
+  return ready;
+}
+
+static bool
+supervisor_child_success (int st)
+{
+  if (WIFEXITED (st))
+    return WEXITSTATUS (st) == 0;
+  return false;
+}
+
+static void
+supervisor_run (const char *exe_path, const char *cfg_abs, int parent_ready_fd)
+{
+  supervisor_sig_init ();
+  start_stdio_detach ();
+  uint64_t backoff_ms = 250;
+  bool first = true;
+  for (;;)
+    {
+      if (g_supervisor_stop)
+        break;
+      int child_ready[2] = { -1, -1 };
+      int ready_fd = -1;
+      if (first)
+        {
+          if (pipe2 (child_ready, O_CLOEXEC) != 0)
+            break;
+          ready_fd = child_ready[1];
+        }
+      uint64_t start_ms = sys_ts ();
+      pid_t child = supervisor_child_spawn (exe_path, cfg_abs, ready_fd);
+      if (ready_fd >= 0)
+        close (ready_fd);
+      if (child_ready[1] >= 0)
+        child_ready[1] = -1;
+      if (child < 0)
+        {
+          if (child_ready[0] >= 0)
+            close (child_ready[0]);
+          break;
+        }
+      g_supervisor_child = child;
+      int st = 0;
+      bool ready = true;
+      if (first)
+        {
+          ready = supervisor_child_initial_ready (child, child_ready[0],
+                                                 parent_ready_fd, &st);
+          if (child_ready[0] >= 0)
+            close (child_ready[0]);
+          if (parent_ready_fd >= 0)
+            {
+              close (parent_ready_fd);
+              parent_ready_fd = -1;
+            }
+          first = false;
+          if (!ready)
+            {
+              if (pid_alive (child))
+                (void)pid_stop_force (child);
+              g_supervisor_child = -1;
+              break;
+            }
+          st = 0;
+        }
+      while (!g_supervisor_stop)
+        {
+          pid_t wr = waitpid (child, &st, 0);
+          if (wr == child)
+            {
+              g_supervisor_child = -1;
+              break;
+            }
+          if (wr < 0 && errno != EINTR)
+            {
+              g_supervisor_child = -1;
+              break;
+            }
+        }
+      if (g_supervisor_stop)
+        break;
+      if (supervisor_child_success (st))
+        break;
+      uint64_t lived_ms = sys_ts () - start_ms;
+      if (lived_ms > 10000ULL)
+        backoff_ms = 250;
+      struct timespec req;
+      req.tv_sec = (time_t)(backoff_ms / 1000ULL);
+      req.tv_nsec = (long)((backoff_ms % 1000ULL) * 1000000ULL);
+      while (nanosleep (&req, &req) != 0 && errno == EINTR
+             && !g_supervisor_stop)
+        {
+        }
+      if (backoff_ms < 5000ULL)
+        {
+          backoff_ms *= 2ULL;
+          if (backoff_ms > 5000ULL)
+            backoff_ms = 5000ULL;
+        }
+    }
+  if (parent_ready_fd >= 0)
+    close (parent_ready_fd);
+  pid_t child = (pid_t)g_supervisor_child;
+  if (child > 1)
+    (void)pid_stop_force (child);
+}
+
 static int
 cmd_stop_run (const char *cfg_abs)
 {
@@ -674,7 +940,7 @@ cmd_stop_run (const char *cfg_abs)
   if (pidfile_owned)
     {
       bool was_alive = pid_alive (pid);
-      if (pid_stop_force (pid) && was_alive)
+      if (pid_group_stop_force (pid) && was_alive)
         killed_cnt++;
     }
   else if (has_pidfile && pid_alive (pid))
@@ -690,12 +956,20 @@ cmd_stop_run (const char *cfg_abs)
       free (pid_path);
       return 1;
     }
-  for (size_t i = 0; i < scan_cnt; i++)
+  for (size_t pass = 0; pass < 2; pass++)
     {
-      if (has_pidfile && pid_arr[i] == pid)
-        continue;
-      if (pid_stop_force (pid_arr[i]))
-        killed_cnt++;
+      for (size_t i = 0; i < scan_cnt; i++)
+        {
+          if (has_pidfile && pid_arr[i] == pid)
+            continue;
+          bool is_supervisor = proc_is_nmesh_start (pid_arr[i]);
+          if ((pass == 0) != is_supervisor)
+            continue;
+          bool stopped = is_supervisor ? pid_group_stop_force (pid_arr[i])
+                                       : pid_stop_force (pid_arr[i]);
+          if (stopped)
+            killed_cnt++;
+        }
     }
   if (ifname[0] == '\0')
     {
@@ -796,7 +1070,7 @@ cmd_start_bg (const char *cfg_abs, const char *ifname)
       close (ready_pipe[0]);
       if (nr == 1 && sig == 'R')
         {
-          fprintf (stderr, "main: nmesh started in background pid=%d\n",
+          fprintf (stderr, "main: nmesh started in background supervisor=%d\n",
                    (int)pid);
           free (pid_path);
           free (exe_path);
@@ -814,24 +1088,25 @@ cmd_start_bg (const char *cfg_abs, const char *ifname)
       close (ready_pipe[1]);
       _exit (1);
     }
-  signal (SIGHUP, SIG_IGN);
   if (pidfile_write (pid_path, getpid (), cfg_abs, ifname) != 0)
     {
       close (ready_pipe[1]);
       _exit (1);
     }
-  if (daemon_env_set (ready_pipe[1], pid_path) != 0)
+  g_pidfile = str_dup (pid_path);
+  if (!g_pidfile)
     {
       close (ready_pipe[1]);
       unlink (pid_path);
       _exit (1);
     }
-  char *const child_argv[] = { exe_path, "-c", (char *)cfg_abs, NULL };
-  execv (exe_path, child_argv);
-  close (ready_pipe[1]);
-  unlink (pid_path);
-  daemon_env_clr ();
-  _exit (1);
+  g_pidfile_armed = true;
+  atexit (pidfile_cleanup);
+  supervisor_run (exe_path, cfg_abs, ready_pipe[1]);
+  pidfile_cleanup ();
+  free (pid_path);
+  free (exe_path);
+  _exit (0);
 }
 
 static int
