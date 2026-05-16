@@ -17,6 +17,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <linux/icmp.h>
+#include <linux/icmpv6.h>
 #include <linux/errqueue.h>
 #include <linux/udp.h>
 #endif
@@ -39,6 +41,23 @@ static void ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN]);
 static bool udp_pend_add (Udp *s, const UdpMsg *m);
 static void udp_sock_buf_set (int fd, int opt, int force_opt, int want,
                               const char *name);
+
+#if defined(__linux__) && defined(MSG_ERRQUEUE)
+static bool
+udp_err_is_ptb (const struct sock_extended_err *e, int family)
+{
+  if (!e || e->ee_errno != EMSGSIZE || e->ee_info == 0)
+    return false;
+  if (family == AF_INET)
+    return e->ee_origin == SO_EE_ORIGIN_ICMP
+           && e->ee_type == ICMP_DEST_UNREACH
+           && e->ee_code == ICMP_FRAG_NEEDED;
+  if (family == AF_INET6)
+    return e->ee_origin == SO_EE_ORIGIN_ICMP6
+           && e->ee_type == ICMPV6_PKT_TOOBIG;
+  return false;
+}
+#endif
 
 typedef struct
 {
@@ -1285,7 +1304,7 @@ udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu)
         {
           struct sock_extended_err *e
               = (struct sock_extended_err *)CMSG_DATA (c);
-          if (e && e->ee_info > 0)
+          if (udp_err_is_ptb (e, AF_INET))
             {
               m = (uint16_t)e->ee_info;
               has_mtu = true;
@@ -1297,7 +1316,7 @@ udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu)
         {
           struct sock_extended_err *e
               = (struct sock_extended_err *)CMSG_DATA (c);
-          if (e && e->ee_info > 0)
+          if (udp_err_is_ptb (e, AF_INET6))
             {
               m = (uint16_t)e->ee_info;
               has_mtu = true;
