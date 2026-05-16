@@ -359,7 +359,7 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
         gsp_ent.adv_m = RT_M_INF;
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
-      if (dst_no_dir && memcmp (re->lla, our_lla, 16) != 0)
+      if (no_dir || (dst_no_dir && memcmp (re->lla, our_lla, 16) != 0))
         gsp_ent_mask_dir (&gsp_ent);
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
       gsp_ent_ser (pl_buf + wr_off, &gsp_ent);
@@ -428,7 +428,7 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
         gsp_ent.adv_m = RT_M_INF;
       memcpy (gsp_ent.nhop_lla, re->nhop_lla, 16);
       gsp_ent.ver = re->ver;
-      if (dst_no_dir && memcmp (re->lla, our_lla, 16) != 0)
+      if (no_dir || (dst_no_dir && memcmp (re->lla, our_lla, 16) != 0))
         gsp_ent_mask_dir (&gsp_ent);
       size_t wr_off = (size_t)(2 + act_cnt * (int)GSP_SZ);
       gsp_ent_ser (pl_buf + wr_off, &gsp_ent);
@@ -803,9 +803,9 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         }
       bool is_s_self = (memcmp (gsp_ent.ep_ip, src_ip, 16) == 0
                         && gsp_ent.ep_port == src_port);
-      if (src_fresh && no_dir && !is_s_self)
+      if (no_dir && !is_s_self)
         rt_dir_hint_prune (rt, gsp_ent.lla);
-      if (!is_s_self)
+      if (!is_s_self && has_s_lla)
         {
           Re rel_re;
           memset (&rel_re, 0, sizeof (rel_re));
@@ -834,8 +834,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           if (rel_re.tp_mask == 0)
             rel_re.tp_mask = TP_MASK_UDP | TP_MASK_TCP;
           rel_re.rto = RTO_INIT;
-          if (has_s_lla)
-            memcpy (rel_re.nhop_lla, src_lla, 16);
+          memcpy (rel_re.nhop_lla, src_lla, 16);
           rt_upd (rt, &rel_re, sys_ts);
         }
       bool import_dir_hint
