@@ -90,7 +90,7 @@ typedef struct LoopRxCtx
   uint64_t sid;
   PPool *pool;
 } LoopRxCtx;
-static void on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src,
+static bool on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src,
                           void *arg);
 
 static int
@@ -3150,15 +3150,13 @@ tap_data_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
   frame_l3_info_get (frame_pkt, frame_len, &l3_off, &eth_type);
   uint32_t flow_hash = tx_path_lcl.use_tcp
                          ? tap_flow_hash_get (frame_pkt, frame_len, l3_off,
-                                              eth_type)
+                                               eth_type)
                          : 0;
-  if (tx_path_lcl.use_tcp)
-    {
-      uint8_t l4_proto
-        = frame_l4_proto_get (frame_pkt, frame_len, l3_off, eth_type);
-      if (l4_proto == IPPROTO_UDP && tp_w_want ())
-        return true;
-    }
+  if (tx_path_lcl.use_tcp
+      && frame_l4_proto_get (frame_pkt, frame_len, l3_off, eth_type)
+             == IPPROTO_UDP
+      && tp_w_want ())
+    return true;
   if (!tx_path_lcl.use_tcp && mss_apply
       && (eth_type == 0x0800U || eth_type == 0x86DDU)
       && frame_len > l3_off)
@@ -3823,6 +3821,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
       {
         if (!has_src)
           break;
+        if (!p2p_direct_peer_ok (cfg, rt, tp_src, src_ip, src_port))
+          break;
         bool is_mod = false;
         bool req_seq = false;
         uint8_t seq_tgt[16] = { 0 };
@@ -3896,12 +3896,12 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
     }
 }
 
-static void
+static bool
 on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
 {
   LoopRxCtx *ctx = arg;
   if (!ctx || !ctx->cry_ctx || !frame || len == 0)
-    return;
+    return false;
 
   uint64_t ts = sys_ts ();
   static uint64_t l_reap_ts = 0;
@@ -3913,15 +3913,14 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
 
   uint8_t src_ip[16] = { 0 };
   uint16_t src_port = 0;
-  if (rx_src_ep_get (src, NULL, 0, src_ip, &src_port))
-    rt_rx_ack (ctx->rt, src_ip, src_port, ts);
+  bool has_src = rx_src_ep_get (src, NULL, 0, src_ip, &src_port);
 
   bool bypass_replay = is_ip_loopback (src_ip) && len >= PKT_HDR_SZ
                        && (frame[0] & PKT_TF_TYPE_MASK) == PT_STAT_REQ;
   if (!bypass_replay)
     {
       if (len < PKT_HDR_SZ || !rx_rp_chk (frame + PKT_CH_SZ))
-        return;
+        return false;
     }
 
   static _Thread_local uint8_t pt_buf[TP_VNET_MAX];
@@ -3931,10 +3930,25 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   if (pkt_dec (ctx->cry_ctx, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf),
                &hdr, &pt, &pt_len)
       != 0)
-    return;
+    return false;
   if (!bypass_replay && !rx_rp_cmt (frame + PKT_CH_SZ))
-    return;
+    return false;
+  if (has_src)
+    {
+      static _Thread_local uint8_t last_ack_ip[16];
+      static _Thread_local uint16_t last_ack_port = 0;
+      static _Thread_local uint64_t last_ack_ts = 0;
+      if (last_ack_ts != ts || last_ack_port != src_port
+          || memcmp (last_ack_ip, src_ip, 16) != 0)
+        {
+          rt_rx_ack (ctx->rt, src_ip, src_port, ts);
+          memcpy (last_ack_ip, src_ip, 16);
+          last_ack_port = src_port;
+          last_ack_ts = ts;
+        }
+    }
   on_rx_dec_pkt (ctx, src, NULL, 0, len, &hdr, pt, pt_len, ts);
+  return true;
 }
 
 void

@@ -37,6 +37,7 @@ seq_lt (uint32_t a, uint32_t b)
 }
 
 static bool is_z16 (const uint8_t lla[16]);
+static const SrcEnt *src_fnd_c (const Rt *t, const uint8_t rt_id[16]);
 
 static bool
 rt_direct_ep_ip_ok (const uint8_t ip[16])
@@ -284,6 +285,9 @@ pth_m (const Pth *pth)
   uint32_t m = pth->sm_m;
   if (m == 0 || m == RTT_UNK || m >= RT_M_INF)
     m = pth->rt_m;
+  if ((m == 0 || m == RTT_UNK || m >= RT_M_INF) && pth->r2d == 0
+      && pth->is_act && pth->state == RT_ACT)
+    m = RTO_INIT;
   return m;
 }
 
@@ -732,7 +736,10 @@ rt_map_rbd (Rt *t)
       pth->next = rtm->paths;
       rtm->paths = pth;
 
-      if (pth->r2d == 0 && pth->is_act && pth->state == RT_ACT)
+      const SrcEnt *src = src_fnd_c (t, rtm->lla);
+      bool no_dir = src && src->no_dir;
+      bool dir_allowed = !no_dir || pth->is_static;
+      if (pth->r2d == 0 && dir_allowed && pth->is_act && pth->state == RT_ACT)
         {
           if (pth_dir_btr (pth, rtm->sel_dir_pth))
             {
@@ -745,10 +752,13 @@ rt_map_rbd (Rt *t)
   RtMap *rtm, *tmp;
   HASH_ITER (hh, n_map, rtm, tmp)
   {
+    const SrcEnt *src = src_fnd_c (t, rtm->lla);
+    bool no_dir = src && src->no_dir;
     int dir_act_cnt = 0;
     for (Pth *p = rtm->paths; p; p = p->next)
       {
-        if (p->r2d == 0 && p->is_act && p->state == RT_ACT)
+        bool dir_allowed = !no_dir || p->is_static;
+        if (p->r2d == 0 && dir_allowed && p->is_act && p->state == RT_ACT)
           dir_act_cnt++;
         if (!p->is_act || p->state != RT_ACT)
           continue;
@@ -780,7 +790,8 @@ rt_map_rbd (Rt *t)
 
     for (Pth *p = rtm->paths; p; p = p->next)
       {
-        if (p->r2d == 0 && !p->is_act && p->state == RT_PND)
+        bool dir_allowed = !no_dir || p->is_static;
+        if (p->r2d == 0 && dir_allowed && !p->is_act && p->state == RT_PND)
           {
             rtm->has_pnd_dir = true;
             break;
@@ -2497,9 +2508,15 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
         {
           if (tp_alive_get (re->lla, re->ep_ip, re->ep_port))
             {
+              bool was_act = re->is_act;
+              RtSt was_state = re->state;
+              uint32_t old_rt_m = re->rt_m;
               re_rx_ack (re, sys_ts);
               if (re->rt_m == 0 || re->rt_m >= RT_M_INF)
                 re->rt_m = re_dir_seed_m (re);
+              if (re->is_act != was_act || re->state != was_state
+                  || re->rt_m != old_rt_m)
+                is_mod = true;
               t->re_arr[wr_idx++] = *re;
               continue;
             }
@@ -2715,8 +2732,10 @@ rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
       se->last_ver = ver;
       se->no_dir = no_dir;
       se->gc_ts = sys_ts;
+      rt_map_mark (t);
       return;
     }
+  bool old_no_dir = se->no_dir;
   if (ver > 0 && se->last_ver > 0 && ver < se->last_ver)
     {
       se->fwd_seq = seq;
@@ -2732,6 +2751,8 @@ rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
     se->last_ver = ver;
   se->no_dir = no_dir;
   se->gc_ts = sys_ts;
+  if (se->no_dir != old_no_dir)
+    rt_map_mark (t);
 }
 
 void
