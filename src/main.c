@@ -365,7 +365,11 @@ static int
 pidfile_write (const char *pid_path, pid_t pid, const char *cfg_abs,
                const char *ifname)
 {
-  int fd = open (pid_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  int flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  int fd = open (pid_path, flags, 0600);
   if (fd < 0)
     return -1;
   FILE *fp = fdopen (fd, "w");

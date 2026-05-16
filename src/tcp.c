@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sodium.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,6 +56,13 @@ static void tp_flush_deferred (void);
 static bool tp_owner_thread (void);
 
 #define TP_TXQ_BATCH_FRAMES 16U
+
+typedef enum
+{
+  TP_AUTH_FAIL = 0,
+  TP_AUTH_PENDING,
+  TP_AUTH_OK,
+} TpAuthRes;
 
 static bool
 tp_inbound_static_ok (const Rt *rt, const uint8_t peer_lla[16],
@@ -246,6 +254,18 @@ static bool
 tp_owner_thread (void)
 {
   return g_tp_owner_set && pthread_equal (pthread_self (), g_tp_owner_tid);
+}
+
+static uint64_t
+tp_auth_tok_new (void)
+{
+  uint64_t tok = 0;
+  do
+    {
+      randombytes_buf (&tok, sizeof (tok));
+    }
+  while (tok == 0);
+  return tok;
 }
 
 static bool
@@ -628,6 +648,7 @@ tp_conn_new (uint32_t slot_idx)
     return NULL;
   conn->slot_idx = slot_idx;
   conn->fd = -1;
+  conn->auth_tok = tp_auth_tok_new ();
   return conn;
 }
 
@@ -1237,8 +1258,10 @@ tp_send_hello (TpConn *conn)
     return true;
   uint8_t ping_buf[UDP_PL_MAX];
   size_t ping_len = 0;
-  ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid, 0,
-            ping_buf, &ping_len);
+  if (conn->auth_tok == 0)
+    conn->auth_tok = tp_auth_tok_new ();
+  ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid,
+            conn->auth_tok, ping_buf, &ping_len);
   bool ok
     = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, ping_buf, ping_len, true);
   if (!ok)
@@ -1262,48 +1285,13 @@ tp_conn_route_sync (TpConn *conn, const Rt *rt)
 }
 
 static bool
-tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
-              const uint8_t *frame, size_t len)
+tp_conn_auth_finish (TpRt *tp, int epfd, TpConn *conn, Rt *rt,
+                     const Cfg *cfg, const uint8_t peer_lla[16],
+                     uint64_t peer_sid, uint16_t peer_port)
 {
-  if (!tp || !conn || !cfg || !g_tp_cry || !frame || len == 0)
+  if (!tp || !conn || !cfg || !peer_lla)
     return false;
-  uint8_t pt_buf[UDP_PL_MAX];
-  PktHdr hdr;
-  uint8_t *pt = NULL;
-  size_t pt_len = 0;
-  if (pkt_dec (g_tp_cry, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr,
-               &pt, &pt_len)
-      != 0)
-    return false;
-  uint8_t peer_lla[16] = { 0 };
-  uint64_t peer_sid = 0;
-  uint16_t peer_port = 0;
-  uint64_t prb_tok = 0;
-  if (hdr.pkt_type == PT_PING)
-    {
-      uint64_t req_ts = 0;
-      if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
-                   &prb_tok)
-          != 0
-          || prb_tok != 0)
-        return false;
-    }
-  else if (hdr.pkt_type == PT_PONG)
-    {
-      uint64_t req_ts = 0;
-      uint64_t peer_rx_ts = 0;
-      if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
-                   &peer_rx_ts, &prb_tok)
-          != 0
-          || prb_tok != 0)
-        return false;
-    }
-  else
-    {
-      return false;
-    }
-
-  if (conn->inbound && cfg && cfg->p2p != P2P_EN
+  if (conn->inbound && cfg->p2p != P2P_EN
       && !tp_inbound_static_ok (rt, peer_lla, conn->sock_ip, peer_port))
     {
       tp_conn_close (tp, epfd, conn);
@@ -1314,6 +1302,12 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
       memcpy (conn->route_ip, conn->sock_ip, 16);
       conn->route_port = peer_port;
     }
+  uint64_t now = sys_ts ();
+  if (rt && rt_peer_sess (rt, peer_lla, peer_sid, now))
+    rx_rp_rst_lla (rt, peer_lla);
+  if (rt && conn->route_port != 0 && !tp_ip_is_zero (conn->route_ip))
+    rt_ep_upd (rt, peer_lla, conn->route_ip, conn->route_port, TP_MASK_TCP,
+               now);
   uint32_t slot_idx = conn->slot_idx;
   memcpy (conn->peer_lla, peer_lla, 16);
   conn->auth = true;
@@ -1325,6 +1319,63 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, const Rt *rt, const Cfg *cfg,
   tp_conn_route_sync (conn, rt);
   tp_conn_dedup_peer (tp, epfd, cfg->addr, peer_lla);
   return tp_conn_slot_live (tp, slot_idx, conn);
+}
+
+static TpAuthRes
+tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
+              const uint8_t *frame, size_t len)
+{
+  if (!tp || !conn || !cfg || !g_tp_cry || !frame || len == 0)
+    return TP_AUTH_FAIL;
+  uint8_t pt_buf[UDP_PL_MAX];
+  PktHdr hdr;
+  uint8_t *pt = NULL;
+  size_t pt_len = 0;
+  if (pkt_dec (g_tp_cry, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr,
+               &pt, &pt_len)
+      != 0)
+    return TP_AUTH_FAIL;
+  uint8_t peer_lla[16] = { 0 };
+  uint64_t peer_sid = 0;
+  uint16_t peer_port = 0;
+  uint64_t prb_tok = 0;
+  if (hdr.pkt_type == PT_PING)
+    {
+      uint64_t req_ts = 0;
+      if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
+                   &prb_tok)
+          != 0
+          || prb_tok == 0)
+        return TP_AUTH_FAIL;
+      uint8_t pong_buf[UDP_PL_MAX];
+      size_t pong_len = 0;
+      pong_bld (g_tp_cry, cfg->addr, cfg->port, req_ts, g_tp_sid, sys_ts (),
+                prb_tok, pong_buf, &pong_len);
+      if (!tp_conn_tx_frame (tp, epfd, conn, pong_buf, pong_len, true))
+        return TP_AUTH_FAIL;
+      if (!tp_send_hello (conn))
+        return TP_AUTH_FAIL;
+      return TP_AUTH_PENDING;
+    }
+  else if (hdr.pkt_type == PT_PONG)
+    {
+      uint64_t req_ts = 0;
+      uint64_t peer_rx_ts = 0;
+      if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
+                   &peer_rx_ts, &prb_tok)
+          != 0
+          || prb_tok == 0 || prb_tok != conn->auth_tok)
+        return TP_AUTH_FAIL;
+    }
+  else
+    {
+      return TP_AUTH_FAIL;
+    }
+
+  return tp_conn_auth_finish (tp, epfd, conn, rt, cfg, peer_lla, peer_sid,
+                              peer_port)
+             ? TP_AUTH_OK
+             : TP_AUTH_FAIL;
 }
 
 static TpProto
@@ -1970,7 +2021,7 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
 }
 
 void
-tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
+tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
                   const Cfg *cfg, TpFrameFn cb, void *cb_arg)
 {
   if (!tp || !cb)
@@ -2097,8 +2148,17 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
       if (!conn->auth)
         {
           uint32_t slot_idx = conn->slot_idx;
-          if (!tp_conn_auth (tp, epfd, conn, rt, cfg, conn->rx_buf,
-                             conn->rx_len))
+          TpAuthRes ar
+              = tp_conn_auth (tp, epfd, conn, rt, cfg, conn->rx_buf,
+                              conn->rx_len);
+          if (ar == TP_AUTH_FAIL)
+            {
+              if (tp_conn_slot_live (tp, slot_idx, conn))
+                tp_conn_close (tp, epfd, conn);
+              tp_unlock (tp);
+              return;
+            }
+          if (ar == TP_AUTH_PENDING)
             {
               if (!tp_conn_slot_live (tp, slot_idx, conn))
                 {
@@ -2111,6 +2171,11 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, const Rt *rt,
               events = EPOLLIN;
               continue;
             }
+          conn->rx_len = 0;
+          conn->rx_have = 0;
+          tp_unlock (tp);
+          events = EPOLLIN;
+          continue;
         }
       if (conn->fd >= 0 && conn->auth)
         {

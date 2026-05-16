@@ -2232,6 +2232,10 @@ rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
         continue;
       if (re->ep_port != port)
         continue;
+      if (!re->prb_tx || re->prb_tx_ts == 0)
+        continue;
+      if (re->prb_ddl > 0 && sys_ts > re->prb_ddl)
+        continue;
       uint16_t old_mtu = re->mtu;
       re->mtu_ukb = pmtu;
       if (re->mtu_lkg > pmtu)
@@ -2340,13 +2344,13 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
         else
           inet_ntop (AF_INET6, ip, ip_str, sizeof (ip_str));
       }
+      if (re_is_recent (re, sys_ts))
+        {
+          re->tx_ts = sys_ts;
+          continue;
+        }
       if (re->r2d == 0)
         {
-          if (re_is_recent (re, sys_ts))
-            {
-              re->tx_ts = sys_ts;
-              continue;
-            }
           if (re->is_act && re->state == RT_ACT && re->rx_ts > 0
               && sys_ts >= re->rx_ts && (sys_ts - re->rx_ts) <= KA_TMO)
             {

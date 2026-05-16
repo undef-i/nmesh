@@ -3753,9 +3753,16 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                      &prb_tok)
             != 0)
           break;
-        bool is_tcp_auth = tp_src && tp_src->is_tcp && prb_tok == 0;
-        if (tp_src && tp_src->is_tcp && !is_tcp_auth)
-          break;
+        if (tp_src && tp_src->is_tcp && prb_tok != 0)
+          {
+            static uint8_t pong_buf[UDP_PL_MAX];
+            size_t pong_len = 0;
+            pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts, prb_tok,
+                      pong_buf, &pong_len);
+            (void)ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL,
+                              src_port, pong_buf, pong_len);
+            break;
+          }
         (void)peer_port;
         if (hdr->rel_f == 0
             && !p2p_direct_peer_ok (cfg, rt, tp_src,
@@ -3790,8 +3797,7 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                      &peer_rx_ts, &prb_tok)
             != 0)
           break;
-        bool is_tcp_auth = tp_src && tp_src->is_tcp && prb_tok == 0;
-        if (tp_src && tp_src->is_tcp && !is_tcp_auth)
+        if (tp_src && tp_src->is_tcp && prb_tok != 0)
           break;
         (void)peer_port;
         if (hdr->rel_f == 0
@@ -3802,16 +3808,12 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           rx_rp_rst_lla (rt, peer_lla);
         if (hdr->rel_f == 0 && has_src)
           rt_ep_upd (rt, peer_lla, src_ip, src_port, src_tp_mask, ts);
-        if (!is_tcp_auth)
-          {
-            uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
-            if (rtt == 0)
-              rtt = 1;
-            (void)peer_rx_ts;
-            if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, ts)
-                && has_src)
-              rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
-          }
+        uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
+        if (rtt == 0)
+          rtt = 1;
+        (void)peer_rx_ts;
+        if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, ts) && has_src)
+          rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
         if (cfg->p2p == P2P_EN && hdr->rel_f == 0 && has_src
             && !p_is_me (rt, cfg->addr, src_ip, src_port))
           pp_add (pool, src_ip, src_port);
@@ -3975,6 +3977,8 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           PktHdr *hdr = &dec_arr[i].hdr;
           uint8_t *pt = dec_arr[i].pt;
           size_t pt_len = dec_arr[i].pt_len;
+          if (dec_arr[i].dec_res != 0)
+            continue;
           if (!has_last_src || src_port != last_src_port
               || memcmp (src_ip, last_src_ip, 16) != 0)
             {
@@ -3984,8 +3988,6 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
               has_last_src = true;
             }
 
-          if (dec_arr[i].dec_res != 0)
-            continue;
           on_rx_dec_pkt (&ctx, NULL, src_ip, src_port, pkt_len, hdr, pt,
                          pt_len, ts);
         }

@@ -63,6 +63,7 @@ typedef struct
   bool inbound;
   bool auth;
   bool hello_tx;
+  uint64_t auth_tok;
   uint64_t ts;
   uint8_t peer_lla[16];
   uint8_t sock_ip[16];
@@ -133,6 +134,5 @@ bool tp_tx_pending (void);
 bool tp_w_want (void);
 void tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg);
 void tp_rt_accept_ready (TpRt *tp, int epfd);
-void tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events,
-                       const Rt *rt, const Cfg *cfg, TpFrameFn cb,
-                       void *cb_arg);
+void tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
+                       const Cfg *cfg, TpFrameFn cb, void *cb_arg);
