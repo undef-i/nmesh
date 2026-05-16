@@ -35,7 +35,7 @@ typedef struct
 } GroEnt;
 
 static GroEnt g_gro[GRO_SLOTS];
-static bool g_udp_gso_bad = false;
+static bool g_udp_gso_off = false;
 
 static inline uint16_t
 u16_be_rd (const uint8_t *p)
@@ -174,7 +174,7 @@ gro_ent_fls (int tap_fd, GroEnt *gro)
   if (!gro->act)
     return;
   if (gro->proto == GRO_PROTO_UDP
-      && (!tap_udp_gso_ok () || g_udp_gso_bad))
+      && (!tap_udp_gso_ok () || g_udp_gso_off))
     {
       static uint8_t seg_buf[GRO_MAX_SZ + 256];
       static const uint8_t z_vnet[VNET_HL] = { 0 };
@@ -264,7 +264,7 @@ gro_ent_fls (int tap_fd, GroEnt *gro)
                    "gro: udp gso write failed errno=%d; "
                    "disabling udp gso to tap\n",
                    errno);
-          g_udp_gso_bad = true;
+          g_udp_gso_off = true;
           gro_ent_fls (tap_fd, gro);
           return;
         }
@@ -362,7 +362,7 @@ static bool
 gro_udp_try (int tap_fd, const uint8_t *frm, size_t len, size_t mac_hl,
              bool is_v6)
 {
-  if (!tap_udp_gso_ok () || g_udp_gso_bad)
+  if (!tap_udp_gso_ok () || g_udp_gso_off)
     return false;
   size_t ip_hl = is_v6 ? 40U : (size_t)((frm[mac_hl] & 0x0fU) * 4U);
   if (ip_hl < (is_v6 ? 40U : 20U) || len < mac_hl + ip_hl + 8U)

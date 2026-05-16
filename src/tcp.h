@@ -3,6 +3,7 @@
 #include "crypto.h"
 #include "route.h"
 #include "udp.h"
+#include <sodium.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -15,7 +16,12 @@
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
 #define TP_FLOW_IDLE_TMO (RT_PRB_INTV * 2ULL)
-#define TP_TXQ_FRAME_BYTES ((uint32_t)(sizeof (uint32_t) + TP_PL_MAX))
+#define TP_WIRE_SALT_SZ (CRY_NONCE_WIRE_SZ + sizeof (uint64_t))
+#define TP_WIRE_KEY_SZ crypto_aead_aegis128l_KEYBYTES
+#define TP_WIRE_NONCE_SZ crypto_aead_aegis128l_NPUBBYTES
+#define TP_WIRE_MAC_SZ crypto_aead_aegis128l_ABYTES
+#define TP_TXQ_FRAME_BYTES                                                    \
+  ((uint32_t)(sizeof (uint32_t) + TP_PL_MAX + TP_WIRE_MAC_SZ))
 #define TP_TXQ_STOP_MULT 4U
 #define TP_CONN_TMO                                                           \
   (RTO_INIT * ((1ULL << (TP_CONN_SYN_RETRIES + 1U)) - 1ULL))
@@ -72,7 +78,18 @@ typedef struct
   uint16_t route_port;
   uint32_t lane_hash;
   uint8_t hdr_buf[sizeof (uint32_t)];
+  uint8_t wire_salt[TP_WIRE_SALT_SZ];
+  uint8_t wire_rx_key[TP_WIRE_KEY_SZ];
+  uint8_t wire_tx_key[TP_WIRE_KEY_SZ];
+  uint64_t wire_rx_seq;
+  uint64_t wire_tx_seq;
+  bool wire_ready;
+  bool drain;
+  uint8_t *rx_in;
   uint8_t *rx_buf;
+  uint32_t rx_in_cap;
+  uint32_t rx_in_off;
+  uint32_t rx_in_len;
   uint32_t rx_cap;
   uint32_t hdr_have;
   uint32_t rx_len;
@@ -105,7 +122,7 @@ typedef struct
   uint32_t tx_bp_cnt;
 } TpRt;
 
-typedef void (*TpFrameFn) (const uint8_t *frame, size_t len, const TpSrc *src,
+typedef bool (*TpFrameFn) (const uint8_t *frame, size_t len, const TpSrc *src,
                            void *arg);
 
 int tp_rt_init (TpRt *tp, uint16_t port);
