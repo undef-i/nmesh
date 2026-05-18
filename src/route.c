@@ -69,6 +69,16 @@ rt_mtu_ub (const Rt *t)
 }
 
 static uint16_t
+rt_ptb_path_mtu_min (const uint8_t ip[16])
+{
+  uint32_t oip_oh = is_ip_v4m (ip) ? 20U : 40U;
+  uint32_t proto_min = is_ip_v4m (ip) ? 68U : 1280U;
+  uint32_t tunnel_min = oip_oh + 8U + (uint32_t)PKT_HDR_SZ + RT_MTU_MIN;
+  uint32_t min = (proto_min > tunnel_min) ? proto_min : tunnel_min;
+  return (min > UINT16_MAX) ? UINT16_MAX : (uint16_t)min;
+}
+
+static uint16_t
 re_mtu_ub (const Rt *t, const Re *re)
 {
   uint16_t upper = rt_mtu_ub (t);
@@ -2238,13 +2248,11 @@ void
 rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
                 uint64_t sys_ts)
 {
-  if (!t || !ip || pmtu == 0)
+  if (!t || !ip || pmtu < rt_ptb_path_mtu_min (ip))
     return;
   if (!t->mtu_probe)
     return;
   uint16_t ub = rt_mtu_ub (t);
-  if (pmtu < RT_MTU_MIN)
-    pmtu = RT_MTU_MIN;
   if (pmtu > ub)
     pmtu = ub;
   for (uint32_t i = 0; i < t->cnt; i++)
@@ -2716,8 +2724,9 @@ rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
 }
 
 void
-rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
-            uint64_t ver, bool no_dir, uint64_t sys_ts)
+rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
+                 uint32_t metric, uint64_t ver, bool no_dir,
+                 bool can_clear_no_dir, uint64_t sys_ts)
 {
   SrcEnt *se = src_fnd (t, rt_id);
   if (!se)
@@ -2749,10 +2758,17 @@ rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
     }
   if (ver > 0)
     se->last_ver = ver;
-  se->no_dir = no_dir;
+  se->no_dir = no_dir || (old_no_dir && !can_clear_no_dir);
   se->gc_ts = sys_ts;
   if (se->no_dir != old_no_dir)
     rt_map_mark (t);
+}
+
+void
+rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
+            uint64_t ver, bool no_dir, uint64_t sys_ts)
+{
+  rt_src_upd_auth (t, rt_id, seq, metric, ver, no_dir, false, sys_ts);
 }
 
 void
@@ -2839,7 +2855,6 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
       se->fwd_seq = 0;
       se->fwd_m = RT_M_INF;
       se->last_ver = 0;
-      se->no_dir = false;
       se->gc_ts = sys_ts;
     }
   rt_map_mark (t);
