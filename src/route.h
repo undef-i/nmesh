@@ -292,6 +292,9 @@ bool rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
              uint64_t n_ver, bool *req_seq);
 void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
                  uint64_t ver, bool no_dir, uint64_t sys_ts);
+void rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
+                      uint32_t metric, uint64_t ver, bool no_dir,
+                      bool can_clear_no_dir, uint64_t sys_ts);
 bool rt_src_no_dir (const Rt *t, const uint8_t rt_id[16]);
 bool rt_src_no_dir_known (const Rt *t, const uint8_t rt_id[16],
                           bool *out_no_dir);
