@@ -513,7 +513,7 @@ cfg_load (const char *path, Cfg *cfg)
       else if (strcmp (k, "mtu") == 0)
         {
           unsigned long m_v = strtoul (v, NULL, 10);
-          if (m_v < 128UL || m_v > 65535UL)
+          if (m_v < CFG_MTU_MIN || m_v > CFG_MTU_MAX)
             {
               cfg_free (cfg);
               free (line);

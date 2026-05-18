@@ -6,6 +6,10 @@
 #define PEER_CAP_INIT 64
 #define TP_PREF_CAP_INIT 4U
 #define BOGON_RULE_CAP_INIT 16U
+#define CFG_MTU_MIN 128U
+/* Current FRAG offset is 15-bit. Keep link MTU within a single offset space:
+   32767 - virtio-net header(10) - Ethernet header(14). */
+#define CFG_MTU_MAX 32743U
 
 typedef enum
 {
