@@ -6,6 +6,8 @@
 #define PEER_CAP_INIT 64
 #define TP_PREF_CAP_INIT 4U
 #define BOGON_RULE_CAP_INIT 16U
+#define CFG_MTU_MIN 128U
+#define CFG_MTU_MAX 32743U
 
 typedef enum
 {
