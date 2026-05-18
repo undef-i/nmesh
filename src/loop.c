@@ -557,16 +557,11 @@ udp_dec_run (Cry *cry_ctx, UdpRxPkt pkt_arr[], UdpDecRes res_arr[],
     {
       uint8_t *raw = pkt_arr[i].data;
       size_t raw_len = pkt_arr[i].data_len;
-      bool bypass_replay = is_ip_loopback (pkt_arr[i].src_ip)
-                           && raw_len >= PKT_HDR_SZ
-                           && (raw[0] & PKT_TF_TYPE_MASK) == PT_STAT_REQ;
-      if (!bypass_replay)
+      bool is_loopback = is_ip_loopback (pkt_arr[i].src_ip);
+      if (raw_len < PKT_HDR_SZ || (!is_loopback && !rx_rp_chk (raw)))
         {
-          if (raw_len < PKT_HDR_SZ || !rx_rp_chk (raw + PKT_CH_SZ))
-            {
-              res_arr[i].dec_res = -1;
-              continue;
-            }
+          res_arr[i].dec_res = -1;
+          continue;
         }
       res_arr[i].dec_res = pkt_dec (cry_ctx, pkt_arr[i].data,
                                     pkt_arr[i].data_len, NULL, 0,
@@ -574,7 +569,9 @@ udp_dec_run (Cry *cry_ctx, UdpRxPkt pkt_arr[], UdpDecRes res_arr[],
                                     &res_arr[i].pt_len);
       if (res_arr[i].dec_res != 0)
         continue;
-      if (!bypass_replay && !rx_rp_cmt (raw + PKT_CH_SZ))
+      bool bypass_replay
+          = is_loopback && res_arr[i].hdr.pkt_type == PT_STAT_REQ;
+      if (!bypass_replay && !rx_rp_cmt (raw))
         {
           res_arr[i].dec_res = -1;
           continue;
@@ -3915,15 +3912,11 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   uint16_t src_port = 0;
   bool has_src = rx_src_ep_get (src, NULL, 0, src_ip, &src_port);
 
-  bool bypass_replay = is_ip_loopback (src_ip) && len >= PKT_HDR_SZ
-                       && (frame[0] & PKT_TF_TYPE_MASK) == PT_STAT_REQ;
-  if (!bypass_replay)
-    {
-      if (len < PKT_HDR_SZ || !rx_rp_chk (frame + PKT_CH_SZ))
-        return false;
-    }
+  bool is_loopback = is_ip_loopback (src_ip);
+  if (len < PKT_HDR_SZ || (!is_loopback && !rx_rp_chk (frame)))
+    return false;
 
-  static _Thread_local uint8_t pt_buf[TP_VNET_MAX];
+  static _Thread_local uint8_t pt_buf[TP_VNET_MAX + PKT_CH_SZ];
   PktHdr hdr;
   uint8_t *pt = NULL;
   size_t pt_len = 0;
@@ -3931,7 +3924,8 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
                &hdr, &pt, &pt_len)
       != 0)
     return false;
-  if (!bypass_replay && !rx_rp_cmt (frame + PKT_CH_SZ))
+  bool bypass_replay = is_loopback && hdr.pkt_type == PT_STAT_REQ;
+  if (!bypass_replay && !rx_rp_cmt (frame))
     return false;
   if (has_src)
     {

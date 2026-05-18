@@ -351,11 +351,12 @@ tp_pkt_enc (Cry *s, uint8_t pkt_type, const uint8_t *payload, size_t pl_len,
   uint8_t nonce[PKT_NONCE_SZ], mac[PKT_MAC_SZ];
   hdr[0] = (uint8_t)(pkt_type & PKT_TF_TYPE_MASK);
   hdr[1] = 32;
-  memcpy (buf, hdr, PKT_CH_SZ);
-  uint8_t *ct = buf + PKT_HDR_SZ;
-  cry_enc (s, payload, pl_len, hdr, PKT_CH_SZ, nonce, mac, ct);
-  memcpy (buf + PKT_CH_SZ, nonce, PKT_NONCE_SZ);
-  memcpy (buf + PKT_CH_SZ + PKT_NONCE_SZ, mac, PKT_MAC_SZ);
+  uint8_t *ct = buf + PKT_NONCE_SZ + PKT_MAC_SZ;
+  memcpy (ct, hdr, PKT_CH_SZ);
+  memcpy (ct + PKT_CH_SZ, payload, pl_len);
+  cry_enc (s, ct, pl_len + PKT_CH_SZ, NULL, 0, nonce, mac, ct);
+  memcpy (buf, nonce, PKT_NONCE_SZ);
+  memcpy (buf + PKT_NONCE_SZ, mac, PKT_MAC_SZ);
   *out_len = PKT_HDR_SZ + pl_len;
   return buf;
 }
