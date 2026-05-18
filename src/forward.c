@@ -88,6 +88,26 @@ rt_nh_get (Rt *rt, const Cfg *cfg, const uint8_t dest_lla[16], RtDec *out_dec,
   return false;
 }
 
+static bool
+rt_nh_lla_get (const Rt *rt, const RtDec *dec, const uint8_t dest_lla[16],
+               const uint8_t tx_ip[16], uint16_t tx_port,
+               uint8_t out_lla[16])
+{
+  if (!rt || !dec || !dest_lla || !tx_ip || !out_lla || tx_port == 0)
+    return false;
+  if (dec->type == RT_DIR)
+    {
+      memcpy (out_lla, dest_lla, 16);
+      return true;
+    }
+  if (dec->type == RT_REL)
+    {
+      memcpy (out_lla, dec->rel.relay_lla, 16);
+      return IS_LLA_VAL (out_lla);
+    }
+  return rt_ep_peer_lla (rt, tx_ip, tx_port, out_lla);
+}
+
 static void
 frame_l3_info_get (const uint8_t *frame_pkt, size_t frame_len, size_t *l3_off,
                    uint16_t *eth_type)
@@ -128,6 +148,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
+  uint8_t tx_lla[16] = { 0 };
+  bool has_tx_lla = rt_nh_lla_get (rt, &dec, dest_lla, tx_ip, tx_port, tx_lla);
   if (src_ip && memcmp (tx_ip, src_ip, 16) == 0 && tx_port == src_port)
     {
       return false;
@@ -170,7 +192,10 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       size_t out_len = 0;
       uint8_t *out_ptr
-          = data_bld_zc (cry_ctx, relay_vnet, vnet_len, 1, hop_c, &out_len);
+          = data_bld_zc (cry_ctx, relay_vnet, vnet_len, 1, hop_c,
+                         has_tx_lla ? tx_lla : NULL, &out_len);
+      if (!out_ptr || out_len == 0)
+        return false;
       if (tp_send (udp, rt, cfg, tx_ip, tx_port, out_ptr, out_len))
         {
           rt_tx_ack (rt, tx_ip, tx_port, ts);
@@ -200,7 +225,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           bool mf = (off + chunk_len) < vnet_len;
           uint8_t *out_ptr
               = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, (uint16_t)off,
-                             mf, 1, dst_tail, hop_c, &out_len);
+                             mf, 1, dst_tail, hop_c,
+                             has_tx_lla ? tx_lla : NULL, &out_len);
           if (!out_ptr || out_len == 0)
             {
               off += chunk_len;
@@ -219,7 +245,8 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
-      hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
+      hp_bld (cry_ctx, cfg->addr, dest_lla, dec.rel.relay_lla, hp_buf,
+              &hp_len);
       (void)tp_send_ctrl (udp, rt, cfg, dec.rel.relay_ip, dec.rel.relay_port,
                           hp_buf, hp_len);
     }
@@ -244,6 +271,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       return false;
     }
+  uint8_t tx_lla[16] = { 0 };
+  bool has_tx_lla = rt_nh_lla_get (rt, &dec, dest_lla, tx_ip, tx_port, tx_lla);
   if (s_ip && memcmp (tx_ip, s_ip, 16) == 0 && tx_port == s_port)
     {
       return false;
@@ -284,7 +313,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       bool mf_out = mf_in || !is_last_sub;
       uint8_t *out_ptr = frag_bld_zc (cry_ctx, chunk_dst_base, sub_len, mid,
                                       (uint16_t)abs_off, mf_out, 1, dst_tail,
-                                      hop_c, &out_len);
+                                      hop_c, has_tx_lla ? tx_lla : NULL,
+                                      &out_len);
       if (!out_ptr || out_len == 0)
         {
           sub_off += sub_len;
@@ -303,7 +333,8 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     {
       static uint8_t hp_buf[UDP_PL_MAX];
       size_t hp_len = 0;
-      hp_bld (cry_ctx, cfg->addr, dest_lla, hp_buf, &hp_len);
+      hp_bld (cry_ctx, cfg->addr, dest_lla, dec.rel.relay_lla, hp_buf,
+              &hp_len);
       (void)tp_send_ctrl (udp, rt, cfg, dec.rel.relay_ip, dec.rel.relay_port,
                           hp_buf, hp_len);
     }

@@ -31,6 +31,9 @@ static _Thread_local uint32_t g_tp_batch_depth = 0;
 static void tp_conn_close (TpRt *tp, int epfd, TpConn *conn);
 static bool tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn,
                               const uint8_t *data, size_t len, bool hi);
+static bool tp_conn_tx_frame_ex (TpRt *tp, int epfd, TpConn *conn,
+                                 const uint8_t *data, size_t len, bool hi,
+                                 bool preauth_ok);
 static bool tp_conn_rsv (TpRt *tp, uint32_t need);
 static bool tp_fd_idx_rsv (TpRt *tp, uint32_t need);
 static bool tp_hot_idx_rsv (TpRt *tp, uint32_t need);
@@ -39,6 +42,8 @@ static void tp_flow_idx_forget_conn (TpRt *tp, uint32_t conn_idx);
 static void tp_flow_idx_prune (TpRt *tp, uint64_t now);
 static bool tp_conn_rx_in_rsv (TpConn *conn, uint32_t need);
 static bool tp_conn_rx_rsv (TpConn *conn, uint32_t need);
+static bool tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len,
+                             bool hi);
 static uint32_t tp_conn_rx_frame_max (const TpConn *conn);
 static void tp_send_cache_note (TpRt *tp, const TpConn *conn);
 static void tp_tx_ring_free (TpTxRing *ring);
@@ -58,12 +63,18 @@ static bool tp_owner_thread (void);
 static bool tp_send_hello (TpConn *conn);
 
 #define TP_TXQ_BATCH_FRAMES 16U
+#define TP_PING_KX_PL_SZ (PING_PL_SZ + TP_KX_PUB_SZ + CRY_KX_PUB_SZ)
+#define TP_PONG_KX_PL_SZ (PONG_PL_SZ + TP_KX_PUB_SZ + CRY_KX_PUB_SZ)
 
 _Static_assert (TP_WIRE_SALT_SZ == sizeof (((TpConn *)0)->wire_salt),
                 "tcp wire salt size");
 _Static_assert (TP_WIRE_KEY_SZ == sizeof (((TpConn *)0)->wire_rx_key),
                 "tcp wire key size");
 _Static_assert (TP_WIRE_MAC_SZ == CRY_MAC_SZ, "tcp wire mac size");
+_Static_assert (TP_KX_PUB_SZ == sizeof (((TpConn *)0)->wire_kx_pk),
+                "tcp kx pub size");
+_Static_assert (TP_KX_SEC_SZ == sizeof (((TpConn *)0)->wire_kx_sk),
+                "tcp kx sec size");
 
 typedef enum
 {
@@ -219,6 +230,19 @@ tp_salt_rp_commit (const uint8_t salt[TP_WIRE_SALT_SZ], uint64_t now)
   return true;
 }
 
+static bool
+tp_kx_ensure (TpConn *conn)
+{
+  if (!conn)
+    return false;
+  if (conn->wire_kx_ready)
+    return true;
+  randombytes_buf (conn->wire_kx_sk, TP_KX_SEC_SZ);
+  crypto_scalarmult_base (conn->wire_kx_pk, conn->wire_kx_sk);
+  conn->wire_kx_ready = true;
+  return true;
+}
+
 static void
 tp_wire_derive (TpConn *conn)
 {
@@ -253,6 +277,69 @@ tp_wire_derive (TpConn *conn)
   sodium_memzero (seed, sizeof (seed));
   sodium_memzero (c2s, sizeof (c2s));
   sodium_memzero (s2c, sizeof (s2c));
+}
+
+static bool
+tp_wire_rekey_fs (TpConn *conn)
+{
+  if (!conn || !g_tp_cry || !conn->wire_ready || conn->wire_fs_ready
+      || !conn->wire_kx_ready || !conn->wire_peer_kx_ready)
+    return false;
+
+  uint8_t shared[crypto_scalarmult_BYTES];
+  if (crypto_scalarmult (shared, conn->wire_kx_sk, conn->wire_peer_pk) != 0)
+    return false;
+
+  uint8_t init_pk[TP_KX_PUB_SZ];
+  uint8_t resp_pk[TP_KX_PUB_SZ];
+  if (conn->inbound)
+    {
+      memcpy (init_pk, conn->wire_peer_pk, sizeof (init_pk));
+      memcpy (resp_pk, conn->wire_kx_pk, sizeof (resp_pk));
+    }
+  else
+    {
+      memcpy (init_pk, conn->wire_kx_pk, sizeof (init_pk));
+      memcpy (resp_pk, conn->wire_peer_pk, sizeof (resp_pk));
+    }
+
+  uint8_t seed[1U + TP_WIRE_SALT_SZ + crypto_scalarmult_BYTES
+               + 2U * TP_KX_PUB_SZ];
+  uint8_t c2s[TP_WIRE_KEY_SZ];
+  uint8_t s2c[TP_WIRE_KEY_SZ];
+  seed[0] = 2;
+  memcpy (seed + 1U, conn->wire_salt, TP_WIRE_SALT_SZ);
+  memcpy (seed + 1U + TP_WIRE_SALT_SZ, shared, sizeof (shared));
+  memcpy (seed + 1U + TP_WIRE_SALT_SZ + sizeof (shared), init_pk,
+          sizeof (init_pk));
+  memcpy (seed + 1U + TP_WIRE_SALT_SZ + sizeof (shared) + sizeof (init_pk),
+          resp_pk, sizeof (resp_pk));
+  crypto_generichash (c2s, sizeof (c2s), seed, sizeof (seed), g_tp_cry->key,
+                      sizeof (g_tp_cry->key));
+
+  seed[0] = 3;
+  crypto_generichash (s2c, sizeof (s2c), seed, sizeof (seed), g_tp_cry->key,
+                      sizeof (g_tp_cry->key));
+
+  if (conn->inbound)
+    {
+      memcpy (conn->wire_rx_key, c2s, TP_WIRE_KEY_SZ);
+      memcpy (conn->wire_tx_key, s2c, TP_WIRE_KEY_SZ);
+    }
+  else
+    {
+      memcpy (conn->wire_tx_key, c2s, TP_WIRE_KEY_SZ);
+      memcpy (conn->wire_rx_key, s2c, TP_WIRE_KEY_SZ);
+    }
+  conn->wire_rx_seq = 0;
+  conn->wire_tx_seq = 0;
+  conn->wire_fs_ready = true;
+  sodium_memzero (conn->wire_kx_sk, sizeof (conn->wire_kx_sk));
+  sodium_memzero (shared, sizeof (shared));
+  sodium_memzero (seed, sizeof (seed));
+  sodium_memzero (c2s, sizeof (c2s));
+  sodium_memzero (s2c, sizeof (s2c));
+  return true;
 }
 
 static uint32_t
@@ -363,7 +450,8 @@ tp_pkt_enc (Cry *s, uint8_t pkt_type, const uint8_t *payload, size_t pl_len,
 
 static uint8_t *
 tp_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
-             uint64_t ts, uint64_t sid, uint64_t prb_tok, uint8_t *buf,
+             uint64_t ts, uint64_t sid, uint64_t prb_tok,
+             const uint8_t kx_pk[TP_KX_PUB_SZ], uint8_t *buf,
              size_t *out_len)
 {
   uint8_t payload[PKT_PT_MAX];
@@ -372,16 +460,21 @@ tp_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
   memcpy (payload + 16, our_lla, 16);
   tp_u16_wr (payload + 32, our_port);
   tp_u64_wr (payload + 34, prb_tok);
-  size_t pad_len = tp_auth_pad_len (PING_PL_SZ);
+  memcpy (payload + PING_PL_SZ, kx_pk, TP_KX_PUB_SZ);
+  memcpy (payload + PING_PL_SZ + TP_KX_PUB_SZ, cry_kx_pub (s),
+          CRY_KX_PUB_SZ);
+  size_t pad_len = tp_auth_pad_len (TP_PING_KX_PL_SZ);
   if (pad_len > 0)
-    randombytes_buf (payload + PING_PL_SZ, pad_len);
-  return tp_pkt_enc (s, PT_PING, payload, PING_PL_SZ + pad_len, buf, out_len);
+    randombytes_buf (payload + TP_PING_KX_PL_SZ, pad_len);
+  return tp_pkt_enc (s, PT_PING, payload, TP_PING_KX_PL_SZ + pad_len, buf,
+                     out_len);
 }
 
 static uint8_t *
 tp_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
              uint64_t o_ts, uint64_t sid, uint64_t rx_ts, uint64_t prb_tok,
-             uint8_t *buf, size_t *out_len)
+             const uint8_t kx_pk[TP_KX_PUB_SZ], uint8_t *buf,
+             size_t *out_len)
 {
   uint8_t payload[PKT_PT_MAX];
   tp_u64_wr (payload, o_ts);
@@ -390,10 +483,14 @@ tp_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
   tp_u16_wr (payload + 32, our_port);
   tp_u64_wr (payload + 34, rx_ts);
   tp_u64_wr (payload + 42, prb_tok);
-  size_t pad_len = tp_auth_pad_len (PONG_PL_SZ);
+  memcpy (payload + PONG_PL_SZ, kx_pk, TP_KX_PUB_SZ);
+  memcpy (payload + PONG_PL_SZ + TP_KX_PUB_SZ, cry_kx_pub (s),
+          CRY_KX_PUB_SZ);
+  size_t pad_len = tp_auth_pad_len (TP_PONG_KX_PL_SZ);
   if (pad_len > 0)
-    randombytes_buf (payload + PONG_PL_SZ, pad_len);
-  return tp_pkt_enc (s, PT_PONG, payload, PONG_PL_SZ + pad_len, buf, out_len);
+    randombytes_buf (payload + TP_PONG_KX_PL_SZ, pad_len);
+  return tp_pkt_enc (s, PT_PONG, payload, TP_PONG_KX_PL_SZ + pad_len, buf,
+                     out_len);
 }
 
 static ssize_t
@@ -858,6 +955,84 @@ tp_tx_ring_write (TpTxRing *ring, const uint8_t *buf, uint32_t len)
 }
 
 static void
+tp_pend_free (TpPendQ *q)
+{
+  if (!q)
+    return;
+  free (q->buf);
+  memset (q, 0, sizeof (*q));
+}
+
+static bool
+tp_pend_rsv (TpPendQ *q, uint32_t need)
+{
+  if (!q)
+    return false;
+  if (need <= q->cap)
+    return true;
+  uint32_t new_cap = q->cap ? q->cap : TP_TXQ_FRAME_BYTES;
+  while (new_cap < need)
+    {
+      if (new_cap > UINT32_MAX / 2U)
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  uint8_t *new_buf = realloc (q->buf, new_cap);
+  if (!new_buf)
+    return false;
+  q->buf = new_buf;
+  q->cap = new_cap;
+  return true;
+}
+
+static bool
+tp_pend_write (TpPendQ *q, const uint8_t *data, size_t len, bool hi)
+{
+  if (!q || !data || len == 0 || len > TP_PL_MAX)
+    return false;
+  uint32_t rec_len = 1U + sizeof (uint32_t) + (uint32_t)len;
+  if (rec_len > UINT32_MAX - q->len)
+    return false;
+  uint32_t need = q->len + rec_len;
+  if (need > TP_TXQ_FRAME_BYTES * TP_TXQ_STOP_MULT)
+    return false;
+  if (!tp_pend_rsv (q, need))
+    return false;
+  uint8_t *dst = q->buf + q->len;
+  dst[0] = hi ? 1U : 0U;
+  tp_u32_wr (dst + 1U, (uint32_t)len);
+  memcpy (dst + 1U + sizeof (uint32_t), data, len);
+  q->len = need;
+  return true;
+}
+
+static bool
+tp_pend_flush (TpConn *conn)
+{
+  if (!conn)
+    return false;
+  uint32_t off = 0;
+  while (off < conn->tx_pend.len)
+    {
+      if (conn->tx_pend.len - off < 1U + sizeof (uint32_t))
+        return false;
+      bool hi = conn->tx_pend.buf[off] != 0;
+      uint32_t len = tp_u32_rd (conn->tx_pend.buf + off + 1U);
+      off += 1U + sizeof (uint32_t);
+      if (len == 0 || len > TP_PL_MAX || len > conn->tx_pend.len - off)
+        return false;
+      if (!tp_conn_enqueue (conn, conn->tx_pend.buf + off, len, hi))
+        return false;
+      off += len;
+    }
+  tp_pend_free (&conn->tx_pend);
+  return true;
+}
+
+static void
 tp_tx_ring_drop (TpTxRing *ring, uint32_t len)
 {
   if (!ring || len == 0 || len > ring->len || ring->cap == 0)
@@ -1159,6 +1334,7 @@ tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
     }
   tp_tx_ring_free (&conn->tx_hi);
   tp_tx_ring_free (&conn->tx_lo);
+  tp_pend_free (&conn->tx_pend);
   free (conn->rx_in);
   free (conn->rx_buf);
   free (conn);
@@ -1175,6 +1351,7 @@ tp_conn_drain_start (TpRt *tp, int epfd, TpConn *conn)
       conn->tx_q_bytes = 0;
       tp_tx_ring_free (&conn->tx_hi);
       tp_tx_ring_free (&conn->tx_lo);
+      tp_pend_free (&conn->tx_pend);
       tp_conn_txq_sync (tp, conn);
     }
   conn->rx_in_off = conn->rx_in_len;
@@ -1480,7 +1657,7 @@ tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len, bool hi)
   size_t frame_len = sizeof (uint32_t) + len;
   uint32_t rem = (uint32_t)frame_len;
   uint32_t salt_len
-      = (!conn->inbound && conn->wire_tx_seq == 0) ? TP_WIRE_SALT_SZ : 0U;
+      = (!conn->inbound && !conn->wire_salt_tx) ? TP_WIRE_SALT_SZ : 0U;
   TpTxRing *ring = hi ? &conn->tx_hi : &conn->tx_lo;
   if (salt_len > UINT32_MAX - rem
       || rem + salt_len > UINT32_MAX - conn->tx_q_bytes)
@@ -1506,7 +1683,10 @@ tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len, bool hi)
   if (!tp_tx_ring_write (ring, g_tp_wire_tx_buf, (uint32_t)wire_len))
     return false;
   if (salt_len > 0)
-    conn->tx_q_bytes += salt_len;
+    {
+      conn->wire_salt_tx = true;
+      conn->tx_q_bytes += salt_len;
+    }
   conn->tx_q_bytes += rem;
   return true;
 }
@@ -1565,12 +1745,23 @@ static bool
 tp_conn_tx_frame (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
                   size_t len, bool hi)
 {
+  return tp_conn_tx_frame_ex (tp, epfd, conn, data, len, hi, false);
+}
+
+static bool
+tp_conn_tx_frame_ex (TpRt *tp, int epfd, TpConn *conn, const uint8_t *data,
+                     size_t len, bool hi, bool preauth_ok)
+{
   if (!tp || !conn || conn->fd < 0 || !data || len == 0 || len > TP_PL_MAX)
     return false;
-  if (!hi && !conn->auth && !conn->hello_tx && !conn->inbound)
+  if (!conn->auth && !preauth_ok)
     {
-      if (!tp_send_hello (conn))
+      if (!conn->hello_tx && !conn->inbound && !tp_send_hello (conn))
         return false;
+      if (!tp_pend_write (&conn->tx_pend, data, len, hi))
+        return false;
+      tp_ev_upd (epfd, conn);
+      return true;
     }
   if (conn->st != TP_ST_ESTABLISHED)
     {
@@ -1615,11 +1806,14 @@ tp_send_hello (TpConn *conn)
   if (conn->auth)
     ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid,
               conn->auth_tok, ping_buf, &ping_len);
-  else
+  else if (tp_kx_ensure (conn))
     tp_ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid,
-                 conn->auth_tok, ping_buf, &ping_len);
+                 conn->auth_tok, conn->wire_kx_pk, ping_buf, &ping_len);
+  else
+    return false;
   bool ok
-    = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, ping_buf, ping_len, true);
+    = tp_conn_tx_frame_ex (g_tp_rt, g_tp_epfd, conn, ping_buf, ping_len, true,
+                           true);
   if (!ok)
     return false;
   conn->hello_tx = true;
@@ -1676,7 +1870,17 @@ tp_conn_auth_finish (TpRt *tp, int epfd, TpConn *conn, Rt *rt,
       tp_conn_close (tp, epfd, conn);
       return false;
     }
+  if (!tp_wire_rekey_fs (conn))
+    {
+      tp_conn_close (tp, epfd, conn);
+      return false;
+    }
   conn->auth = true;
+  if (!tp_pend_flush (conn))
+    {
+      tp_conn_close (tp, epfd, conn);
+      return false;
+    }
   tp_conn_route_sync (conn, rt);
   tp_conn_dedup_peer (tp, epfd, cfg->addr, peer_lla);
   if (!tp_conn_slot_live (tp, slot_idx, conn))
@@ -1714,15 +1918,19 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
       if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
                    &prb_tok)
           != 0
-          || prb_tok == 0)
+          || prb_tok == 0 || pt_len < TP_PING_KX_PL_SZ
+          || !tp_kx_ensure (conn))
         return TP_AUTH_FAIL;
+      memcpy (conn->wire_peer_pk, pt + PING_PL_SZ, TP_KX_PUB_SZ);
+      conn->wire_peer_kx_ready = true;
+      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
+                            pt + PING_PL_SZ + TP_KX_PUB_SZ);
       uint8_t pong_buf[UDP_PL_MAX];
       size_t pong_len = 0;
       tp_pong_bld (g_tp_cry, cfg->addr, cfg->port, req_ts, g_tp_sid,
-                   sys_ts (), prb_tok, pong_buf, &pong_len);
-      if (!tp_conn_tx_frame (tp, epfd, conn, pong_buf, pong_len, true))
-        return TP_AUTH_FAIL;
-      if (!tp_send_hello (conn))
+                   sys_ts (), prb_tok, conn->wire_kx_pk, pong_buf, &pong_len);
+      if (!tp_conn_tx_frame_ex (tp, epfd, conn, pong_buf, pong_len, true,
+                                true))
         return TP_AUTH_FAIL;
     }
   else if (hdr.pkt_type == PT_PONG)
@@ -1732,8 +1940,13 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
       if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
                    &peer_rx_ts, &prb_tok)
           != 0
-          || prb_tok == 0 || prb_tok != conn->auth_tok)
+          || prb_tok == 0 || prb_tok != conn->auth_tok
+          || pt_len < TP_PONG_KX_PL_SZ)
         return TP_AUTH_FAIL;
+      memcpy (conn->wire_peer_pk, pt + PONG_PL_SZ, TP_KX_PUB_SZ);
+      conn->wire_peer_kx_ready = true;
+      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
+                            pt + PONG_PL_SZ + TP_KX_PUB_SZ);
     }
   else
     {
@@ -1887,6 +2100,8 @@ tp_rt_free (TpRt *tp)
       tp->conn_arr[i] = NULL;
       tp_tx_ring_free (&conn->tx_hi);
       tp_tx_ring_free (&conn->tx_lo);
+      tp_pend_free (&conn->tx_pend);
+      free (conn->rx_in);
       free (conn->rx_buf);
       free (conn);
     }
