@@ -20,6 +20,8 @@
 #define TP_WIRE_KEY_SZ crypto_aead_aegis128l_KEYBYTES
 #define TP_WIRE_NONCE_SZ crypto_aead_aegis128l_NPUBBYTES
 #define TP_WIRE_MAC_SZ crypto_aead_aegis128l_ABYTES
+#define TP_KX_PUB_SZ crypto_scalarmult_BYTES
+#define TP_KX_SEC_SZ crypto_scalarmult_SCALARBYTES
 #define TP_TXQ_FRAME_BYTES                                                    \
   ((uint32_t)(sizeof (uint32_t) + TP_PL_MAX + TP_WIRE_MAC_SZ))
 #define TP_TXQ_STOP_MULT 4U
@@ -52,6 +54,13 @@ typedef struct
 
 typedef struct
 {
+  uint8_t *buf;
+  uint32_t cap;
+  uint32_t len;
+} TpPendQ;
+
+typedef struct
+{
   uint8_t route_ip[16];
   uint8_t peer_lla[16];
   uint16_t route_port;
@@ -81,9 +90,16 @@ typedef struct
   uint8_t wire_salt[TP_WIRE_SALT_SZ];
   uint8_t wire_rx_key[TP_WIRE_KEY_SZ];
   uint8_t wire_tx_key[TP_WIRE_KEY_SZ];
+  uint8_t wire_kx_pk[TP_KX_PUB_SZ];
+  uint8_t wire_kx_sk[TP_KX_SEC_SZ];
+  uint8_t wire_peer_pk[TP_KX_PUB_SZ];
   uint64_t wire_rx_seq;
   uint64_t wire_tx_seq;
   bool wire_ready;
+  bool wire_salt_tx;
+  bool wire_kx_ready;
+  bool wire_peer_kx_ready;
+  bool wire_fs_ready;
   bool drain;
   uint8_t *rx_in;
   uint8_t *rx_buf;
@@ -96,6 +112,7 @@ typedef struct
   uint32_t rx_have;
   TpTxRing tx_hi;
   TpTxRing tx_lo;
+  TpPendQ tx_pend;
   uint32_t tx_q_bytes;
   uint32_t sndbuf_bytes;
   bool tx_qd;

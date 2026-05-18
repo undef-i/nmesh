@@ -1168,6 +1168,7 @@ status_query_run (const Cfg *cfg)
   if (fd < 0)
     {
       perror ("status: socket failed");
+      cry_free (&cry_ctx);
       return 1;
     }
   struct timeval tv;
@@ -1183,6 +1184,7 @@ status_query_run (const Cfg *cfg)
     {
       perror ("status: bind failed");
       close (fd);
+      cry_free (&cry_ctx);
       return 1;
     }
   struct sockaddr_in6 dst;
@@ -1193,12 +1195,13 @@ status_query_run (const Cfg *cfg)
   uint32_t req_id = (uint32_t)(sys_ts () ^ (uint64_t)getpid ());
   uint8_t req_buf[UDP_PL_MAX];
   size_t req_len = 0;
-  stat_req_bld (&cry_ctx, req_id, req_buf, &req_len);
+  stat_req_bld (&cry_ctx, req_id, NULL, req_buf, &req_len);
   if (sendto (fd, req_buf, req_len, 0, (struct sockaddr *)&dst, sizeof (dst))
       < 0)
     {
       perror ("status: send failed");
       close (fd);
+      cry_free (&cry_ctx);
       return 1;
     }
   char *text = NULL;
@@ -1267,11 +1270,13 @@ status_query_run (const Cfg *cfg)
       free (seen);
       free (text);
       fprintf (stderr, "status: no response from 127.0.0.1:%u\n", cfg->port);
+      cry_free (&cry_ctx);
       return 1;
     }
   fwrite (text, 1, got_len, stdout);
   free (seen);
   free (text);
+  cry_free (&cry_ctx);
   return 0;
 }
 
