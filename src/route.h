@@ -12,7 +12,7 @@
 #define RT_MTU_MIN 128U
 #define RT_MTU_DEF 1280U
 #define RT_MTU_MAX 65535U
-#define RT_PRB_BST 3U
+#define RT_PRB_BST 5U
 #define RT_HL_INTV 10000ULL
 #define RT_GHS_HL 30ULL
 #define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
