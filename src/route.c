@@ -23,6 +23,7 @@
 #define RT_MTU_VFY 10000ULL
 #define RT_MTU_HLD 600000ULL
 #define RT_MTU_EPS 10U
+#define RT_METRIC_EPS 10U
 #define RT_METRIC_SLOT_INV 0ULL
 static bool
 seq_gt (uint32_t a, uint32_t b)
@@ -301,15 +302,16 @@ pth_m (const Pth *pth)
   return m;
 }
 
-static uint64_t
-pth_last_rx_ts (const Pth *pth)
+static bool
+pth_loss_pct_get (const Pth *pth, uint32_t *out_pct)
 {
-  if (!pth)
-    return 0;
-  uint64_t ts = pth->rx_ts;
-  if (pth->pong_ts > ts)
-    ts = pth->pong_ts;
-  return ts;
+  if (!pth || !out_pct || pth->prb_tx_cnt == 0
+      || pth->prb_rx_cnt > pth->prb_tx_cnt)
+    return false;
+  uint64_t lost = pth->prb_tx_cnt - pth->prb_rx_cnt;
+  *out_pct = (uint32_t)((lost * 100ULL + (pth->prb_tx_cnt / 2ULL))
+                        / pth->prb_tx_cnt);
+  return true;
 }
 
 static bool
@@ -323,12 +325,21 @@ pth_dir_btr (const Pth *cand, const Pth *best)
   uint32_t cand_m = pth_m (cand);
   uint32_t best_m = pth_m (best);
   if (cand_m != best_m)
-    return cand_m < best_m;
+    {
+      uint32_t diff = (cand_m > best_m) ? (cand_m - best_m)
+                                        : (best_m - cand_m);
+      if (diff > RT_METRIC_EPS)
+        return cand_m < best_m;
+    }
 
-  uint64_t cand_ts = pth_last_rx_ts (cand);
-  uint64_t best_ts = pth_last_rx_ts (best);
-  if (cand_ts != best_ts)
-    return cand_ts > best_ts;
+  uint32_t cand_loss = 0;
+  uint32_t best_loss = 0;
+  bool cand_has_loss = pth_loss_pct_get (cand, &cand_loss);
+  bool best_has_loss = pth_loss_pct_get (best, &best_loss);
+  if (cand_has_loss && best_has_loss && cand_loss != best_loss)
+    return cand_loss < best_loss;
+  if (cand_has_loss != best_has_loss)
+    return cand_has_loss;
 
   int ip_cmp = memcmp (cand->ep_ip, best->ep_ip, 16);
   if (ip_cmp != 0)
@@ -746,10 +757,7 @@ rt_map_rbd (Rt *t)
       pth->next = rtm->paths;
       rtm->paths = pth;
 
-      const SrcEnt *src = src_fnd_c (t, rtm->lla);
-      bool no_dir = src && src->no_dir;
-      bool dir_allowed = !no_dir || pth->is_static;
-      if (pth->r2d == 0 && dir_allowed && pth->is_act && pth->state == RT_ACT)
+      if (pth->r2d == 0 && pth->is_act && pth->state == RT_ACT)
         {
           if (pth_dir_btr (pth, rtm->sel_dir_pth))
             {
@@ -762,13 +770,10 @@ rt_map_rbd (Rt *t)
   RtMap *rtm, *tmp;
   HASH_ITER (hh, n_map, rtm, tmp)
   {
-    const SrcEnt *src = src_fnd_c (t, rtm->lla);
-    bool no_dir = src && src->no_dir;
     int dir_act_cnt = 0;
     for (Pth *p = rtm->paths; p; p = p->next)
       {
-        bool dir_allowed = !no_dir || p->is_static;
-        if (p->r2d == 0 && dir_allowed && p->is_act && p->state == RT_ACT)
+        if (p->r2d == 0 && p->is_act && p->state == RT_ACT)
           dir_act_cnt++;
         if (!p->is_act || p->state != RT_ACT)
           continue;
@@ -800,8 +805,7 @@ rt_map_rbd (Rt *t)
 
     for (Pth *p = rtm->paths; p; p = p->next)
       {
-        bool dir_allowed = !no_dir || p->is_static;
-        if (p->r2d == 0 && dir_allowed && !p->is_act && p->state == RT_PND)
+        if (p->r2d == 0 && !p->is_act && p->state == RT_PND)
           {
             rtm->has_pnd_dir = true;
             break;

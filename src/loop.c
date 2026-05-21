@@ -1179,6 +1179,17 @@ mesh_src_lla_from_ip6 (const uint8_t *frame, size_t frame_len,
   return IS_LLA_VAL (out_lla);
 }
 
+static bool
+rx_direct_src_lla_ok (bool has_src_peer, const uint8_t src_peer_lla[16],
+                      const uint8_t frame_src_lla[16])
+{
+  if (!frame_src_lla || !IS_LLA_VAL (frame_src_lla))
+    return false;
+  if (!has_src_peer)
+    return true;
+  return memcmp (src_peer_lla, frame_src_lla, 16) == 0;
+}
+
 void
 rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint8_t tp_mask,
             uint64_t now)
@@ -2138,23 +2149,35 @@ tap_tcp_sum_v6 (const uint8_t *ip6, const uint8_t *tcp, size_t tcp_len)
 }
 
 static bool
+tap_vnet_hdr_load (const uint8_t *vnet_frm, size_t vnet_len,
+                   struct virtio_net_hdr *vh)
+{
+  if (!vnet_frm || !vh || vnet_len < sizeof (*vh) || VNET_HL < sizeof (*vh))
+    return false;
+  memcpy (vh, vnet_frm, sizeof (*vh));
+  return true;
+}
+
+static bool
 tap_tso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapTso *tso)
 {
   if (!vnet_frm || !tso || vnet_len <= VNET_HL + ETH_HLEN + 20U + 20U)
     return false;
-  const struct virtio_net_hdr *vh = (const struct virtio_net_hdr *)vnet_frm;
-  uint8_t gso_t = (uint8_t)(vh->gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN);
+  struct virtio_net_hdr vh;
+  if (!tap_vnet_hdr_load (vnet_frm, vnet_len, &vh))
+    return false;
+  uint8_t gso_t = (uint8_t)(vh.gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN);
   if (gso_t != VIRTIO_NET_HDR_GSO_TCPV4 && gso_t != VIRTIO_NET_HDR_GSO_TCPV6)
     return false;
-  if (vh->gso_size == 0)
+  if (vh.gso_size == 0)
     return false;
-  if ((vh->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0)
+  if ((vh.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0)
     return false;
-  if (vh->hdr_len < (uint16_t)(ETH_HLEN + 20U + 20U))
+  if (vh.hdr_len < (uint16_t)(ETH_HLEN + 20U + 20U))
     return false;
-  if (vh->hdr_len >= vnet_len)
+  if (vh.hdr_len >= vnet_len)
     return false;
-  if (vh->gso_size > 65535U / 4U)
+  if (vh.gso_size > 65535U / 4U)
     return false;
 
   const uint8_t *frm = vnet_frm + VNET_HL;
@@ -2171,7 +2194,7 @@ tap_tso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapTso *tso)
   tso->frm = frm;
   tso->frm_len = frm_len;
   tso->mac_hl = mac_hl;
-  tso->seg_pl = vh->gso_size;
+  tso->seg_pl = vh.gso_size;
 
   if (eth_t == 0x86DDU)
     {
@@ -2204,9 +2227,9 @@ tap_tso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapTso *tso)
   if (tso->tcp_hl < 20U || tso->tcp_hl > 60U
       || frm_len < tso->tcp_off + tso->tcp_hl)
     return false;
-  if (vh->hdr_len != (uint16_t)(tso->tcp_off + tso->tcp_hl))
+  if (vh.hdr_len != (uint16_t)(tso->tcp_off + tso->tcp_hl))
     return false;
-  if (vh->csum_start != tso->tcp_off || vh->csum_offset != 16)
+  if (vh.csum_start != tso->tcp_off || vh.csum_offset != 16)
     return false;
   tso->pl_off = tso->tcp_off + tso->tcp_hl;
   if (frm_len <= tso->pl_off)
@@ -2275,17 +2298,19 @@ tap_uso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapUso *uso)
 {
   if (!vnet_frm || !uso || vnet_len <= VNET_HL + ETH_HLEN + 20U + 8U)
     return false;
-  const struct virtio_net_hdr *vh = (const struct virtio_net_hdr *)vnet_frm;
-  uint8_t gso_t = (uint8_t)(vh->gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN);
+  struct virtio_net_hdr vh;
+  if (!tap_vnet_hdr_load (vnet_frm, vnet_len, &vh))
+    return false;
+  uint8_t gso_t = (uint8_t)(vh.gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN);
   if (gso_t != VIRTIO_NET_HDR_GSO_UDP && gso_t != VIRTIO_NET_HDR_GSO_UDP_L4)
     return false;
-  if (vh->gso_size == 0)
+  if (vh.gso_size == 0)
     return false;
-  if ((vh->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0)
+  if ((vh.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0)
     return false;
-  if (vh->hdr_len < (uint16_t)(ETH_HLEN + 20U + 8U))
+  if (vh.hdr_len < (uint16_t)(ETH_HLEN + 20U + 8U))
     return false;
-  if (vh->hdr_len >= vnet_len)
+  if (vh.hdr_len >= vnet_len)
     return false;
 
   const uint8_t *frm = vnet_frm + VNET_HL;
@@ -2302,7 +2327,7 @@ tap_uso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapUso *uso)
   uso->frm = frm;
   uso->frm_len = frm_len;
   uso->mac_hl = mac_hl;
-  uso->seg_pl = vh->gso_size;
+  uso->seg_pl = vh.gso_size;
 
   if (eth_t == 0x86DDU)
     {
@@ -2332,9 +2357,9 @@ tap_uso_fit (const uint8_t *vnet_frm, size_t vnet_len, TapUso *uso)
 
   uso->udp_off = mac_hl + uso->ip_hl;
   uso->pl_off = uso->udp_off + 8U;
-  if (vh->hdr_len != (uint16_t)uso->pl_off)
+  if (vh.hdr_len != (uint16_t)uso->pl_off)
     return false;
-  if (vh->csum_start != uso->udp_off || vh->csum_offset != 6)
+  if (vh.csum_start != uso->udp_off || vh.csum_offset != 6)
     return false;
   if (frm_len <= uso->pl_off || uso->seg_pl == 0)
     return false;
@@ -2398,10 +2423,11 @@ tap_vnet_gso_type (const uint8_t *vnet_frame, size_t vnet_len,
 {
   if (!vnet_frame || vnet_len <= VNET_HL + ETH_HLEN || !out_gso_t)
     return false;
-  const struct virtio_net_hdr *vh
-      = (const struct virtio_net_hdr *)vnet_frame;
-  uint8_t gso_t = (uint8_t)(vh->gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN);
-  if (vh->gso_size == 0)
+  struct virtio_net_hdr vh;
+  if (!tap_vnet_hdr_load (vnet_frame, vnet_len, &vh))
+    return false;
+  uint8_t gso_t = (uint8_t)(vh.gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN);
+  if (vh.gso_size == 0)
     return false;
   switch (gso_t)
     {
@@ -3652,14 +3678,17 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           if (!p2p_direct_peer_ok (cfg, rt, tp_src, has_src ? src_ip : NULL,
                                    src_port))
             return;
+          const uint8_t *frame = pt + VNET_HL;
+          uint8_t src_lla[16] = { 0 };
+          bool has_frame_src
+              = mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
+                || mesh_src_lla_from_ip6 (frame, pt_len - VNET_HL, src_lla);
+          if (!rx_direct_src_lla_ok (has_src_peer, src_peer_lla,
+                                     has_frame_src ? src_lla : NULL))
+            return;
           if (has_src && rt_dat_upd (rt, src_ip, src_port, ts))
             {
-              const uint8_t *frame = pt + VNET_HL;
-              uint8_t src_lla[16] = { 0 };
-              if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
-                   || mesh_src_lla_from_ip6 (frame, pt_len - VNET_HL,
-                                             src_lla))
-                  && memcmp (src_lla, cfg->addr, 16) != 0
+              if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
                   && cfg->p2p == P2P_EN)
                 {
                   rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
@@ -3748,13 +3777,17 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                         &full_len);
         if (!full_l3 || full_len < VNET_HL + ETH_HLEN)
           break;
+        const uint8_t *frame = full_l3 + VNET_HL;
+        uint8_t src_lla[16] = { 0 };
+        bool has_frame_src
+            = mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
+              || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL, src_lla);
+        if (!rx_direct_src_lla_ok (has_src_peer, src_peer_lla,
+                                   has_frame_src ? src_lla : NULL))
+          break;
         if (rt_dat_upd (rt, src_ip, src_port, ts))
           {
-            const uint8_t *frame = full_l3 + VNET_HL;
-            uint8_t src_lla[16] = { 0 };
-            if ((mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
-                 || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL, src_lla))
-                && memcmp (src_lla, cfg->addr, 16) != 0
+            if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
                 && cfg->p2p == P2P_EN)
               {
                 rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
@@ -3822,6 +3855,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                      &prb_tok)
             != 0)
           break;
+        if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
+          break;
         const uint8_t *peer_pk = on_ping_kx (pt, pt_len);
         if (peer_pk)
           (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
@@ -3868,6 +3903,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, &peer_port,
                      &peer_rx_ts, &prb_tok)
             != 0)
+          break;
+        if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
           break;
         const uint8_t *peer_pk = on_pong_kx (pt, pt_len);
         if (peer_pk)
