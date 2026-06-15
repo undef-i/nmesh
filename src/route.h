@@ -67,6 +67,7 @@ typedef struct
   uint64_t rtt_win_id[RT_METRIC_WIN_BINS];
   uint32_t rtt_win_min[RT_METRIC_WIN_BINS];
   uint32_t r2d;
+  uint32_t fd;
   uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
@@ -116,6 +117,7 @@ typedef struct Pth
   uint32_t rto;
   uint32_t sm_m;
   uint32_t r2d;
+  uint32_t fd;
   uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;

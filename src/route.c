@@ -701,6 +701,7 @@ re_to_pth (const Re *re, Pth *pth)
   pth->rto = re->rto;
   pth->sm_m = re->sm_m;
   pth->r2d = re->r2d;
+  pth->fd = re->fd;
   pth->mtu = re->mtu;
   pth->mtu_lkg = re->mtu_lkg;
   pth->mtu_ukb = re->mtu_ukb;
@@ -793,6 +794,18 @@ rt_map_rbd (Rt *t)
               continue;
 
             uint32_t tot = n2r + p->r2d;
+
+            uint32_t dst_fd = rtm->sel_dir_pth ? rtm->sel_dir_m : UINT32_MAX;
+            for (Pth *fp = rtm->paths; fp; fp = fp->next)
+              {
+                if (fp->r2d == 0)
+                  continue;
+                if (fp->fd > 0 && fp->fd < dst_fd)
+                  dst_fd = fp->fd;
+              }
+            if (dst_fd != UINT32_MAX && p->adv_m > 0 && p->adv_m >= dst_fd)
+              continue;
+
             if (!rtm->sel_rel_pth || tot < rtm->sel_rel_m)
               {
                 rtm->sel_rel_pth = p;
@@ -802,6 +815,21 @@ rt_map_rbd (Rt *t)
       }
 
     rtm->sel_pth = rtm->sel_dir_pth ? rtm->sel_dir_pth : rtm->sel_rel_pth;
+
+    if (rtm->sel_pth)
+      {
+        uint32_t sel_m = rtm->sel_dir_pth ? rtm->sel_dir_m : rtm->sel_rel_m;
+        if (sel_m < RT_M_INF)
+          for (uint32_t i = 0; i < t->cnt; i++)
+            {
+              Re *re = &t->re_arr[i];
+              if (re->r2d == 0)
+                continue;
+              if (memcmp (re->lla, rtm->lla, 16) != 0)
+                continue;
+              re->fd = sel_m;
+            }
+      }
 
     for (Pth *p = rtm->paths; p; p = p->next)
       {
@@ -1166,6 +1194,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
   bool is_zero = is_z16 (re->lla);
   bool is_loc_inj = false;
   bool is_rel = (re->r2d > 0);
+  uint32_t e_adv = re->adv_m > 0 ? re->adv_m : re->rt_m;
   if (!is_zero && !IS_LLA_VAL (re->lla))
     return;
   if (!is_zero && memcmp (re->lla, t->our_lla, 16) == 0)
@@ -1185,6 +1214,22 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         roam->ep_port = re->ep_port;
       rt_zero_ep_rm (t, re->ep_ip, re->ep_port, false);
       rt_dir_ep_rm_same_ip (t, re->lla, re->ep_ip, re->ep_port);
+    }
+  if (is_rel && e_adv > 0)
+    {
+      uint32_t min_fd = UINT32_MAX;
+      for (uint32_t i = 0; i < t->cnt; i++)
+        {
+          Re *c = &t->re_arr[i];
+          if (c->r2d == 0)
+            continue;
+          if (memcmp (c->lla, re->lla, 16) != 0)
+            continue;
+          if (c->fd > 0 && c->fd < min_fd)
+            min_fd = c->fd;
+        }
+      if (min_fd != UINT32_MAX && e_adv >= min_fd)
+        return;
     }
   for (uint32_t i = 0; i < t->cnt; i++)
     {
@@ -1561,7 +1606,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
         }
       re_rx_note (&t->re_arr[i], sys_ts);
       if (tp_mask != 0)
-        t->re_arr[i].tp_mask |= tp_mask;
+        t->re_arr[i].tp_mask = tp_mask;
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
         {
@@ -1611,7 +1656,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
         }
       re_rx_note (re, sys_ts);
       if (tp_mask != 0)
-        re->tp_mask |= tp_mask;
+        re->tp_mask = tp_mask;
       memcpy (re->nhop_lla, lla, 16);
       if (re->mtu == 0)
         {
