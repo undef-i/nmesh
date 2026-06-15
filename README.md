@@ -32,6 +32,10 @@ mtu = 1280
 # Optional: PMTU probing (default: disable).
 mtu_probe = disable
 
+# Optional: physical MTU upper bound (default: 0, meaning auto-detect).
+# When set, caps the path MTU to this value regardless of interface scanning.
+default_phys_mtu = 1280
+
 # Optional: P2P behavior (default: enable).
 p2p = enable
 
@@ -76,7 +80,9 @@ These numbers are a point-in-time local reference, not a portability claim.
 
 ## Planned Features
 
-- [WIP] Data Channel Offload support for better performance.
+- [ ] Data Channel Offload support
+- [ ] UDP path forward secrecy via ephemeral ECDH rekey
+- [ ] IBS authentication
 
 ## Acknowledgements
 
