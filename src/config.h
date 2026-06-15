@@ -68,6 +68,7 @@ typedef struct
   uint16_t port;
   uint16_t mtu;
   bool mtu_probe;
+  uint16_t default_phys_mtu;
   uint8_t tp_mask;
   size_t tp_pref_len;
   size_t tp_pref_cap;
