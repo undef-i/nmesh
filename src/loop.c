@@ -1492,6 +1492,8 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   printf ("main: udp bound to port %u\n", act_port);
   {
     uint16_t hw_mtu = udp_mtu_get (&udp);
+    if (cfg.default_phys_mtu > 0 && cfg.default_phys_mtu < hw_mtu)
+      hw_mtu = cfg.default_phys_mtu;
     rt_pmtu_ub_set (&rt, hw_mtu);
   }
   rt_loc_add (&rt, cfg.addr, act_port, cfg.tp_mask, sys_ts ());

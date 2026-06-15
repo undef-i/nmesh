@@ -552,6 +552,18 @@ cfg_load (const char *path, Cfg *cfg)
               return -1;
             }
         }
+      else if (strcmp (k, "default_phys_mtu") == 0)
+        {
+          unsigned long d_v = strtoul (v, NULL, 10);
+          if (d_v < CFG_MTU_MIN || d_v > CFG_MTU_MAX)
+            {
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          cfg->default_phys_mtu = (uint16_t)d_v;
+        }
       else if (strcmp (k, "transport") == 0)
         {
           if (tp_cfg_prs (v, cfg) != 0)
