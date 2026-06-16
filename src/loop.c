@@ -4161,14 +4161,12 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
     {
       rt->gsp_dirty = false;
       rt->gsp_off = 0;
-      rt->gsp_last_ts = now;
       return;
     }
   if (exp_cnt == 0)
     {
       rt->gsp_dirty = false;
       rt->gsp_off = 0;
-      rt->gsp_last_ts = now;
       return;
     }
   static uint8_t g_buf[UDP_PL_MAX];
