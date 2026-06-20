@@ -4198,9 +4198,17 @@ gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg)
         ctrl_tx_mark (rt, &rt->gsp_tx_cnt, gsp_len, re->ep_ip, re->ep_port,
                       now);
     }
-  if (exp_cnt > GSP_MAX)
+  uint32_t gsp_max = GSP_MAX;
+  {
+    uint16_t pmtu = rt_mtu_ub (rt);
+    if (pmtu > 100U + GSP_SZ)
+      gsp_max = ((uint32_t)pmtu - 100U) / GSP_SZ;
+    if (gsp_max > GSP_MAX || gsp_max == 0)
+      gsp_max = GSP_MAX;
+  }
+  if (exp_cnt > gsp_max)
     {
-      uint32_t next_off = start_off + GSP_MAX;
+      uint32_t next_off = start_off + gsp_max;
       rt->gsp_off = (next_off < exp_cnt) ? next_off : 0;
       rt->gsp_dirty = rt->gsp_off != 0;
     }

@@ -51,7 +51,7 @@ rt_direct_ep_ip_ok (const uint8_t ip[16])
   return true;
 }
 
-static uint16_t
+uint16_t
 rt_mtu_ub (const Rt *t)
 {
   uint32_t upper = RT_MTU_MAX;

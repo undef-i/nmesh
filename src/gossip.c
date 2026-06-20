@@ -376,7 +376,12 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
       return buf;
     }
   exp_off = (s_off > 0) ? ((uint32_t)s_off % exp_cnt) : 0;
-  for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < GSP_MAX; re_idx++)
+  uint32_t max_cnt = GSP_MAX, mtu = rt_mtu_ub (rt);
+  if (mtu > 100U + GSP_SZ)
+    max_cnt = ((uint32_t)mtu - 100U) / GSP_SZ;
+  if (max_cnt > GSP_MAX)
+    max_cnt = GSP_MAX;
+  for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < (int)max_cnt; re_idx++)
     {
       const Re *re = &rt->re_arr[re_idx];
       static const uint8_t z[16] = { 0 };
@@ -471,7 +476,12 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
       *out_len = 0;
       return buf;
     }
-  for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < GSP_MAX; re_idx++)
+  uint32_t max_cnt = GSP_MAX, mtu = rt_mtu_ub (rt);
+  if (mtu > 100U + GSP_SZ)
+    max_cnt = ((uint32_t)mtu - 100U) / GSP_SZ;
+  if (max_cnt > GSP_MAX)
+    max_cnt = GSP_MAX;
+  for (int re_idx = 0; re_idx < (int)rt->cnt && act_cnt < (int)max_cnt; re_idx++)
     {
       const Re *re = &rt->re_arr[re_idx];
       static const uint8_t z[16] = { 0 };
