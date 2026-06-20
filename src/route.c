@@ -806,7 +806,9 @@ rt_map_rbd (Rt *t)
             if (dst_fd != UINT32_MAX && p->adv_m > 0 && p->adv_m >= dst_fd)
               continue;
 
-            if (!rtm->sel_rel_pth || tot < rtm->sel_rel_m)
+            if (!rtm->sel_rel_pth || tot < rtm->sel_rel_m
+                || (tot == rtm->sel_rel_m
+                    && p->adv_m < rtm->sel_rel_pth->adv_m))
               {
                 rtm->sel_rel_pth = p;
                 rtm->sel_rel_m = tot;
