@@ -1279,6 +1279,8 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         }
       else if ((is_rel || is_loc_inj) && (re->state == RT_ACT || re->is_act))
         {
+          if (is_rel && !cur_re->is_act)
+            rt_gsp_dirty_set (t, "rt_upd (relay activate)");
           cur_re->state = RT_ACT;
           cur_re->is_act = true;
         }
@@ -1379,6 +1381,8 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         }
       t->re_arr[t->cnt++] = ne;
       rt_map_mark (t);
+      if (is_rel && ne.is_act)
+        rt_gsp_dirty_set (t, "rt_upd (relay new active)");
     }
 }
 
