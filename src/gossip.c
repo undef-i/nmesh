@@ -191,8 +191,6 @@ gsp_self_ep_exp_ok (const Re *re, const uint8_t our_lla[16])
 {
   if (!re || !our_lla)
     return false;
-  if (re->r2d != 0)
-    return false;
   if (!re->is_act || re->state != RT_ACT)
     return false;
   if (memcmp (re->lla, our_lla, 16) != 0)
@@ -206,8 +204,6 @@ gsp_ent_exp_ok (const Re *re, const uint8_t our_lla[16])
   static const uint8_t z[16] = { 0 };
   bool is_z = false;
   if (!re || !our_lla)
-    return false;
-  if (re->r2d != 0)
     return false;
   if (is_ip_bgn (re->ep_ip))
     return false;
@@ -411,6 +407,27 @@ gsp_bld (Cry *s, Rt *rt, int s_off,
           = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_get (rt, re) : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
+      if (re->r2d > 0)
+        {
+          uint32_t nh_m = UINT32_MAX;
+          for (uint32_t j = 0; j < rt->cnt; j++)
+            {
+              const Re *nh = &rt->re_arr[j];
+              if (nh->r2d != 0)
+                continue;
+              if (memcmp (nh->lla, re->nhop_lla, 16) != 0)
+                continue;
+              if (!nh->is_act || nh->state != RT_ACT)
+                continue;
+              uint32_t m = nh->sm_m;
+              if (m == 0 || m >= RT_M_INF)
+                m = nh->rt_m;
+              if (m > 0 && m < nh_m)
+                nh_m = m;
+            }
+          if (nh_m < RT_M_INF)
+            gsp_ent.adv_m = nh_m + re->r2d;
+        }
       {
         uint32_t loss_pct = 0;
         gsp_ent.adv_loss = rt_loss_pct_get (re, &loss_pct) ? (uint8_t)loss_pct : 0;
@@ -485,6 +502,27 @@ gsp_dt_bld (Cry *s, Rt *rt, const uint8_t tgt_lla[16],
           = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_get (rt, re) : 0;
       gsp_ent.seq = re->seq;
       gsp_ent.adv_m = re->rt_m;
+      if (re->r2d > 0)
+        {
+          uint32_t nh_m = UINT32_MAX;
+          for (uint32_t j = 0; j < rt->cnt; j++)
+            {
+              const Re *nh = &rt->re_arr[j];
+              if (nh->r2d != 0)
+                continue;
+              if (memcmp (nh->lla, re->nhop_lla, 16) != 0)
+                continue;
+              if (!nh->is_act || nh->state != RT_ACT)
+                continue;
+              uint32_t m = nh->sm_m;
+              if (m == 0 || m >= RT_M_INF)
+                m = nh->rt_m;
+              if (m > 0 && m < nh_m)
+                nh_m = m;
+            }
+          if (nh_m < RT_M_INF)
+            gsp_ent.adv_m = nh_m + re->r2d;
+        }
       {
         uint32_t loss_pct = 0;
         gsp_ent.adv_loss = rt_loss_pct_get (re, &loss_pct) ? (uint8_t)loss_pct : 0;

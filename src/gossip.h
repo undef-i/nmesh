@@ -5,7 +5,7 @@
 #include "udp.h"
 #include <stddef.h>
 #include <stdint.h>
-#define GSP_MAX 20
+#define GSP_MAX 16
 uint8_t *ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                    uint64_t ts, uint64_t sid, uint64_t prb_tok, uint8_t *buf,
                    size_t *out_len);
