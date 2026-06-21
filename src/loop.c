@@ -3860,8 +3860,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
           break;
         const uint8_t *peer_pk = on_ping_kx (pt, pt_len);
-        if (peer_pk)
-          (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
+        if (peer_pk && !cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk))
+          fprintf (stderr, "crypto: peer rekey failed on ping\n");
         if (tp_src && tp_src->is_tcp && prb_tok != 0)
           {
             static uint8_t pong_buf[UDP_PL_MAX];
@@ -3909,8 +3909,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
           break;
         const uint8_t *peer_pk = on_pong_kx (pt, pt_len);
-        if (peer_pk)
-          (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
+        if (peer_pk && !cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk))
+          fprintf (stderr, "crypto: peer rekey failed on pong\n");
         if (tp_src && tp_src->is_tcp && prb_tok != 0)
           break;
         (void)peer_port;
