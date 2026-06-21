@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TAP_F_MAX 65550
+#define TAP_F_MAX (10U + 14U + 65535U)
 #define VNET_HL 10
 #define EV_MAX 10
 #define ID_TAP 1

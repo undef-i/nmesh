@@ -479,5 +479,12 @@ bypass:
   gro_fls_all (tap_fd);
   if (write (tap_fd, vnet_frm, vnet_len) < 0)
     {
+      static uint64_t last_log_ts;
+      uint64_t now = sys_ts ();
+      if (now - last_log_ts > 5000ULL)
+        {
+          perror ("gro: bypass write");
+          last_log_ts = now;
+        }
     }
 }
