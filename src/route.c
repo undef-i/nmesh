@@ -2164,7 +2164,7 @@ rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
       Re *re = &t->re_arr[i];
       if (re->r2d != 0)
         continue;
-      if (re->state != RT_ACT)
+      if (re->state == RT_DED)
         continue;
       if (memcmp (re->lla, t->our_lla, 16) == 0)
         continue;
