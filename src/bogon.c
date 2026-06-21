@@ -6,38 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const BogonRule g_default_rule_arr[] = {
-  { .ip = { [10] = 0xff, [11] = 0xff }, .prefix_len = 104, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 10 }, .prefix_len = 104, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 100, [13] = 64 }, .prefix_len = 106, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 172, [13] = 16 }, .prefix_len = 108, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 192, [13] = 0, [14] = 0 }, .prefix_len = 120, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 192, [13] = 0, [14] = 2 }, .prefix_len = 120, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 192, [13] = 88, [14] = 99 }, .prefix_len = 120, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 192, [13] = 168 }, .prefix_len = 112, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 198, [13] = 18 }, .prefix_len = 111, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 198, [13] = 51, [14] = 100 }, .prefix_len = 120, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 203, [13] = 0, [14] = 113 }, .prefix_len = 120, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 127 }, .prefix_len = 104, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 169, [13] = 254 }, .prefix_len = 112, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 224 }, .prefix_len = 100, .is_set = true },
-  { .ip = { [10] = 0xff, [11] = 0xff, [12] = 240 }, .prefix_len = 100, .is_set = true },
-  { .ip = { 0 }, .prefix_len = 128, .is_set = true },
-  { .ip = { [15] = 1 }, .prefix_len = 128, .is_set = true },
-  { .ip = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, .prefix_len = 64, .is_set = true },
-  { .ip = { 0x20, 0x01, 0x00, 0x02 }, .prefix_len = 48, .is_set = true },
-  { .ip = { 0x20, 0x01, 0x10 }, .prefix_len = 28, .is_set = true },
-  { .ip = { 0x20, 0x01, 0x0d, 0xb8 }, .prefix_len = 32, .is_set = true },
-  { .ip = { 0x20, 0x02 }, .prefix_len = 16, .is_set = true },
-  { .ip = { 0x20, 0x01, 0x00, 0x00, 0x0a, 0x00 }, .prefix_len = 40, .is_set = true },
-  { .ip = { 0x20, 0x01, 0x00, 0x00, 0xc0, 0x00, 0x02 }, .prefix_len = 56, .is_set = true },
-  { .ip = { 0x20, 0x01, 0x00, 0x00, 0xc0, 0xa8 }, .prefix_len = 48, .is_set = true },
-  { .ip = { 0xff }, .prefix_len = 8, .is_set = true },
-  { .ip = { 0xfe, 0x80 }, .prefix_len = 10, .is_set = true },
-  { .ip = { 0xfe, 0xc0 }, .prefix_len = 10, .is_set = true },
-  { .ip = { 0xfc }, .prefix_len = 7, .is_set = true },
-};
-
 static BogonRule *g_rule_arr = NULL;
 static size_t g_rule_cnt = 0;
 static size_t g_rule_cap = 0;
@@ -139,13 +107,7 @@ bogon_cfg_apply (const Cfg *cfg)
 {
   g_rule_cnt = 0;
   if (!cfg || cfg->bogon_cnt == 0)
-    {
-      for (size_t i = 0;
-           i < sizeof (g_default_rule_arr) / sizeof (g_default_rule_arr[0]);
-           i++)
-        bogon_rule_add (&g_default_rule_arr[i]);
-      return;
-    }
+    return;
   for (size_t i = 0; i < cfg->bogon_cnt; i++)
     {
       if (cfg->bogon_arr[i].is_set)
