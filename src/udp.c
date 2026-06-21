@@ -1160,7 +1160,7 @@ udp_mtu_get (const Udp *s)
   (void)s;
   struct ifaddrs *ifaddr, *ifa;
   if (getifaddrs (&ifaddr) != 0)
-    return 1500;
+    return 0;
   int max_mtu = 1280;
   int fd = socket (AF_INET, SOCK_DGRAM, 0);
   if (fd >= 0)
@@ -1196,7 +1196,7 @@ uint16_t
 udp_ep_mtu_get (const uint8_t dst_ip[16])
 {
   if (!dst_ip)
-    return 1500;
+    return 0;
   int slot = (int)((dst_ip[12] ^ dst_ip[13] ^ dst_ip[14] ^ dst_ip[15])
                    & (UDP_EP_MTU_CACHE_MAX - 1));
   uint64_t now = sys_ts ();
@@ -1210,7 +1210,7 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
       return mtu;
     }
   pthread_mutex_unlock (&g_ep_mtu_mtx);
-  uint16_t mtu = 1500;
+  uint16_t mtu = 0;
   int is_v4m = (dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0
                 && dst_ip[3] == 0 && dst_ip[4] == 0 && dst_ip[5] == 0
                 && dst_ip[6] == 0 && dst_ip[7] == 0 && dst_ip[8] == 0
@@ -1258,13 +1258,16 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
         }
     }
   close (fd6);
-out:
-  pthread_mutex_lock (&g_ep_mtu_mtx);
-  memcpy (ent->dst_ip, dst_ip, 16);
-  ent->mtu = mtu;
-  ent->ts = now;
-  ent->is_val = true;
-  pthread_mutex_unlock (&g_ep_mtu_mtx);
+ out:
+  if (mtu > 0)
+    {
+      pthread_mutex_lock (&g_ep_mtu_mtx);
+      memcpy (ent->dst_ip, dst_ip, 16);
+      ent->mtu = mtu;
+      ent->ts = now;
+      ent->is_val = true;
+      pthread_mutex_unlock (&g_ep_mtu_mtx);
+    }
   return mtu;
 }
 

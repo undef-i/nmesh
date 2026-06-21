@@ -15,7 +15,7 @@
 #define TP_CONN_CAP_INIT 512U
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
-#define TP_FLOW_IDLE_TMO (RT_PRB_INTV * 2ULL)
+#define TP_FLOW_IDLE_TMO (KA_TMO * 2ULL)
 #define TP_WIRE_SALT_SZ (CRY_NONCE_WIRE_SZ + sizeof (uint64_t))
 #define TP_WIRE_KEY_SZ crypto_aead_aegis128l_KEYBYTES
 #define TP_WIRE_NONCE_SZ crypto_aead_aegis128l_NPUBBYTES
