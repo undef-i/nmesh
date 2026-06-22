@@ -29,7 +29,7 @@ typedef struct __attribute__ ((packed))
 #define PKT_NONCE_SID_SZ (PKT_NONCE_SZ - PKT_NONCE_CNT_SZ)
 #define PKT_HDR_SZ (PKT_CH_SZ + PKT_NONCE_SZ + PKT_MAC_SZ)
 #define V6_PL_MAX 9000
-#define UDP_PL_MAX (PKT_HDR_SZ + 16 + V6_PL_MAX)
+#define UDP_PL_MAX (PKT_HDR_SZ + sizeof (FragHdr) + 4U + V6_PL_MAX)
 #define PKT_PT_MAX (UDP_PL_MAX - PKT_HDR_SZ)
 #define TP_VNET_MAX UINT16_MAX
 #define TP_PL_MAX (PKT_HDR_SZ + TP_VNET_MAX)
@@ -95,4 +95,4 @@ _Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
 _Static_assert (sizeof (StatHdr) == 20, "StatHdr size");
 _Static_assert (PKT_HDR_SZ == 50, "PKT_HDR_SZ");
-_Static_assert (UDP_PL_MAX == (PKT_HDR_SZ + 16 + V6_PL_MAX), "UDP_PL_MAX");
+_Static_assert (UDP_PL_MAX == PKT_HDR_SZ + sizeof (FragHdr) + 4U + V6_PL_MAX, "UDP_PL_MAX");
