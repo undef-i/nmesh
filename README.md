@@ -29,9 +29,6 @@ port = 50000
 # Optional: overlay MTU (default: 1280, range: 128..32743).
 mtu = 1280
 
-# Optional: PMTU probing (default: disable).
-mtu_probe = disable
-
 # Optional: physical MTU upper bound (default: 0, meaning auto-detect).
 # When set, caps the path MTU to this value regardless of interface scanning.
 default_phys_mtu = 1280
@@ -82,6 +79,7 @@ These numbers are a point-in-time local reference, not a portability claim.
 
 - [ ] Data Channel Offload support
 - [ ] UDP path forward secrecy via ephemeral ECDH rekey
+- [ ] PMTU probing
 - [ ] IBS authentication
 
 ## Acknowledgements

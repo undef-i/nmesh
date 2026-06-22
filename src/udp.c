@@ -1197,8 +1197,10 @@ udp_ep_mtu_get (const uint8_t dst_ip[16])
 {
   if (!dst_ip)
     return 0;
-  int slot = (int)((dst_ip[12] ^ dst_ip[13] ^ dst_ip[14] ^ dst_ip[15])
-                   & (UDP_EP_MTU_CACHE_MAX - 1));
+  uint32_t h = 5381;
+  for (int i = 0; i < 16; i++)
+    h = ((h << 5) + h) + dst_ip[i];
+  int slot = (int)(h & (UDP_EP_MTU_CACHE_MAX - 1));
   uint64_t now = sys_ts ();
   pthread_mutex_lock (&g_ep_mtu_mtx);
   UdpEpMtuEnt *ent = &g_ep_mtu_cache[slot];
