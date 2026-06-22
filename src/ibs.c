@@ -34,8 +34,10 @@ ibs_setup (uint8_t msk[IBS_MSK_SZ], uint8_t mpk[IBS_MPK_SZ])
   blst_scalar_from_be_bytes (&s, msk, IBS_MSK_SZ);
   if (!blst_sk_check (&s))
     return false;
+  blst_p2 gen;
+  blst_p2_from_affine (&gen, blst_p2_affine_generator ());
   blst_p2 pk;
-  blst_p2_mult (&pk, blst_p2_affine_generator (), msk, 8 * IBS_MSK_SZ);
+  blst_p2_mult (&pk, &gen, msk, 8 * IBS_MSK_SZ);
   blst_p2_affine pk_aff;
   blst_p2_to_affine (&pk_aff, &pk);
   blst_p2_affine_compress (mpk, &pk_aff);
@@ -76,10 +78,6 @@ ibs_sign (const uint8_t sk[IBS_SK_SZ], const uint8_t *id,
     randombytes_buf (r_buf, sizeof (r_buf));
     blst_scalar_from_be_bytes (&r, r_buf, sizeof (r_buf));
   }
-
-  blst_p1 P1;
-  blst_p1_from_affine (&P1, blst_p1_affine_generator ());
-  (void)P1;
 
   /* U = r * Q_ID */
   blst_p1 Q;
@@ -161,5 +159,6 @@ ibs_verify (const uint8_t mpk[IBS_MPK_SZ], const uint8_t *id,
   }
 
   blst_pairing_commit (ctx);
-  return blst_pairing_finalverify (ctx, NULL);
+  bool ok = blst_pairing_finalverify (ctx, NULL);
+  return ok;
 }

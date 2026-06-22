@@ -552,6 +552,26 @@ typedef struct
   bool has_peer_lla;
 } UdpDecRes;
 
+#define IBS_TS_SKEW_MAX (KA_TMO * 6ULL)
+
+static uint64_t
+be64_rd (const uint8_t *s)
+{
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++)
+    v = (v << 8) | (uint64_t)s[i];
+  return v;
+}
+
+static bool
+ibs_ts_fresh (const uint8_t *pl)
+{
+  uint64_t pkt_ts = be64_rd (pl);
+  uint64_t now = sys_ts ();
+  uint64_t delta = (now >= pkt_ts) ? (now - pkt_ts) : (pkt_ts - now);
+  return delta <= IBS_TS_SKEW_MAX;
+}
+
 static void
 udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[],
              int pkt_cnt)
@@ -561,6 +581,42 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
       uint8_t *raw = pkt_arr[i].data;
       size_t raw_len = pkt_arr[i].data_len;
       bool is_loopback = is_ip_loopback (pkt_arr[i].src_ip);
+      bool is_ibs = cry_ctx->auth_ibs && raw_len >= PKT_CH_SZ + IBS_SIG_SZ;
+      uint8_t raw_hdr_type = 0;
+      if (is_ibs)
+        raw_hdr_type = (uint8_t)(raw[0] & PKT_TF_TYPE_MASK);
+      if (is_ibs && (raw_hdr_type == PT_IBS_PING
+                     || raw_hdr_type == PT_IBS_PONG))
+        {
+          size_t pl_sz = (raw_hdr_type == PT_IBS_PING) ? IBS_PING_PL_SZ
+                                                       : IBS_PONG_PL_SZ;
+          if (raw_len >= PKT_CH_SZ + pl_sz + IBS_SIG_SZ)
+            {
+              const uint8_t *pl = raw + PKT_CH_SZ;
+              const uint8_t *peer_lla = pl + 16;
+              const uint8_t *sig = raw + PKT_CH_SZ + pl_sz;
+              if (ibs_ts_fresh (pl)
+                  && ibs_verify (cry_ctx->ibs_mpk, peer_lla, 16, pl, pl_sz,
+                                 sig))
+                {
+                  res_arr[i].hdr.pkt_type = (raw_hdr_type == PT_IBS_PING)
+                                                ? PT_PING
+                                                : PT_PONG;
+                  res_arr[i].hdr.rel_f = 0;
+                  res_arr[i].hdr.hop_c = raw[1];
+                  res_arr[i].pt = raw + PKT_CH_SZ;
+                  res_arr[i].pt_len = pl_sz;
+                  res_arr[i].dec_res = 0;
+                  res_arr[i].used_psk = false;
+                  memcpy (res_arr[i].peer_lla, peer_lla, 16);
+                  res_arr[i].has_peer_lla = IS_LLA_VAL (peer_lla);
+                }
+            }
+          if (res_arr[i].dec_res == 0)
+            continue;
+          res_arr[i].dec_res = -1;
+          continue;
+        }
       if (raw_len < PKT_HDR_SZ || (!is_loopback && !rx_rp_chk (raw)))
         {
           res_arr[i].dec_res = -1;
@@ -577,43 +633,8 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
           = pkt_dec_from (cry_ctx, has_src_lla ? src_lla : NULL,
                           pkt_arr[i].data, pkt_arr[i].data_len, NULL, 0,
                           &res_arr[i].hdr, &res_arr[i].pt,
-                          &res_arr[i].pt_len, &res_arr[i].used_psk,
-                          res_arr[i].peer_lla);
-      if (res_arr[i].dec_res != 0 && cry_ctx->auth_ibs
-          && raw_len >= PKT_CH_SZ + IBS_SIG_SZ)
-        {
-          uint8_t *raw_buf = pkt_arr[i].data;
-          uint8_t raw_hdr_type
-              = (uint8_t)(raw_buf[0] & PKT_TF_TYPE_MASK);
-          if (raw_hdr_type == PT_IBS_PING || raw_hdr_type == PT_IBS_PONG)
-            {
-              size_t pl_sz = (raw_hdr_type == PT_IBS_PING)
-                                 ? IBS_PING_PL_SZ
-                                 : IBS_PONG_PL_SZ;
-              if (raw_len >= PKT_CH_SZ + pl_sz + IBS_SIG_SZ)
-                {
-                  const uint8_t *pl = raw_buf + PKT_CH_SZ;
-                  const uint8_t *peer_lla = pl + 16;
-                  const uint8_t *sig
-                      = raw_buf + PKT_CH_SZ + pl_sz;
-                  if (ibs_verify (cry_ctx->ibs_mpk, peer_lla, 16,
-                                  pl, pl_sz, sig))
-                    {
-                      res_arr[i].hdr.pkt_type = (raw_hdr_type
-                                                  == PT_IBS_PING)
-                                                    ? PT_PING
-                                                    : PT_PONG;
-                      res_arr[i].hdr.rel_f = 0;
-                      res_arr[i].hdr.hop_c = raw_buf[1];
-                      res_arr[i].pt = raw_buf + PKT_CH_SZ;
-                      res_arr[i].pt_len = pl_sz;
-                      res_arr[i].dec_res = 0;
-                      memcpy (res_arr[i].peer_lla, peer_lla, 16);
-                      res_arr[i].has_peer_lla = IS_LLA_VAL (peer_lla);
-                    }
-                }
-            }
-        }
+                          &res_arr[i].pt_len, is_loopback,
+                          &res_arr[i].used_psk, res_arr[i].peer_lla);
       if (res_arr[i].dec_res != 0)
         continue;
       res_arr[i].has_peer_lla = IS_LLA_VAL (res_arr[i].peer_lla);
@@ -1358,12 +1379,27 @@ cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
       bogon_cfg_apply (cfg);
       fprintf (stderr, "main: reloaded bogon filter\n");
     }
-  if (memcmp (cfg->psk, new_cfg.psk, 32) != 0)
+  bool auth_rekey = cfg->auth_ibs != new_cfg.auth_ibs
+                    || (!new_cfg.auth_ibs
+                        && memcmp (cfg->psk, new_cfg.psk, 32) != 0)
+                    || (new_cfg.auth_ibs
+                        && (memcmp (cfg->ibs_mpk, new_cfg.ibs_mpk,
+                                    IBS_MPK_SZ)
+                                != 0
+                            || memcmp (cfg->ibs_sk, new_cfg.ibs_sk,
+                                      IBS_SK_SZ)
+                                   != 0));
+  if (auth_rekey)
     {
       memcpy (cfg->psk, new_cfg.psk, 32);
+      cfg->auth_ibs = new_cfg.auth_ibs;
+      memcpy (cfg->ibs_mpk, new_cfg.ibs_mpk, IBS_MPK_SZ);
+      memcpy (cfg->ibs_sk, new_cfg.ibs_sk, IBS_SK_SZ);
       cry_free (cry_ctx);
-      cry_init (cry_ctx, cfg->psk);
-      fprintf (stderr, "main: reloaded psk\n");
+      cry_init (cry_ctx, cfg->psk, cfg->auth_ibs);
+      if (cfg->auth_ibs)
+        cry_set_ibs (cry_ctx, cfg->ibs_mpk, cfg->ibs_sk);
+      fprintf (stderr, "main: reloaded auth material\n");
     }
   P *peers = NULL;
   int peer_cnt = 0;
@@ -1482,7 +1518,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   free (peers);
 
   Cry cry_ctx;
-  cry_init (&cry_ctx, cfg.psk);
+  cry_init (&cry_ctx, cfg.psk, cfg.auth_ibs);
   if (cfg.auth_ibs)
     cry_set_ibs (&cry_ctx, cfg.ibs_mpk, cfg.ibs_sk);
   bool cry_inited = true;
@@ -3901,8 +3937,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
           break;
         const uint8_t *peer_pk = on_ping_kx (pt, pt_len);
-        if (peer_pk && !cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk))
-          fprintf (stderr, "crypto: peer rekey failed on ping\n");
+        if (peer_pk)
+          (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
         if (tp_src && tp_src->is_tcp && prb_tok != 0)
           {
             static uint8_t pong_buf[UDP_PL_MAX];
@@ -3958,8 +3994,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
           break;
         const uint8_t *peer_pk = on_pong_kx (pt, pt_len);
-        if (peer_pk && !cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk))
-          fprintf (stderr, "crypto: peer rekey failed on pong\n");
+        if (peer_pk)
+          (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
         if (tp_src && tp_src->is_tcp && prb_tok != 0)
           break;
         (void)peer_port;
@@ -4094,7 +4130,7 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   uint8_t dec_peer_lla[16] = { 0 };
   if (pkt_dec_from (ctx->cry_ctx, src && src->is_tcp ? src->peer_lla : NULL,
                     (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr, &pt,
-                    &pt_len, &used_psk, dec_peer_lla)
+                    &pt_len, is_loopback, &used_psk, dec_peer_lla)
       != 0)
     return false;
   if (used_psk && !is_loopback && hdr.pkt_type != PT_PING

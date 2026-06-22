@@ -254,12 +254,14 @@ tp_wire_derive (TpConn *conn)
 
   seed[0] = 0;
   memcpy (seed + 1U, conn->wire_salt, TP_WIRE_SALT_SZ);
-  crypto_generichash (c2s, sizeof (c2s), seed, sizeof (seed), g_tp_cry->key,
-                      sizeof (g_tp_cry->key));
+  crypto_generichash (c2s, sizeof (c2s), seed, sizeof (seed),
+                      g_tp_cry->auth_ibs ? NULL : g_tp_cry->key,
+                      g_tp_cry->auth_ibs ? 0 : sizeof (g_tp_cry->key));
 
   seed[0] = 1;
-  crypto_generichash (s2c, sizeof (s2c), seed, sizeof (seed), g_tp_cry->key,
-                      sizeof (g_tp_cry->key));
+  crypto_generichash (s2c, sizeof (s2c), seed, sizeof (seed),
+                      g_tp_cry->auth_ibs ? NULL : g_tp_cry->key,
+                      g_tp_cry->auth_ibs ? 0 : sizeof (g_tp_cry->key));
 
   if (conn->inbound)
     {
@@ -314,12 +316,14 @@ tp_wire_rekey_fs (TpConn *conn)
           sizeof (init_pk));
   memcpy (seed + 1U + TP_WIRE_SALT_SZ + sizeof (shared) + sizeof (init_pk),
           resp_pk, sizeof (resp_pk));
-  crypto_generichash (c2s, sizeof (c2s), seed, sizeof (seed), g_tp_cry->key,
-                      sizeof (g_tp_cry->key));
+  crypto_generichash (c2s, sizeof (c2s), seed, sizeof (seed),
+                      g_tp_cry->auth_ibs ? NULL : g_tp_cry->key,
+                      g_tp_cry->auth_ibs ? 0 : sizeof (g_tp_cry->key));
 
   seed[0] = 3;
-  crypto_generichash (s2c, sizeof (s2c), seed, sizeof (seed), g_tp_cry->key,
-                      sizeof (g_tp_cry->key));
+  crypto_generichash (s2c, sizeof (s2c), seed, sizeof (seed),
+                      g_tp_cry->auth_ibs ? NULL : g_tp_cry->key,
+                      g_tp_cry->auth_ibs ? 0 : sizeof (g_tp_cry->key));
 
   if (conn->inbound)
     {
@@ -1923,9 +1927,8 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
         return TP_AUTH_FAIL;
       memcpy (conn->wire_peer_pk, pt + PING_PL_SZ, TP_KX_PUB_SZ);
       conn->wire_peer_kx_ready = true;
-      if (!cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
-                           pt + PING_PL_SZ + TP_KX_PUB_SZ))
-        fprintf (stderr, "crypto: tcp peer rekey failed on ping\n");
+      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
+                            pt + PING_PL_SZ + TP_KX_PUB_SZ);
       uint8_t pong_buf[UDP_PL_MAX];
       size_t pong_len = 0;
       tp_pong_bld (g_tp_cry, cfg->addr, cfg->port, req_ts, g_tp_sid,
@@ -1946,9 +1949,8 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
         return TP_AUTH_FAIL;
       memcpy (conn->wire_peer_pk, pt + PONG_PL_SZ, TP_KX_PUB_SZ);
       conn->wire_peer_kx_ready = true;
-      if (!cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
-                           pt + PONG_PL_SZ + TP_KX_PUB_SZ))
-        fprintf (stderr, "crypto: tcp peer rekey failed on pong\n");
+      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
+                            pt + PONG_PL_SZ + TP_KX_PUB_SZ);
     }
   else
     {

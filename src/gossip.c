@@ -334,8 +334,6 @@ pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port, uint64_t o_ts,
   return pkt_enc_psk (s, hdr, payload, sizeof (payload), buf, out_len);
 }
 
-#define IBS_PING_PL_SZ (PING_KX_PL_SZ + 16)
-
 uint8_t *
 ibs_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
               uint64_t ts, uint64_t sid, uint64_t prb_tok,
@@ -371,8 +369,6 @@ ibs_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
   *out_len = PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ;
   return out;
 }
-
-#define IBS_PONG_PL_SZ (PONG_KX_PL_SZ + 16)
 
 uint8_t *
 ibs_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
@@ -846,8 +842,8 @@ pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
 int
 pkt_dec_from (Cry *s, const uint8_t src_lla[16], uint8_t *raw, size_t raw_len,
               uint8_t *pt_buf, size_t pt_len, PktHdr *hdr_out,
-              uint8_t **pt_out, size_t *pt_len_out, bool *used_psk,
-              uint8_t matched_lla[16])
+              uint8_t **pt_out, size_t *pt_len_out, bool allow_psk_fallback,
+              bool *used_psk, uint8_t matched_lla[16])
 {
   if (raw_len < PKT_HDR_SZ)
     return -1;
@@ -868,6 +864,8 @@ pkt_dec_from (Cry *s, const uint8_t src_lla[16], uint8_t *raw, size_t raw_len,
                     matched_lla)
       != 0)
     {
+      if (s && s->auth_ibs && !allow_psk_fallback)
+        return -1;
       if (cry_dec (s, ct, ct_len, NULL, 0, nonce, mac, pt) != 0)
         return -1;
       psk = true;
@@ -1150,6 +1148,7 @@ on_gsp (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       bool import_dir_hint
           = src_fresh && allow_dir_hint && !eff_no_dir && has_dir_hint
             && has_udp_hint
+            && (!is_s_owner || is_s_self)
             && (is_s_self || (gsp_ent.flags & GSP_F_SEL_DIR) != 0);
       if (import_dir_hint)
         {

@@ -1159,11 +1159,14 @@ status_query_run (const Cfg *cfg)
   if (!cfg)
     return 1;
   Cry cry_ctx;
-  if (cry_init (&cry_ctx, cfg) != 0)
+  if (cry_init (&cry_ctx, cfg->auth_ibs ? NULL : cfg->psk, cfg->auth_ibs)
+      != 0)
     {
       fprintf (stderr, "status: failed to init crypto\n");
       return 1;
     }
+  if (cfg->auth_ibs)
+    cry_set_ibs (&cry_ctx, cfg->ibs_mpk, cfg->ibs_sk);
   int fd = socket (AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     {

@@ -83,15 +83,18 @@ cry_enc_cnt_key (const uint8_t key[32], const uint8_t sid[CRY_NONCE_SID_SZ],
 }
 
 int
-cry_init (Cry *s, const uint8_t psk[32])
+cry_init (Cry *s, const uint8_t psk[32], bool auth_ibs)
 {
   if (sodium_init () < 0)
     return -1;
   int has_aesni = sodium_runtime_has_aesni ();
   int has_pclmul = sodium_runtime_has_pclmul ();
   int has_avx = sodium_runtime_has_avx ();
-  s->auth_ibs = false;
-  memcpy (s->key, psk, 32);
+  s->auth_ibs = auth_ibs;
+  if (auth_ibs)
+    randombytes_buf (s->key, sizeof (s->key));
+  else
+    memcpy (s->key, psk, sizeof (s->key));
   atomic_store_explicit (&s->cnt, 1, memory_order_relaxed);
   randombytes_buf (s->n_sid, CRY_NONCE_SID_SZ);
   randombytes_buf (s->kx_sk, CRY_KX_SEC_SZ);
@@ -113,6 +116,12 @@ cry_set_ibs (Cry *s, const uint8_t mpk[96], const uint8_t sk[48])
   s->auth_ibs = true;
   memcpy (s->ibs_mpk, mpk, IBS_MPK_SZ);
   memcpy (s->ibs_sk, sk, IBS_SK_SZ);
+  uint8_t seed[16 + IBS_MPK_SZ + IBS_SK_SZ];
+  memcpy (seed, "nmesh-ibs-local", 16);
+  memcpy (seed + 16U, mpk, IBS_MPK_SZ);
+  memcpy (seed + 16U + IBS_MPK_SZ, sk, IBS_SK_SZ);
+  crypto_generichash (s->key, sizeof (s->key), seed, sizeof (seed), NULL, 0);
+  sodium_memzero (seed, sizeof (seed));
 }
 
 void
@@ -165,6 +174,8 @@ cry_peer_rekey (Cry *s, const uint8_t our_lla[16],
   uint8_t high_to_low[32];
   uint8_t low_to_high_sid[CRY_NONCE_SID_SZ];
   uint8_t high_to_low_sid[CRY_NONCE_SID_SZ];
+  const uint8_t *kdf_key = s->auth_ibs ? NULL : s->key;
+  size_t kdf_key_len = s->auth_ibs ? 0 : sizeof (s->key);
   seed[0] = 4;
   memcpy (seed + 1U, shared, sizeof (shared));
   memcpy (seed + 1U + sizeof (shared), low_lla, 16);
@@ -173,16 +184,16 @@ cry_peer_rekey (Cry *s, const uint8_t our_lla[16],
   memcpy (seed + 1U + sizeof (shared) + 32U + CRY_KX_PUB_SZ, high_pk,
           CRY_KX_PUB_SZ);
   crypto_generichash (low_to_high, sizeof (low_to_high), seed, sizeof (seed),
-                      s->key, sizeof (s->key));
+                      kdf_key, kdf_key_len);
   seed[0] = 5;
   crypto_generichash (high_to_low, sizeof (high_to_low), seed, sizeof (seed),
-                      s->key, sizeof (s->key));
+                      kdf_key, kdf_key_len);
   seed[0] = 6;
   crypto_generichash (low_to_high_sid, sizeof (low_to_high_sid), seed,
-                      sizeof (seed), s->key, sizeof (s->key));
+                      sizeof (seed), kdf_key, kdf_key_len);
   seed[0] = 7;
   crypto_generichash (high_to_low_sid, sizeof (high_to_low_sid), seed,
-                      sizeof (seed), s->key, sizeof (s->key));
+                      sizeof (seed), kdf_key, kdf_key_len);
 
   pthread_mutex_lock (&s->mtx);
   CryPeer *p = cry_peer_get_locked (s, peer_lla);

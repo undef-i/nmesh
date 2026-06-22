@@ -63,7 +63,8 @@ int pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
 int pkt_dec_from (Cry *s, const uint8_t src_lla[16], uint8_t *raw,
                   size_t raw_len, uint8_t *pt_buf, size_t pt_len,
                   PktHdr *hdr_out, uint8_t **pt_out, size_t *pt_len_out,
-                  bool *used_psk, uint8_t matched_lla[16]);
+                  bool allow_psk_fallback, bool *used_psk,
+                  uint8_t matched_lla[16]);
 int gsp_prs_mtu_prb (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
                      uint16_t *probe_mtu);
 int gsp_prs_mtu_ack (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,

@@ -41,7 +41,7 @@ typedef struct
   uint8_t ibs_sk[48];
 } Cry;
 
-int cry_init (Cry *s, const uint8_t psk[32]);
+int cry_init (Cry *s, const uint8_t psk[32], bool auth_ibs);
 void cry_set_ibs (Cry *s, const uint8_t mpk[96], const uint8_t sk[48]);
 void cry_free (Cry *s);
 uint64_t cry_cnt_take (Cry *s, uint64_t n);
