@@ -6,12 +6,22 @@
 #include <stddef.h>
 #include <stdint.h>
 #define GSP_MAX 64
+#define IBS_PING_PL_SZ (PING_PL_SZ + CRY_KX_PUB_SZ + 16)
+#define IBS_PONG_PL_SZ (PONG_PL_SZ + CRY_KX_PUB_SZ + 16)
 uint8_t *ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                    uint64_t ts, uint64_t sid, uint64_t prb_tok, uint8_t *buf,
                    size_t *out_len);
 uint8_t *pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                    uint64_t o_ts, uint64_t sid, uint64_t rx_ts,
                    uint64_t prb_tok, uint8_t *buf, size_t *out_len);
+uint8_t *ibs_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
+                       uint64_t ts, uint64_t sid, uint64_t prb_tok,
+                       const uint8_t our_ip[16], uint8_t *buf,
+                       size_t *out_len);
+uint8_t *ibs_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
+                       uint64_t o_ts, uint64_t sid, uint64_t rx_ts,
+                       uint64_t prb_tok, const uint8_t our_ip[16],
+                       uint8_t *buf, size_t *out_len);
 uint8_t *gsp_bld (Cry *s, Rt *rt, int s_off,
                   const uint8_t our_lla[16], bool self_dir_ok,
                   bool dst_no_dir, const uint8_t dst_lla[16], uint8_t *buf,

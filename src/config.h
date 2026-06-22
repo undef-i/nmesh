@@ -78,6 +78,9 @@ typedef struct
   P2pMode p2p;
   TapMode tap_mode;
   uint8_t psk[32];
+  uint8_t ibs_mpk[96];
+  uint8_t ibs_sk[48];
+  bool auth_ibs;
 } Cfg;
 
 typedef struct

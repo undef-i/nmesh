@@ -579,6 +579,41 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
                           &res_arr[i].hdr, &res_arr[i].pt,
                           &res_arr[i].pt_len, &res_arr[i].used_psk,
                           res_arr[i].peer_lla);
+      if (res_arr[i].dec_res != 0 && cry_ctx->auth_ibs
+          && raw_len >= PKT_CH_SZ + IBS_SIG_SZ)
+        {
+          uint8_t *raw_buf = pkt_arr[i].data;
+          uint8_t raw_hdr_type
+              = (uint8_t)(raw_buf[0] & PKT_TF_TYPE_MASK);
+          if (raw_hdr_type == PT_IBS_PING || raw_hdr_type == PT_IBS_PONG)
+            {
+              size_t pl_sz = (raw_hdr_type == PT_IBS_PING)
+                                 ? IBS_PING_PL_SZ
+                                 : IBS_PONG_PL_SZ;
+              if (raw_len >= PKT_CH_SZ + pl_sz + IBS_SIG_SZ)
+                {
+                  const uint8_t *pl = raw_buf + PKT_CH_SZ;
+                  const uint8_t *peer_lla = pl + 16;
+                  const uint8_t *sig
+                      = raw_buf + PKT_CH_SZ + pl_sz;
+                  if (ibs_verify (cry_ctx->ibs_mpk, peer_lla, 16,
+                                  pl, pl_sz, sig))
+                    {
+                      res_arr[i].hdr.pkt_type = (raw_hdr_type
+                                                  == PT_IBS_PING)
+                                                    ? PT_PING
+                                                    : PT_PONG;
+                      res_arr[i].hdr.rel_f = 0;
+                      res_arr[i].hdr.hop_c = raw_buf[1];
+                      res_arr[i].pt = raw_buf + PKT_CH_SZ;
+                      res_arr[i].pt_len = pl_sz;
+                      res_arr[i].dec_res = 0;
+                      memcpy (res_arr[i].peer_lla, peer_lla, 16);
+                      res_arr[i].has_peer_lla = IS_LLA_VAL (peer_lla);
+                    }
+                }
+            }
+        }
       if (res_arr[i].dec_res != 0)
         continue;
       res_arr[i].has_peer_lla = IS_LLA_VAL (res_arr[i].peer_lla);
@@ -768,7 +803,11 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
   size_t p_len = 0;
   uint64_t p_ts = sys_ts ();
   uint64_t p_tok = ((uint64_t)u32_rnd () << 32) | (uint64_t)u32_rnd ();
-  ping_bld (cry_ctx, cfg->addr, cfg->port, p_ts, sid, p_tok, p_buf, &p_len);
+  if (cry_ctx->auth_ibs)
+    ibs_ping_bld (cry_ctx, cfg->addr, cfg->port, p_ts, sid, p_tok,
+                  cfg->addr, p_buf, &p_len);
+  else
+    ping_bld (cry_ctx, cfg->addr, cfg->port, p_ts, sid, p_tok, p_buf, &p_len);
   if (tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, p_buf, p_len))
     {
       ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port, ts);
@@ -1444,6 +1483,8 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
 
   Cry cry_ctx;
   cry_init (&cry_ctx, cfg.psk);
+  if (cfg.auth_ibs)
+    cry_set_ibs (&cry_ctx, cfg.ibs_mpk, cfg.ibs_sk);
   bool cry_inited = true;
   tap_stl_rm (cfg.ifname);
   tap_fd = tap_init (cfg.ifname);
@@ -3866,8 +3907,12 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           {
             static uint8_t pong_buf[UDP_PL_MAX];
             size_t pong_len = 0;
-            pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts, prb_tok,
-                      pong_buf, &pong_len);
+            if (cry_ctx->auth_ibs)
+              ibs_pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts,
+                            prb_tok, cfg->addr, pong_buf, &pong_len);
+            else
+              pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts,
+                        prb_tok, pong_buf, &pong_len);
             (void)ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL,
                               src_port, pong_buf, pong_len);
             break;
@@ -3886,8 +3931,12 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           pp_add (pool, src_ip, src_port);
         static uint8_t pong_buf[UDP_PL_MAX];
         size_t pong_len = 0;
-        pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts, prb_tok,
-                  pong_buf, &pong_len);
+        if (cry_ctx->auth_ibs)
+          ibs_pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts,
+                        prb_tok, cfg->addr, pong_buf, &pong_len);
+        else
+          pong_bld (cry_ctx, cfg->addr, cfg->port, req_ts, sid, ts, prb_tok,
+                    pong_buf, &pong_len);
         if (ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL, src_port,
                        pong_buf, pong_len))
           ctrl_tx_mark (rt, &rt->pong_tx_cnt, pong_len,

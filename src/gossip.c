@@ -1,5 +1,6 @@
 #include "gossip.h"
 #include "bogon.h"
+#include "ibs.h"
 #include "packet.h"
 #include "tcp.h"
 #include <arpa/inet.h>
@@ -331,6 +332,84 @@ pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port, uint64_t o_ts,
   uint8_t hdr[PKT_CH_SZ];
   hdr_bld (PT_PONG, 0, 32, hdr);
   return pkt_enc_psk (s, hdr, payload, sizeof (payload), buf, out_len);
+}
+
+#define IBS_PING_PL_SZ (PING_KX_PL_SZ + 16)
+
+uint8_t *
+ibs_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
+              uint64_t ts, uint64_t sid, uint64_t prb_tok,
+              const uint8_t our_ip[16], uint8_t *buf, size_t *out_len)
+{
+  if (!s || !buf || !out_len || !s->auth_ibs)
+    {
+      if (out_len)
+        *out_len = 0;
+      return NULL;
+    }
+  uint8_t payload[IBS_PING_PL_SZ];
+  u64_wr (payload, ts);
+  u64_wr (payload + 8, sid);
+  memcpy (payload + 16, our_lla, 16);
+  u16_wr (payload + 32, our_port);
+  u64_wr (payload + 34, prb_tok);
+  memcpy (payload + PING_PL_SZ, cry_kx_pub (s), CRY_KX_PUB_SZ);
+  memcpy (payload + PING_KX_PL_SZ, our_ip, 16);
+  uint8_t sig[IBS_SIG_SZ];
+  if (!ibs_sign (s->ibs_sk, our_lla, 16, payload, sizeof (payload), sig))
+    {
+      if (out_len)
+        *out_len = 0;
+      return NULL;
+    }
+  uint8_t hdr[PKT_CH_SZ];
+  hdr_bld (PT_IBS_PING, 0, 32, hdr);
+  uint8_t *out = buf;
+  memcpy (out, hdr, PKT_CH_SZ);
+  memcpy (out + PKT_CH_SZ, payload, sizeof (payload));
+  memcpy (out + PKT_CH_SZ + sizeof (payload), sig, IBS_SIG_SZ);
+  *out_len = PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ;
+  return out;
+}
+
+#define IBS_PONG_PL_SZ (PONG_KX_PL_SZ + 16)
+
+uint8_t *
+ibs_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
+              uint64_t o_ts, uint64_t sid, uint64_t rx_ts,
+              uint64_t prb_tok, const uint8_t our_ip[16],
+              uint8_t *buf, size_t *out_len)
+{
+  if (!s || !buf || !out_len || !s->auth_ibs)
+    {
+      if (out_len)
+        *out_len = 0;
+      return NULL;
+    }
+  uint8_t payload[IBS_PONG_PL_SZ];
+  u64_wr (payload, o_ts);
+  u64_wr (payload + 8, sid);
+  memcpy (payload + 16, our_lla, 16);
+  u16_wr (payload + 32, our_port);
+  u64_wr (payload + 34, rx_ts);
+  u64_wr (payload + 42, prb_tok);
+  memcpy (payload + PONG_PL_SZ, cry_kx_pub (s), CRY_KX_PUB_SZ);
+  memcpy (payload + PONG_KX_PL_SZ, our_ip, 16);
+  uint8_t sig[IBS_SIG_SZ];
+  if (!ibs_sign (s->ibs_sk, our_lla, 16, payload, sizeof (payload), sig))
+    {
+      if (out_len)
+        *out_len = 0;
+      return NULL;
+    }
+  uint8_t hdr[PKT_CH_SZ];
+  hdr_bld (PT_IBS_PONG, 0, 32, hdr);
+  uint8_t *out = buf;
+  memcpy (out, hdr, PKT_CH_SZ);
+  memcpy (out + PKT_CH_SZ, payload, sizeof (payload));
+  memcpy (out + PKT_CH_SZ + sizeof (payload), sig, IBS_SIG_SZ);
+  *out_len = PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ;
+  return out;
 }
 
 static void

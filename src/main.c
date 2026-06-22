@@ -1159,7 +1159,7 @@ status_query_run (const Cfg *cfg)
   if (!cfg)
     return 1;
   Cry cry_ctx;
-  if (cry_init (&cry_ctx, cfg->psk) != 0)
+  if (cry_init (&cry_ctx, cfg) != 0)
     {
       fprintf (stderr, "status: failed to init crypto\n");
       return 1;

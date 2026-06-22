@@ -1,4 +1,6 @@
 #pragma once
+#include "config.h"
+#include "ibs.h"
 #include "packet.h"
 #include <stdbool.h>
 #include <pthread.h>
@@ -34,9 +36,13 @@ typedef struct
   uint32_t peer_cap;
   pthread_mutex_t mtx;
   _Atomic uint64_t cnt;
+  bool auth_ibs;
+  uint8_t ibs_mpk[96];
+  uint8_t ibs_sk[48];
 } Cry;
 
 int cry_init (Cry *s, const uint8_t psk[32]);
+void cry_set_ibs (Cry *s, const uint8_t mpk[96], const uint8_t sk[48]);
 void cry_free (Cry *s);
 uint64_t cry_cnt_take (Cry *s, uint64_t n);
 const uint8_t *cry_kx_pub (Cry *s);

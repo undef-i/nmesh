@@ -12,6 +12,8 @@
 #define PT_MTU_ACK 9
 #define PT_STAT_REQ 10
 #define PT_STAT_RSP 11
+#define PT_IBS_PING 12
+#define PT_IBS_PONG 13
 
 typedef struct __attribute__ ((packed))
 {

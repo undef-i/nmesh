@@ -90,6 +90,7 @@ cry_init (Cry *s, const uint8_t psk[32])
   int has_aesni = sodium_runtime_has_aesni ();
   int has_pclmul = sodium_runtime_has_pclmul ();
   int has_avx = sodium_runtime_has_avx ();
+  s->auth_ibs = false;
   memcpy (s->key, psk, 32);
   atomic_store_explicit (&s->cnt, 1, memory_order_relaxed);
   randombytes_buf (s->n_sid, CRY_NONCE_SID_SZ);
@@ -102,6 +103,16 @@ cry_init (Cry *s, const uint8_t psk[32])
   fprintf (stderr, "crypto: aead=aegis128l aesni=%d pclmul=%d avx=%d\n",
            has_aesni, has_pclmul, has_avx);
   return 0;
+}
+
+void
+cry_set_ibs (Cry *s, const uint8_t mpk[96], const uint8_t sk[48])
+{
+  if (!s || !mpk || !sk)
+    return;
+  s->auth_ibs = true;
+  memcpy (s->ibs_mpk, mpk, IBS_MPK_SZ);
+  memcpy (s->ibs_sk, sk, IBS_SK_SZ);
 }
 
 void

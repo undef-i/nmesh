@@ -1,5 +1,6 @@
 #include "config.h"
 #include "bogon.h"
+#include "ibs.h"
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -610,6 +611,36 @@ cfg_load (const char *path, Cfg *cfg)
               return -1;
             }
         }
+      else if (strcmp (k, "auth") == 0)
+        {
+          cfg->auth_ibs = (strcmp (v, "ibs") == 0);
+        }
+      else if (strcmp (k, "ibs_mpk") == 0)
+        {
+          if (strlen (v) != IBS_MPK_SZ * 2)
+            { cfg_free (cfg); free (line); fclose (fp); return -1; }
+          for (size_t i = 0; i < IBS_MPK_SZ; i++)
+            {
+              int hi = char_to_hex (v[i * 2]);
+              int lo = char_to_hex (v[i * 2 + 1]);
+              if (hi < 0 || lo < 0)
+                { cfg_free (cfg); free (line); fclose (fp); return -1; }
+              cfg->ibs_mpk[i] = (uint8_t)((hi << 4) | lo);
+            }
+        }
+      else if (strcmp (k, "ibs_sk") == 0)
+        {
+          if (strlen (v) != IBS_SK_SZ * 2)
+            { cfg_free (cfg); free (line); fclose (fp); return -1; }
+          for (size_t i = 0; i < IBS_SK_SZ; i++)
+            {
+              int hi = char_to_hex (v[i * 2]);
+              int lo = char_to_hex (v[i * 2 + 1]);
+              if (hi < 0 || lo < 0)
+                { cfg_free (cfg); free (line); fclose (fp); return -1; }
+              cfg->ibs_sk[i] = (uint8_t)((hi << 4) | lo);
+            }
+        }
     }
   free (line);
   fclose (fp);
@@ -620,7 +651,18 @@ cfg_load (const char *path, Cfg *cfg)
       return -1;
     }
   uint8_t z32[32] = { 0 };
-  if (memcmp (cfg->psk, z32, 32) == 0)
+  if (cfg->auth_ibs)
+    {
+      uint8_t z_mpk[IBS_MPK_SZ] = { 0 };
+      uint8_t z_sk[IBS_SK_SZ] = { 0 };
+      if (memcmp (cfg->ibs_mpk, z_mpk, IBS_MPK_SZ) == 0
+          || memcmp (cfg->ibs_sk, z_sk, IBS_SK_SZ) == 0)
+        {
+          cfg_free (cfg);
+          return -1;
+        }
+    }
+  else if (memcmp (cfg->psk, z32, 32) == 0)
     {
       cfg_free (cfg);
       return -1;

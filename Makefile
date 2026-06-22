@@ -21,8 +21,8 @@ CFLAGS_BASE = -std=gnu11 -Wall -Wextra -pthread -Iext/uthash/src \
 		-DHAVE_WMMINTRIN_H -DHAVE_IMMINTRIN_H -DHAVE_TI_MODE -DHAVE_GETXBV \
 		-DHAVE_PCLMUL_INTRIN -DHAVE_AVX_INTRIN -DHAVE_ADXINTRIN_H -DHAVE_RDRAND
 
-CFLAGS_APP = $(CFLAGS_BASE) -Isrc -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium
-CFLAGS_LIB = $(CFLAGS_BASE) -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium
+CFLAGS_APP = $(CFLAGS_BASE) -Isrc -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium -Iext/blst/bindings
+CFLAGS_LIB = $(CFLAGS_BASE) -I$(LIBSODIUM_INC) -I$(LIBSODIUM_INC)/sodium -Iext/blst/bindings
 CFLAGS_DEP = -MMD -MP
 
 LDFLAGS_COMMON = -static -pthread
@@ -48,10 +48,10 @@ release: $(BUILD_DIR)/release/$(TARGET_NAME)
 debug: $(BUILD_DIR)/debug/$(TARGET_NAME)
 
 $(BUILD_DIR)/release/$(TARGET_NAME): $(OBJS_REL)
-	$(CC) $(OBJS_REL) -o $@ $(LDFLAGS_COMMON) $(LDFLAGS_RELEASE)
+	$(CC) $(OBJS_REL) ext/blst/libblst.a -o $@ $(LDFLAGS_COMMON) $(LDFLAGS_RELEASE)
 
 $(BUILD_DIR)/debug/$(TARGET_NAME): $(OBJS_DBG)
-	$(CC) $(OBJS_DBG) -o $@ $(LDFLAGS_COMMON) $(LDFLAGS_DEBUG)
+	$(CC) $(OBJS_DBG) ext/blst/libblst.a -o $@ $(LDFLAGS_COMMON) $(LDFLAGS_DEBUG)
 
 $(BUILD_DIR)/release/src/%.o: src/%.c
 	@mkdir -p $(dir $@)
