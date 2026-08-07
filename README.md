@@ -1,5 +1,5 @@
 # nmesh
-A simple, high-performance decentralized VPN.
+A decentralized VPN.
 
 ## Build
 
@@ -58,21 +58,6 @@ peer = 203.0.113.1:50000
 sudo ./build/release/nmesh -c nmesh.conf
 
 ```
-
-## Performance
-
-|  | UDP (Gbps) | TCP (Gbps) |
-| --- | --- | --- |
-| nmesh | 3.263 | 8.517 |
-| nebula 1.10.3 | 1.543 | 1.263 |
-| wireguard-go v0.0.20250522 | 0.880 | 6.533 |
-
-Local environment:
-
-- Linux `6.6.123.2-microsoft-standard-WSL2+` on `x86_64`
-- CPU: AMD Ryzen 9 7940HX with Radeon Graphics
-
-These numbers are a point-in-time local reference, not a portability claim.
 
 
 ## Planned Features
