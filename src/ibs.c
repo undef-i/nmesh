@@ -72,12 +72,28 @@ ibs_sign (const uint8_t sk[IBS_SK_SZ], const uint8_t *id,
   if (blst_p1_uncompress (&sk_aff, sk) != 0)
     return false;
 
+  /* r = BLAKE2b-512("nmesh-ibs-r-v1" || sk || msg || ctr) mod r,
+     ctr counting up from 0 while the result is zero (RFC 6979). */
   blst_scalar r;
-  {
-    uint8_t r_buf[IBS_MSK_SZ];
-    randombytes_buf (r_buf, sizeof (r_buf));
-    blst_scalar_from_be_bytes (&r, r_buf, sizeof (r_buf));
-  }
+  for (uint32_t ctr = 0;; ctr++)
+    {
+      unsigned char hash[64];
+      crypto_generichash_state st;
+      crypto_generichash_init (&st, NULL, 0, sizeof (hash));
+      crypto_generichash_update (&st, (const uint8_t *)"nmesh-ibs-r-v1",
+                                 sizeof ("nmesh-ibs-r-v1") - 1);
+      crypto_generichash_update (&st, sk, IBS_SK_SZ);
+      crypto_generichash_update (&st, msg, msg_len);
+      {
+        uint8_t cb[4] = { (uint8_t)ctr, (uint8_t)(ctr >> 8),
+                          (uint8_t)(ctr >> 16), (uint8_t)(ctr >> 24) };
+        crypto_generichash_update (&st, cb, sizeof (cb));
+      }
+      crypto_generichash_final (&st, hash, sizeof (hash));
+      blst_scalar_from_be_bytes (&r, hash, sizeof (hash));
+      if (blst_sk_check (&r))
+        break;
+    }
 
   /* U = r * Q_ID */
   blst_p1 Q;

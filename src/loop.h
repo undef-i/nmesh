@@ -68,8 +68,9 @@ bool tap_frame_tx (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt,
 bool tap_frame_flush (Udp *udp);
 void on_tap (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
              uint64_t sid, uint64_t now);
+struct Adv;
 void on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-             uint64_t sid, PPool *pool);
+             uint64_t sid, PPool *pool, struct Adv *adv);
 void on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
              uint16_t act_port, uint64_t sid, PPool *pool);
 size_t status_buf_bld (char *buf, size_t cap, Rt *rt, const Cfg *cfg,
@@ -78,7 +79,7 @@ void status_fd_emit (int fd, Rt *rt, const Cfg *cfg, PPool *pool);
 void on_std (int fd, Rt *rt, const Cfg *cfg, PPool *pool);
 void tty_raw (void);
 void cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
-                       const char *cfg_path, uint64_t ts);
-void gsp_dirty_flush (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg);
+                       const char *cfg_path, uint64_t ts,
+                       pthread_rwlock_t *snap_lk);
 int loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
               bool daemon_child, LoopReadyFn ready_fn, void *ready_arg);

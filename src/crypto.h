@@ -39,6 +39,7 @@ typedef struct
   bool auth_ibs;
   uint8_t ibs_mpk[96];
   uint8_t ibs_sk[48];
+  uint8_t ibs_ckie_key[IBS_CKIE_SZ];
 } Cry;
 
 int cry_init (Cry *s, const uint8_t psk[32], bool auth_ibs);

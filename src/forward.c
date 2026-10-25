@@ -1,6 +1,7 @@
 #include "forward.h"
 #include "frag.h"
-#include "gossip.h"
+#include "nbr.h"
+#include "pkt.h"
 #include "mss.h"
 #include "packet.h"
 #include "tcp.h"
@@ -218,13 +219,17 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
           size_t chunk_len = vnet_len - off;
           if (chunk_len > chunk_max)
             chunk_len = chunk_max;
+          bool mf = (off + chunk_len) < vnet_len;
+          if (mf)
+            chunk_len &= ~(size_t)(FRAG_OFF_UNIT - 1U);
+          if (chunk_len == 0)
+            return false;
           uint8_t *chunk_dst
               = relay_vnet_buf + TAP_HR + PKT_HDR_SZ + sizeof (FragHdr) + 4U;
           memcpy (chunk_dst, relay_vnet + off, chunk_len);
           size_t out_len = 0;
-          bool mf = (off + chunk_len) < vnet_len;
           uint8_t *out_ptr
-              = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, (uint16_t)off,
+              = frag_bld_zc (cry_ctx, chunk_dst, chunk_len, mid, off,
                              mf, 1, dst_tail, hop_c,
                              has_tx_lla ? tx_lla : NULL, &out_len);
           if (!out_ptr || out_len == 0)
@@ -255,7 +260,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
 bool
 relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-                const uint8_t dest_lla[16], uint32_t mid, uint16_t frag_off,
+                const uint8_t dest_lla[16], uint32_t mid, uint32_t frag_off,
                 bool mf_in, const uint8_t *chunk, size_t chunk_len,
                 uint8_t hop_c, uint64_t ts, const uint8_t s_ip[16],
                 uint16_t s_port)
@@ -306,13 +311,17 @@ relay_fwd_frag (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       size_t sub_len = chunk_len - sub_off;
       if (sub_len > chunk_max)
         sub_len = chunk_max;
-      uint32_t abs_off = (uint32_t)frag_off + (uint32_t)sub_off;
-      memcpy (chunk_dst_base, chunk + sub_off, sub_len);
-      size_t out_len = 0;
       bool is_last_sub = (sub_off + sub_len) == chunk_len;
       bool mf_out = mf_in || !is_last_sub;
+      if (mf_out)
+        sub_len &= ~(size_t)(FRAG_OFF_UNIT - 1U);
+      if (sub_len == 0)
+        return false;
+      uint32_t abs_off = frag_off + (uint32_t)sub_off;
+      memcpy (chunk_dst_base, chunk + sub_off, sub_len);
+      size_t out_len = 0;
       uint8_t *out_ptr = frag_bld_zc (cry_ctx, chunk_dst_base, sub_len, mid,
-                                      (uint16_t)abs_off, mf_out, 1, dst_tail,
+                                      abs_off, mf_out, 1, dst_tail,
                                       hop_c, has_tx_lla ? tx_lla : NULL,
                                       &out_len);
       if (!out_ptr || out_len == 0)

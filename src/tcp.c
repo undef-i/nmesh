@@ -1,5 +1,6 @@
 #include "tcp.h"
-#include "gossip.h"
+#include "nbr.h"
+#include "pkt.h"
 #include "packet.h"
 #include "replay.h"
 #include "utils.h"
@@ -1857,8 +1858,8 @@ tp_conn_auth_finish (TpRt *tp, int epfd, TpConn *conn, Rt *rt,
       conn->route_port = peer_port;
     }
   uint64_t now = sys_ts ();
-  if (rt && rt_peer_sess (rt, peer_lla, peer_sid, now))
-    rx_rp_rst_lla (rt, peer_lla);
+  if (rt)
+    (void)rt_peer_sess (rt, peer_lla, peer_sid, now);
   if (rt && conn->route_port != 0 && !tp_ip_is_zero (conn->route_ip))
     rt_ep_upd (rt, peer_lla, conn->route_ip, conn->route_port, TP_MASK_TCP,
                now);
@@ -2560,6 +2561,12 @@ tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg)
           tp_conn_close (tp, g_tp_epfd, conn);
           continue;
         }
+      if (!conn->auth && now > conn->ts
+          && (now - conn->ts) > TP_CONN_TMO)
+        {
+          tp_conn_close (tp, g_tp_epfd, conn);
+          continue;
+        }
       if (conn->auth && rt && cfg && conn->route_port != 0
           && (!tp_mask_has (cfg->tp_mask, TP_PROTO_TCP)
               || !tp_mask_has (rt_ep_tp_mask (rt, conn->route_ip,
@@ -2593,6 +2600,18 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
           return;
         }
       tp_fd_cfg (fd);
+      uint32_t preauth = 0;
+      for (uint32_t i = 0; i < tp->conn_cap; i++)
+        {
+          TpConn *pre = tp->conn_arr[i];
+          if (pre && pre->fd >= 0 && pre->inbound && !pre->auth)
+            preauth++;
+        }
+      if (preauth >= TP_PREAUTH_MAX)
+        {
+          close (fd);
+          continue;
+        }
       TpConn *conn = tp_conn_alloc (tp);
       if (!conn)
         {

@@ -441,24 +441,3 @@ rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ])
   rx_rp_map_set (slot->map, cnt);
   return true;
 }
-
-void
-rx_rp_rst_ep (const uint8_t ip[16], uint16_t port)
-{
-  (void)ip;
-  (void)port;
-}
-
-void
-rx_rp_rst_lla (Rt *rt, const uint8_t lla[16])
-{
-  if (!rt || !lla)
-    return;
-  for (uint32_t i = 0; i < rt->cnt; i++)
-    {
-      Re *re = &rt->re_arr[i];
-      if (memcmp (re->lla, lla, 16) != 0)
-        continue;
-      rx_rp_rst_ep (re->ep_ip, re->ep_port);
-    }
-}

@@ -41,16 +41,68 @@
 static bool g_tap_udp_gso = false;
 
 static int
-tap_cmd_run (const char *cmd, const char *what, const char *name)
+tap_ip_run (char *const argv[], const char *what, const char *name,
+            char *out, size_t out_cap)
 {
-  int rc = system (cmd);
-  if (rc == 0)
+  int pipefd[2] = { -1, -1 };
+  if (out && pipe (pipefd) != 0)
+    return -1;
+  pid_t pid = fork ();
+  if (pid < 0)
+    {
+      if (pipefd[0] >= 0)
+        {
+          close (pipefd[0]);
+          close (pipefd[1]);
+        }
+      return -1;
+    }
+  if (pid == 0)
+    {
+      if (out)
+        {
+          close (pipefd[0]);
+          if (dup2 (pipefd[1], STDOUT_FILENO) < 0)
+            _exit (127);
+          close (pipefd[1]);
+        }
+      execvp (argv[0], argv);
+      _exit (127);
+    }
+  if (out)
+    {
+      close (pipefd[1]);
+      size_t used = 0;
+      ssize_t r;
+      char buf[256];
+      while ((r = read (pipefd[0], buf, sizeof (buf))) > 0)
+        {
+          if (out_cap > 0 && used < out_cap - 1)
+            {
+              size_t take = (size_t)r;
+              if (take > out_cap - 1 - used)
+                take = out_cap - 1 - used;
+              memcpy (out + used, buf, take);
+              used += take;
+            }
+        }
+      close (pipefd[0]);
+      if (out_cap > 0)
+        out[used] = '\0';
+    }
+  int status = 0;
+  if (waitpid (pid, &status, 0) < 0)
+    return -1;
+  if (WIFEXITED (status) && WEXITSTATUS (status) == 0)
     return 0;
-  if (WIFEXITED (rc))
-    fprintf (stderr, "tap: %s failed for %s (exit=%d)\n", what, name,
-             WEXITSTATUS (rc));
-  else
-    fprintf (stderr, "tap: %s failed for %s\n", what, name);
+  if (what)
+    {
+      if (WIFEXITED (status))
+        fprintf (stderr, "tap: %s failed for %s (exit=%d)\n", what, name,
+                 WEXITSTATUS (status));
+      else
+        fprintf (stderr, "tap: %s failed for %s\n", what, name);
+    }
   return -1;
 }
 
@@ -80,25 +132,19 @@ tap_udp_gso_ok (void)
 void
 tap_stl_rm (const char *name)
 {
-  char chk_cmd[256];
-  snprintf (chk_cmd, sizeof (chk_cmd),
-            "ip -6 addr show dev %s 2>/dev/null | grep -Eq "
-            "'dadfailed|tentative'",
-            name);
-  int rc = system (chk_cmd);
-  if (rc != 0)
+  char out[1024];
+  char *show_argv[]
+      = { "ip", "-6", "addr", "show", "dev", (char *)name, NULL };
+  if (tap_ip_run (show_argv, NULL, name, out, sizeof (out)) != 0)
     return;
-  char cmd[256];
-  snprintf (cmd, sizeof (cmd), "ip link set dev %s down", name);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to set link %s down\n", name);
-    }
-  snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
-  if (system (cmd) < 0)
-    {
-      fprintf (stderr, "tap: failed to flush addresses for %s\n", name);
-    }
+  if (!strstr (out, "dadfailed") && !strstr (out, "tentative"))
+    return;
+  char *down_argv[]
+      = { "ip", "link", "set", "dev", (char *)name, "down", NULL };
+  (void)tap_ip_run (down_argv, "set link down", name, NULL, 0);
+  char *flush_argv[] = { "ip",  "-6",   "addr", "flush", "dev",
+                         (char *)name, "scope", "link", NULL };
+  (void)tap_ip_run (flush_argv, "flush addresses", name, NULL, 0);
 }
 
 void
@@ -106,13 +152,14 @@ tap_iface_cleanup (const char *name)
 {
   if (!name || !name[0] || if_nametoindex (name) == 0)
     return;
-  char cmd[256];
-  snprintf (cmd, sizeof (cmd), "ip link set dev %s down", name);
-  (void)tap_cmd_run (cmd, "set link down", name);
-  snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
-  (void)tap_cmd_run (cmd, "flush addresses", name);
-  snprintf (cmd, sizeof (cmd), "ip link del dev %s", name);
-  (void)tap_cmd_run (cmd, "delete link", name);
+  char *down_argv[]
+      = { "ip", "link", "set", "dev", (char *)name, "down", NULL };
+  (void)tap_ip_run (down_argv, "set link down", name, NULL, 0);
+  char *flush_argv[] = { "ip",  "-6",   "addr", "flush", "dev",
+                         (char *)name, "scope", "link", NULL };
+  (void)tap_ip_run (flush_argv, "flush addresses", name, NULL, 0);
+  char *del_argv[] = { "ip", "link", "del", "dev", (char *)name, NULL };
+  (void)tap_ip_run (del_argv, "delete link", name, NULL, 0);
 }
 
 int
@@ -165,9 +212,9 @@ tap_init (const char *name)
   }
   tap_txq_set (name);
   {
-    char cmd[256];
-    snprintf (cmd, sizeof (cmd), "ip link set dev %s up", name);
-    if (tap_cmd_run (cmd, "set link up", name) != 0)
+    char *up_argv[]
+        = { "ip", "link", "set", "dev", (char *)name, "up", NULL };
+    if (tap_ip_run (up_argv, "set link up", name, NULL, 0) != 0)
       {
         close (fd);
         return -1;
@@ -192,24 +239,28 @@ tap_addr_set (const char *name, const uint8_t lla[16])
             lla[15]);
   uint8_t mac[6];
   lla_to_mac (lla, mac);
-  char cmd[256];
-  snprintf (cmd, sizeof (cmd),
-            "ip link set dev %s address %02x:%02x:%02x:%02x:%02x:%02x", name,
+  char mac_str[24];
+  snprintf (mac_str, sizeof (mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  if (tap_cmd_run (cmd, "set address", name) != 0)
+  char *addr_argv[] = { "ip",   "link", "set",     "dev",
+                        (char *)name, "address", mac_str, NULL };
+  if (tap_ip_run (addr_argv, "set address", name, NULL, 0) != 0)
     return -1;
-  snprintf (cmd, sizeof (cmd), "ip link set dev %s multicast on", name);
-  if (tap_cmd_run (cmd, "enable multicast", name) != 0)
+  char *mc_argv[] = { "ip",   "link",      "set", "dev",
+                      (char *)name, "multicast", "on",  NULL };
+  if (tap_ip_run (mc_argv, "enable multicast", name, NULL, 0) != 0)
     return -1;
-  snprintf (cmd, sizeof (cmd), "ip link set dev %s addrgenmode none", name);
-  if (tap_cmd_run (cmd, "set addrgenmode", name) != 0)
+  char *ag_argv[] = { "ip",   "link", "set",        "dev",
+                      (char *)name, "addrgenmode", "none", NULL };
+  if (tap_ip_run (ag_argv, "set addrgenmode", name, NULL, 0) != 0)
     return -1;
-  snprintf (cmd, sizeof (cmd), "ip -6 addr flush dev %s scope link", name);
-  if (tap_cmd_run (cmd, "flush addresses", name) != 0)
+  char *flush_argv[] = { "ip",  "-6",   "addr", "flush", "dev",
+                         (char *)name, "scope", "link", NULL };
+  if (tap_ip_run (flush_argv, "flush addresses", name, NULL, 0) != 0)
     return -1;
-  snprintf (cmd, sizeof (cmd), "ip -6 addr add %s dev %s scope link", addr_str,
-            name);
-  if (tap_cmd_run (cmd, "add link-local address", name) != 0)
+  char *add_argv[] = { "ip",  "-6",     "addr",    "add",  addr_str,
+                       "dev", (char *)name, "scope", "link", NULL };
+  if (tap_ip_run (add_argv, "add link-local address", name, NULL, 0) != 0)
     return -1;
   return 0;
 }
@@ -221,10 +272,11 @@ tap_mtu_set (const char *name, uint16_t mtu)
     return -1;
   if (mtu < 128)
     mtu = 128;
-  char cmd[256];
-  snprintf (cmd, sizeof (cmd), "ip link set dev %s mtu %u", name,
-            (unsigned)mtu);
-  return tap_cmd_run (cmd, "set mtu", name);
+  char mtu_str[16];
+  snprintf (mtu_str, sizeof (mtu_str), "%u", (unsigned)mtu);
+  char *mtu_argv[] = { "ip",   "link", "set", "dev",
+                       (char *)name, "mtu",  mtu_str, NULL };
+  return tap_ip_run (mtu_argv, "set mtu", name, NULL, 0);
 }
 
 int

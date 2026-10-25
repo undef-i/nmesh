@@ -3,7 +3,7 @@
 #include "crypto.h"
 #include "forward.h"
 #include "frag.h"
-#include "gossip.h"
+#include "pkt.h"
 #include "gro.h"
 #include "loop.h"
 #include "mss.h"
@@ -819,17 +819,37 @@ supervisor_child_success (int st)
   return false;
 }
 
+#define SUP_START_BURST 5
+#define SUP_START_INTV_MS 10000ULL
+
 static void
 supervisor_run (const char *exe_path, const char *cfg_abs, int parent_ready_fd)
 {
   supervisor_sig_init ();
   start_stdio_detach ();
   uint64_t backoff_ms = 250;
+  uint64_t start_ts[SUP_START_BURST] = { 0 };
+  int start_n = 0;
   bool first = true;
   for (;;)
     {
       if (g_supervisor_stop)
         break;
+      uint64_t now_ms = sys_ts ();
+      int recent = 0;
+      for (int i = 0; i < start_n && i < SUP_START_BURST; i++)
+        if (start_ts[i] != 0 && now_ms >= start_ts[i]
+            && (now_ms - start_ts[i]) < SUP_START_INTV_MS)
+          recent++;
+      if (recent >= SUP_START_BURST)
+        {
+          fprintf (stderr,
+                   "main: supervisor: start limit reached (%d starts in "
+                   "%llu ms), not restarting\n",
+                   SUP_START_BURST,
+                   (unsigned long long)SUP_START_INTV_MS);
+          break;
+        }
       int child_ready[2] = { -1, -1 };
       int ready_fd = -1;
       if (first)
@@ -840,6 +860,11 @@ supervisor_run (const char *exe_path, const char *cfg_abs, int parent_ready_fd)
         }
       uint64_t start_ms = sys_ts ();
       pid_t child = supervisor_child_spawn (exe_path, cfg_abs, ready_fd);
+      if (child > 0)
+        {
+          start_ts[start_n % SUP_START_BURST] = start_ms;
+          start_n++;
+        }
       if (ready_fd >= 0)
         close (ready_fd);
       if (child_ready[1] >= 0)
@@ -1235,7 +1260,7 @@ status_query_run (const Cfg *cfg)
       uint64_t pkt_total = 0;
       const uint8_t *chunk = NULL;
       size_t chunk_len = 0;
-      if (gsp_prs_stat_rsp (pt, pt_len, &pkt_req_id, &off, &pkt_total, &chunk,
+      if (pkt_prs_stat_rsp (pt, pt_len, &pkt_req_id, &off, &pkt_total, &chunk,
                             &chunk_len)
           != 0)
         continue;

@@ -13,13 +13,14 @@
 #define TP_EV_CONN_BASE (1ULL << 32)
 #define TP_IDX_INV UINT32_MAX
 #define TP_CONN_CAP_INIT 512U
+#define TP_PREAUTH_MAX 10U
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
 #define TP_FLOW_IDLE_TMO (KA_TMO * 2ULL)
 #define TP_WIRE_SALT_SZ (CRY_NONCE_WIRE_SZ + sizeof (uint64_t))
-#define TP_WIRE_KEY_SZ crypto_aead_aegis128l_KEYBYTES
-#define TP_WIRE_NONCE_SZ crypto_aead_aegis128l_NPUBBYTES
-#define TP_WIRE_MAC_SZ crypto_aead_aegis128l_ABYTES
+#define TP_WIRE_KEY_SZ crypto_aead_aegis256_KEYBYTES
+#define TP_WIRE_NONCE_SZ crypto_aead_aegis256_NPUBBYTES
+#define TP_WIRE_MAC_SZ crypto_aead_aegis256_ABYTES
 #define TP_KX_PUB_SZ crypto_scalarmult_BYTES
 #define TP_KX_SEC_SZ crypto_scalarmult_SCALARBYTES
 #define TP_TXQ_FRAME_BYTES                                                    \

@@ -6,8 +6,6 @@ uint64_t g_tx_ts = 0;
 uint64_t g_rx_ts = 0;
 uint32_t g_frag_mid = 1;
 uint32_t g_rnd_st = 0;
-Rt *g_rt = NULL;
-
 uint64_t
 sys_ts (void)
 {

@@ -1,9 +1,11 @@
 #pragma once
+#include "udp.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAG_BKT_CAP_INIT 512U
+#define FRAG_BKT_CAP_INIT 64U
+#define FRAG_BKT_MAX BATCH_MAX
 
 typedef struct
 {

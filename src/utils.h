@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 #define TAP_F_MAX (10U + 14U + 65535U)
+_Static_assert (FRAG_OFF_MASK * FRAG_OFF_UNIT >= TAP_F_MAX,
+                "fragment offset space must cover the largest frame");
 #define VNET_HL 10
 #define EV_MAX 10
 #define ID_TAP 1
@@ -15,7 +17,7 @@
 #define ID_STD 4
 #define ID_CFG 5
 #define ID_TAP_NOTE 6
-#define GSP_INTV 1
+#define TICK_INTV 1
 #define UPD_TK 30
 #define PEER_FLS_TK 5
 #define KA_TMO 20000ULL
@@ -37,7 +39,6 @@ extern uint64_t g_tx_ts;
 extern uint64_t g_rx_ts;
 extern uint32_t g_frag_mid;
 extern uint32_t g_rnd_st;
-extern Rt *g_rt;
 
 uint64_t sys_ts (void);
 uint32_t u32_rnd (void);

@@ -26,7 +26,7 @@ ifname = nmesh
 # Optional: listen port (default: 50000).
 port = 50000
 
-# Optional: overlay MTU (default: 1280, range: 128..32743).
+# Optional: overlay MTU (default: 1280, range: 128..65511).
 mtu = 1280
 
 # Optional: physical MTU upper bound (default: 0, meaning auto-detect).

@@ -5,6 +5,10 @@
 #define PT_PING 1
 #define PT_PONG 2
 #define PT_GSP 3
+#define PT_ADV_UPD 14
+#define PT_ADV_ACK 15
+#define PT_ADV_DGST 16
+#define PT_ADV_REQ 17
 #define PT_HP 4
 #define PT_SEQ_REQ 5
 #define PT_FRAG 7
@@ -14,6 +18,8 @@
 #define PT_STAT_RSP 11
 #define PT_IBS_PING 12
 #define PT_IBS_PONG 13
+#define PT_IBS_CKIE 18
+#define IBS_CKIE_SZ 32
 
 typedef struct __attribute__ ((packed))
 {
@@ -25,13 +31,14 @@ typedef struct __attribute__ ((packed))
 #define PKT_TF_REL 0x80
 #define PKT_TF_TYPE_MASK 0x7f
 #define PKT_CH_SZ 2
-#define PKT_NONCE_SZ 16
+#define PKT_NONCE_SZ 32
 #define PKT_MAC_SZ 32
 #define PKT_NONCE_CNT_SZ sizeof (uint64_t)
 #define PKT_NONCE_SID_SZ (PKT_NONCE_SZ - PKT_NONCE_CNT_SZ)
 #define PKT_HDR_SZ (PKT_CH_SZ + PKT_NONCE_SZ + PKT_MAC_SZ)
-#define V6_PL_MAX 9000
-#define UDP_PL_MAX (PKT_HDR_SZ + sizeof (FragHdr) + 4U + V6_PL_MAX)
+/* Largest UDP payload in a largest IP packet: 65535 - 20
+   (IPv4 header) - 8 (UDP header); IPv6 needs less. */
+#define UDP_PL_MAX (65535U - 20U - 8U)
 #define PKT_PT_MAX (UDP_PL_MAX - PKT_HDR_SZ)
 #define TP_VNET_MAX UINT16_MAX
 #define TP_PL_MAX (PKT_HDR_SZ + TP_VNET_MAX)
@@ -41,6 +48,12 @@ typedef struct __attribute__ ((packed))
 #define PONG_PL_SZ 50
 #define FRAG_MF_MASK 0x8000U
 #define FRAG_OFF_MASK 0x7fffU
+/* Fragment offsets count 8-byte units, as in IP (RFC 791):
+   the 15-bit field reaches 32767 * 8 = 262136 bytes. */
+#define FRAG_OFF_UNIT 8U
+#define FRAG_DATA_MAX 65535U
+
+#define ADV_PATH_MAX 32U
 
 typedef struct __attribute__ ((packed))
 {
@@ -55,7 +68,9 @@ typedef struct __attribute__ ((packed))
   uint8_t adv_loss;
   uint8_t nhop_lla[16];
   uint64_t ver;
-} GspEnt;
+  uint8_t path_len;
+  uint32_t path[ADV_PATH_MAX];
+} AdvEnt;
 
 typedef struct __attribute__ ((packed))
 {
@@ -83,18 +98,20 @@ frag_vnet_len_max (size_t chunk_max)
 {
   if (chunk_max == 0)
     return 0;
-  return (((size_t)FRAG_OFF_MASK / chunk_max) + 1U) * chunk_max;
+  return FRAG_DATA_MAX;
 }
 
-#define GSP_F_SEL_DIR 0x01U
-#define GSP_F_NO_DIR 0x02U
-#define GSP_F_TP_UDP 0x04U
-#define GSP_F_TP_TCP 0x08U
-#define GSP_SZ sizeof (GspEnt)
+#define ADV_CORE_SZ 71U
+#define ADV_F_SEL_DIR 0x01U
+#define ADV_F_NO_DIR 0x02U
+#define ADV_F_TP_UDP 0x04U
+#define ADV_F_TP_TCP 0x08U
+#define ADV_SZ ADV_CORE_SZ
 _Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
-_Static_assert (sizeof (GspEnt) == 71, "GspEnt size");
+_Static_assert (sizeof (AdvEnt)
+                == ADV_CORE_SZ + 1U + 4U * ADV_PATH_MAX, "AdvEnt size");
 _Static_assert (sizeof (FragHdr) == 6, "FragHdr size");
 _Static_assert (sizeof (ProbeHdr) == 6, "ProbeHdr size");
 _Static_assert (sizeof (StatHdr) == 20, "StatHdr size");
-_Static_assert (PKT_HDR_SZ == 50, "PKT_HDR_SZ");
-_Static_assert (UDP_PL_MAX == PKT_HDR_SZ + sizeof (FragHdr) + 4U + V6_PL_MAX, "UDP_PL_MAX");
+_Static_assert (PKT_HDR_SZ == 66, "PKT_HDR_SZ");
+_Static_assert (UDP_PL_MAX == 65535U - 20U - 8U, "UDP_PL_MAX");

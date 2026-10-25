@@ -9,10 +9,13 @@
 #define RTO_MAX 30000U
 #define RTO_INIT 1000U
 #define RT_M_INF 0xFFFFU
-#define RT_MTU_MIN 128U
+#define TNL_OH_MAX (40U + 8U + PKT_HDR_SZ)
+#define RT_MTU_MIN (TNL_OH_MAX + sizeof (FragHdr) + FRAG_OFF_UNIT)
 #define RT_MTU_DEF 1280U
 #define RT_MTU_MAX 65535U
 #define RT_PRB_BST 5U
+#define RT_PRB_MAX 3U
+#define RT_MTU_BASE 1200U
 #define RT_HL_INTV 10000ULL
 #define RT_GHS_HL 30ULL
 #define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
@@ -36,6 +39,13 @@ typedef enum
   MTU_ST_S = 1,
   MTU_ST_F = 2,
 } MtuSt;
+
+typedef enum
+{
+  BHCK_NONE = 0,
+  BHCK_BASE = 1,
+  BHCK_CONFIRM = 2
+} BhckSt;
 
 #define IS_LLA_VAL(ip) ((ip)[0] == 0xfe && ((ip)[1] & 0xc0) == 0x80)
 
@@ -67,13 +77,14 @@ typedef struct
   uint64_t rtt_win_id[RT_METRIC_WIN_BINS];
   uint32_t rtt_win_min[RT_METRIC_WIN_BINS];
   uint32_t r2d;
-  uint32_t fd;
+  uint8_t path_len;
+  uint32_t path[ADV_PATH_MAX];
   uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
   uint16_t peer_rev_mtu;
   MtuSt mtu_st;
-  bool mtu_ukb_soft;
+  BhckSt bhck;
   uint64_t prb_i_ts;
   uint16_t prb_mtu;
   uint32_t prb_id;
@@ -90,6 +101,9 @@ typedef struct
   uint64_t pnd_ts;
   uint64_t hp_ts;
   uint64_t dat_ts;
+  uint8_t ibs_ckie[IBS_CKIE_SZ];
+  bool ibs_ckie_ok;
+  uint8_t prb_hash[IBS_CKIE_SZ];
 } Re;
 
 typedef struct Pth
@@ -117,13 +131,14 @@ typedef struct Pth
   uint32_t rto;
   uint32_t sm_m;
   uint32_t r2d;
-  uint32_t fd;
+  uint8_t path_len;
+  uint32_t path[ADV_PATH_MAX];
   uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
   uint16_t peer_rev_mtu;
   MtuSt mtu_st;
-  bool mtu_ukb_soft;
+  BhckSt bhck;
   uint64_t prb_i_ts;
   uint16_t prb_mtu;
   uint32_t prb_id;
@@ -160,8 +175,7 @@ typedef struct RtMap
 typedef struct
 {
   uint8_t rt_id[16];
-  uint32_t fwd_seq;
-  uint32_t fwd_m;
+  uint32_t seq;
   uint64_t last_ver;
   bool no_dir;
   uint64_t gc_ts;
@@ -196,14 +210,11 @@ typedef struct Rt
   uint16_t mtu_ub;
   bool mtu_probe;
   bool map_dirty;
-  bool gsp_dirty;
+  bool adv_dirty;
   uint64_t boot_ts;
   uint64_t loc_last_ts;
   uint64_t sync_rev;
-  uint32_t gsp_off;
-  uint64_t gsp_last_ts;
-  uint64_t gsp_tx_cnt;
-  uint64_t gsp_dt_tx_cnt;
+  uint64_t adv_tx_cnt;
   uint64_t ping_tx_cnt;
   uint64_t pong_tx_cnt;
   uint64_t hp_tx_cnt;
@@ -248,6 +259,7 @@ typedef struct
   };
 } RtDec;
 
+bool seq_lt (uint32_t a, uint32_t b);
 void rt_init (Rt *t);
 void rt_free (Rt *t);
 int rt_cpy (Rt *dst, const Rt *src);
@@ -266,6 +278,7 @@ void rt_tx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 bool rt_dat_upd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 RtDec rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p);
 uint16_t rt_mtu_ub (const Rt *t);
+uint16_t rt_dir_mtu_adv (const Rt *t, const Re *re);
 uint16_t rt_dir_mtu_get (const Rt *t, const Re *re);
 uint16_t rt_mtu (const Rt *t, const RtDec *sel);
 void rt_mtu_probe_set (Rt *t, bool is_on);
@@ -291,12 +304,10 @@ bool rt_pmtu_lims (const Rt *t, const RtDec *sel, uint16_t *out_lkg,
 int rt_act_get (Rt *t, Re *buf, int buf_len, int s_off);
 void rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts);
 void rt_src_gc (Rt *t, uint64_t sys_ts);
-bool rt_fsb (Rt *t, const uint8_t rt_id[16], uint32_t n_seq, uint32_t n_metric,
-             uint64_t n_ver, bool *req_seq);
-void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq, uint32_t metric,
+void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq,
                  uint64_t ver, bool no_dir, uint64_t sys_ts);
 void rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
-                      uint32_t metric, uint64_t ver, bool no_dir,
+                      uint64_t ver, bool no_dir,
                       bool can_clear_no_dir, uint64_t sys_ts);
 bool rt_src_no_dir (const Rt *t, const uint8_t rt_id[16]);
 bool rt_src_no_dir_known (const Rt *t, const uint8_t rt_id[16],
@@ -312,5 +323,4 @@ bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
 void pp_init (PPool *p, const char *persist_path);
 void pp_free (PPool *p);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
-void rt_gsp_dirty_set (Rt *t, const char *r);
-bool rt_gsp_refresh_due (const Rt *t, uint64_t sys_ts);
+void rt_adv_dirty_set (Rt *t, const char *r);

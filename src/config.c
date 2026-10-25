@@ -1,4 +1,6 @@
 #include "config.h"
+#include <stdarg.h>
+#include <errno.h>
 #include "bogon.h"
 #include "ibs.h"
 #include <ctype.h>
@@ -468,6 +470,31 @@ tp_cfg_prs (const char *s, Cfg *cfg)
   return 0;
 }
 
+static void
+cfg_ln_err (const char *path, int line_no, const char *fmt, ...)
+{
+  va_list ap;
+  va_start (ap, fmt);
+  fprintf (stderr, "config: %s:%d: ", path, line_no);
+  vfprintf (stderr, fmt, ap);
+  va_end (ap);
+  fputc ('\n', stderr);
+}
+
+static int
+cfg_u32_prs (const char *v, unsigned long *out)
+{
+  if (!v || !*v)
+    return -1;
+  char *end = NULL;
+  errno = 0;
+  unsigned long val = strtoul (v, &end, 10);
+  if (errno != 0 || !end || *end != '\0')
+    return -1;
+  *out = val;
+  return 0;
+}
+
 int
 cfg_load (const char *path, Cfg *cfg)
 {
@@ -485,14 +512,22 @@ cfg_load (const char *path, Cfg *cfg)
     }
   char *line = NULL;
   size_t line_cap = 0;
+  int line_no = 0;
   while (getline (&line, &line_cap, fp) >= 0)
     {
+      line_no++;
       char *l_trm = str_trm (line);
       if (!l_trm[0] || l_trm[0] == '#')
         continue;
       char *sep = strchr (l_trm, '=');
       if (!sep)
-        continue;
+        {
+          cfg_ln_err (path, line_no, "expected key = value");
+          cfg_free (cfg);
+          free (line);
+          fclose (fp);
+          return -1;
+        }
       *sep = '\0';
       char *k = str_trm (l_trm);
       char *v = str_trm (sep + 1);
@@ -500,6 +535,7 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (str_to_v6 (v, cfg->addr) != 0)
             {
+              cfg_ln_err (path, line_no, "invalid address: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -508,14 +544,25 @@ cfg_load (const char *path, Cfg *cfg)
         }
       else if (strcmp (k, "port") == 0)
         {
-          cfg->port = (uint16_t)strtoul (v, NULL, 10);
+          unsigned long p_v = 0;
+          if (cfg_u32_prs (v, &p_v) != 0 || p_v < 1 || p_v > 65535)
+            {
+              cfg_ln_err (path, line_no, "invalid port: %s", v);
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          cfg->port = (uint16_t)p_v;
           cfg->l_exp = true;
         }
       else if (strcmp (k, "mtu") == 0)
         {
-          unsigned long m_v = strtoul (v, NULL, 10);
-          if (m_v < CFG_MTU_MIN || m_v > CFG_MTU_MAX)
+          unsigned long m_v = 0;
+          if (cfg_u32_prs (v, &m_v) != 0 || m_v < CFG_MTU_MIN
+              || m_v > CFG_MTU_MAX)
             {
+              cfg_ln_err (path, line_no, "invalid mtu: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -525,7 +572,16 @@ cfg_load (const char *path, Cfg *cfg)
         }
       else if (strcmp (k, "p2p") == 0)
         {
-          cfg->p2p = (strcmp (v, "enable") == 0) ? P2P_EN : P2P_DIS;
+          bool en = false;
+          if (bool_prs (v, &en) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid p2p value: %s", v);
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          cfg->p2p = en ? P2P_EN : P2P_DIS;
         }
       else if (strcmp (k, "tap_mode") == 0)
         {
@@ -537,6 +593,7 @@ cfg_load (const char *path, Cfg *cfg)
             cfg->tap_mode = TAP_MODE_PIPE;
           else
             {
+              cfg_ln_err (path, line_no, "invalid tap_mode: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -547,6 +604,7 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (bool_prs (v, &cfg->mtu_probe) != 0)
             {
+              cfg_ln_err (path, line_no, "invalid mtu_probe value: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -555,9 +613,11 @@ cfg_load (const char *path, Cfg *cfg)
         }
       else if (strcmp (k, "default_phys_mtu") == 0)
         {
-          unsigned long d_v = strtoul (v, NULL, 10);
-          if (d_v < CFG_MTU_MIN || d_v > CFG_MTU_MAX)
+          unsigned long d_v = 0;
+          if (cfg_u32_prs (v, &d_v) != 0 || d_v < CFG_MTU_MIN
+              || d_v > CFG_MTU_MAX)
             {
+              cfg_ln_err (path, line_no, "invalid default_phys_mtu: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -569,6 +629,7 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (tp_cfg_prs (v, cfg) != 0)
             {
+              cfg_ln_err (path, line_no, "invalid transport: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -579,8 +640,8 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (cfg_bogon_rsv (cfg, cfg->bogon_cnt + 1U) != 0)
             {
-              fprintf (stderr,
-                       "config: out of memory while expanding bogon rules\n");
+              cfg_ln_err (path, line_no,
+                          "out of memory while expanding bogon rules");
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -588,7 +649,7 @@ cfg_load (const char *path, Cfg *cfg)
             }
           if (!bogon_rule_parse (v, &cfg->bogon_arr[cfg->bogon_cnt]))
             {
-              fprintf (stderr, "config: invalid bogon rule: %s\n", v);
+              cfg_ln_err (path, line_no, "invalid bogon rule: %s", v);
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -605,6 +666,7 @@ cfg_load (const char *path, Cfg *cfg)
         {
           if (psk_prs (v, cfg->psk) != 0)
             {
+              cfg_ln_err (path, line_no, "invalid psk value");
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -613,33 +675,67 @@ cfg_load (const char *path, Cfg *cfg)
         }
       else if (strcmp (k, "auth") == 0)
         {
-          cfg->auth_ibs = (strcmp (v, "ibs") == 0);
+          if (strcmp (v, "ibs") == 0)
+            cfg->auth_ibs = true;
+          else if (strcmp (v, "psk") == 0)
+            cfg->auth_ibs = false;
+          else
+            {
+              cfg_ln_err (path, line_no, "invalid auth mode: %s", v);
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
         }
       else if (strcmp (k, "ibs_mpk") == 0)
         {
           if (strlen (v) != IBS_MPK_SZ * 2)
-            { cfg_free (cfg); free (line); fclose (fp); return -1; }
+            {
+              cfg_ln_err (path, line_no, "invalid ibs_mpk length");
+              cfg_free (cfg); free (line); fclose (fp); return -1;
+            }
           for (size_t i = 0; i < IBS_MPK_SZ; i++)
             {
               int hi = char_to_hex (v[i * 2]);
               int lo = char_to_hex (v[i * 2 + 1]);
               if (hi < 0 || lo < 0)
-                { cfg_free (cfg); free (line); fclose (fp); return -1; }
+                {
+                  cfg_ln_err (path, line_no, "invalid hex in ibs key");
+                  cfg_free (cfg); free (line); fclose (fp); return -1;
+                }
               cfg->ibs_mpk[i] = (uint8_t)((hi << 4) | lo);
             }
         }
       else if (strcmp (k, "ibs_sk") == 0)
         {
           if (strlen (v) != IBS_SK_SZ * 2)
-            { cfg_free (cfg); free (line); fclose (fp); return -1; }
+            {
+              cfg_ln_err (path, line_no, "invalid ibs_sk length");
+              cfg_free (cfg); free (line); fclose (fp); return -1;
+            }
           for (size_t i = 0; i < IBS_SK_SZ; i++)
             {
               int hi = char_to_hex (v[i * 2]);
               int lo = char_to_hex (v[i * 2 + 1]);
               if (hi < 0 || lo < 0)
-                { cfg_free (cfg); free (line); fclose (fp); return -1; }
+                {
+                  cfg_ln_err (path, line_no, "invalid hex in ibs key");
+                  cfg_free (cfg); free (line); fclose (fp); return -1;
+                }
               cfg->ibs_sk[i] = (uint8_t)((hi << 4) | lo);
             }
+        }
+      else if (strcmp (k, "peer") == 0)
+        {
+        }
+      else
+        {
+          cfg_ln_err (path, line_no, "unknown key: %s", k);
+          cfg_free (cfg);
+          free (line);
+          fclose (fp);
+          return -1;
         }
     }
   free (line);
@@ -647,6 +743,7 @@ cfg_load (const char *path, Cfg *cfg)
   uint8_t z16[16] = { 0 };
   if (memcmp (cfg->addr, z16, 16) == 0)
     {
+      fprintf (stderr, "config: %s: address is required\n", path);
       cfg_free (cfg);
       return -1;
     }
@@ -658,12 +755,16 @@ cfg_load (const char *path, Cfg *cfg)
       if (memcmp (cfg->ibs_mpk, z_mpk, IBS_MPK_SZ) == 0
           || memcmp (cfg->ibs_sk, z_sk, IBS_SK_SZ) == 0)
         {
+          fprintf (stderr,
+                   "config: %s: auth = ibs requires ibs_mpk and ibs_sk\n",
+                   path);
           cfg_free (cfg);
           return -1;
         }
     }
   else if (memcmp (cfg->psk, z32, 32) == 0)
     {
+      fprintf (stderr, "config: %s: psk is required\n", path);
       cfg_free (cfg);
       return -1;
     }
@@ -685,8 +786,10 @@ p_arr_load (const char *path, P **out_arr, int *out_cnt)
   int p_cap = 0;
   char *line = NULL;
   size_t line_cap = 0;
+  int line_no = 0;
   while (getline (&line, &line_cap, fp) >= 0)
     {
+      line_no++;
       char *l_trm = str_trm (line);
       if (!l_trm[0] || l_trm[0] == '#')
         continue;
@@ -707,8 +810,8 @@ p_arr_load (const char *path, P **out_arr, int *out_cnt)
               P *new_arr = realloc (arr, sizeof (*arr) * (size_t)new_cap);
               if (!new_arr)
                 {
-                  fprintf (stderr,
-                           "config: out of memory while expanding peer list\n");
+                  cfg_ln_err (path, line_no,
+                              "out of memory while expanding peer list");
                   free (arr);
                   free (line);
                   fclose (fp);
@@ -721,7 +824,11 @@ p_arr_load (const char *path, P **out_arr, int *out_cnt)
         }
       else
         {
-          fprintf (stderr, "config: invalid peer entry ignored: %s\n", v);
+          cfg_ln_err (path, line_no, "invalid peer entry: %s", v);
+          free (arr);
+          free (line);
+          fclose (fp);
+          return -1;
         }
     }
   free (line);

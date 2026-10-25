@@ -9,6 +9,13 @@ _Static_assert (CRY_KX_PUB_SZ == crypto_scalarmult_BYTES,
                 "x25519 public key size");
 _Static_assert (CRY_KX_SEC_SZ == crypto_scalarmult_SCALARBYTES,
                 "x25519 secret key size");
+_Static_assert (sizeof (((CryPeer *)0)->tx_key)
+                    == crypto_aead_aegis256_KEYBYTES,
+                "session key size must equal the AEAD key size");
+_Static_assert (CRY_NONCE_WIRE_SZ == crypto_aead_aegis256_NPUBBYTES,
+                "wire nonce size must equal the AEAD nonce size");
+_Static_assert (CRY_MAC_SZ == crypto_aead_aegis256_ABYTES,
+                "wire mac size must equal the AEAD tag size");
 
 static bool
 cry_lla_ok (const uint8_t lla[16])
@@ -78,7 +85,7 @@ cry_enc_cnt_key (const uint8_t key[32], const uint8_t sid[CRY_NONCE_SID_SZ],
   memcpy (nonce, sid, CRY_NONCE_SID_SZ);
   for (size_t i = 0; i < sizeof (cnt); i++)
     nonce[CRY_NONCE_SID_SZ + i] = (uint8_t)(cnt >> (56U - (i * 8U)));
-  crypto_aead_aegis128l_encrypt_detached (ct, mac, NULL, pt, pt_len, ad,
+  crypto_aead_aegis256_encrypt_detached (ct, mac, NULL, pt, pt_len, ad,
                                           ad_len, NULL, nonce, key);
 }
 
@@ -94,7 +101,17 @@ cry_init (Cry *s, const uint8_t psk[32], bool auth_ibs)
   if (auth_ibs)
     randombytes_buf (s->key, sizeof (s->key));
   else
-    memcpy (s->key, psk, sizeof (s->key));
+    {
+      /* Fixed salt: both ends must derive the same master key from the PSK. */
+      static const uint8_t psk_salt[crypto_pwhash_SALTBYTES]
+          = "nmesh-psk-salt01";
+      if (crypto_pwhash (s->key, sizeof (s->key), (const char *)psk,
+                         32, psk_salt, crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                         crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                         crypto_pwhash_ALG_ARGON2ID13)
+          != 0)
+        return -1;
+    }
   atomic_store_explicit (&s->cnt, 1, memory_order_relaxed);
   randombytes_buf (s->n_sid, CRY_NONCE_SID_SZ);
   randombytes_buf (s->kx_sk, CRY_KX_SEC_SZ);
@@ -103,7 +120,7 @@ cry_init (Cry *s, const uint8_t psk[32], bool auth_ibs)
   s->peer_cnt = 0;
   s->peer_cap = 0;
   pthread_mutex_init (&s->mtx, NULL);
-  fprintf (stderr, "crypto: aead=aegis128l aesni=%d pclmul=%d avx=%d\n",
+  fprintf (stderr, "crypto: aead=aegis256 aesni=%d pclmul=%d avx=%d\n",
            has_aesni, has_pclmul, has_avx);
   return 0;
 }
@@ -114,6 +131,7 @@ cry_set_ibs (Cry *s, const uint8_t mpk[96], const uint8_t sk[48])
   if (!s || !mpk || !sk)
     return;
   s->auth_ibs = true;
+  randombytes_buf (s->ibs_ckie_key, sizeof (s->ibs_ckie_key));
   memcpy (s->ibs_mpk, mpk, IBS_MPK_SZ);
   memcpy (s->ibs_sk, sk, IBS_SK_SZ);
   uint8_t seed[16 + IBS_MPK_SZ + IBS_SK_SZ];
@@ -137,6 +155,9 @@ cry_free (Cry *s)
   s->peer_cnt = 0;
   s->peer_cap = 0;
   sodium_memzero (s->kx_sk, sizeof (s->kx_sk));
+  sodium_memzero (s->key, sizeof (s->key));
+  sodium_memzero (s->ibs_sk, sizeof (s->ibs_sk));
+  sodium_memzero (s->n_sid, sizeof (s->n_sid));
   pthread_mutex_unlock (&s->mtx);
   pthread_mutex_destroy (&s->mtx);
 }
@@ -304,7 +325,7 @@ cry_dec (Cry *s, const uint8_t *ct, size_t ct_len, const uint8_t *ad,
          size_t ad_len, const uint8_t nonce[CRY_NONCE_WIRE_SZ],
          const uint8_t mac[CRY_MAC_SZ], uint8_t *pt)
 {
-  int rc = crypto_aead_aegis128l_decrypt_detached (
+  int rc = crypto_aead_aegis256_decrypt_detached (
       pt, NULL, ct, ct_len, mac, ad, ad_len, nonce, s->key);
   return (rc == 0) ? 0 : -1;
 }
@@ -344,7 +365,7 @@ cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
       pthread_mutex_unlock (&s->mtx);
       if (keyed)
         {
-          int rc = crypto_aead_aegis128l_decrypt_detached (
+          int rc = crypto_aead_aegis256_decrypt_detached (
               pt, NULL, ct, ct_len, mac, ad, ad_len, nonce, key);
           sodium_memzero (key, sizeof (key));
           if (rc == 0)

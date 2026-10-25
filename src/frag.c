@@ -19,6 +19,8 @@ sys_ts (void)
 static bool
 frag_tab_rsv (uint32_t need)
 {
+  if (need > FRAG_BKT_MAX)
+    need = FRAG_BKT_MAX;
   if (need <= g_frag_cap)
     return true;
   uint32_t new_cap = g_frag_cap ? g_frag_cap : FRAG_BKT_CAP_INIT;
@@ -31,6 +33,9 @@ frag_tab_rsv (uint32_t need)
         }
       new_cap *= 2U;
     }
+
+  if (new_cap > FRAG_BKT_MAX)
+    new_cap = FRAG_BKT_MAX;
 
   FBktMeta *new_meta = calloc ((size_t)new_cap, sizeof (*new_meta));
   if (!new_meta)
@@ -61,13 +66,13 @@ frag_bkt_bufs_ensure (FBktData *d)
     return false;
   if (!d->buf)
     {
-      d->buf = malloc (65535U);
+      d->buf = malloc (FRAG_DATA_MAX);
       if (!d->buf)
         return false;
     }
   if (!d->rx_bmp)
     {
-      d->rx_bmp = malloc ((65535U / 8U) + 1U);
+      d->rx_bmp = malloc ((FRAG_DATA_MAX / 8U) + 1U);
       if (!d->rx_bmp)
         {
           free (d->buf);
@@ -107,12 +112,26 @@ frag_bkt_new (const uint8_t src_lla[16], uint32_t msg_id)
           break;
         }
     }
-  if (idx < 0)
+  if (idx < 0 && g_frag_cap < FRAG_BKT_MAX)
     {
       uint32_t old_cap = g_frag_cap;
-      if (!frag_tab_rsv (old_cap + 1U))
+      if (frag_tab_rsv (old_cap + 1U))
+        idx = (int)old_cap;
+    }
+  if (idx < 0)
+    {
+      uint64_t oldest = UINT64_MAX;
+      for (uint32_t i = 0; i < g_frag_cap; i++)
+        {
+          if (g_frag_meta[i].is_act && g_frag_meta[i].cre_ts < oldest)
+            {
+              oldest = g_frag_meta[i].cre_ts;
+              idx = (int)i;
+            }
+        }
+      if (idx < 0)
         return -1;
-      idx = (int)old_cap;
+      g_frag_meta[idx].is_act = false;
     }
 
   FBktMeta *m = &g_frag_meta[idx];
@@ -121,7 +140,7 @@ frag_bkt_new (const uint8_t src_lla[16], uint32_t msg_id)
     return -1;
 
   memset (m, 0, sizeof (*m));
-  memset (d->rx_bmp, 0, (65535U / 8U) + 1U);
+  memset (d->rx_bmp, 0, (FRAG_DATA_MAX / 8U) + 1U);
   memcpy (m->src_lla, src_lla, 16);
   m->msg_id = msg_id;
   m->cre_ts = sys_ts ();
@@ -133,7 +152,7 @@ uint8_t *
 frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off, bool mf,
           const uint8_t *data, size_t data_len, uint16_t *out_len)
 {
-  if (!data || data_len == 0 || (size_t)off + data_len > 65535)
+  if (!data || data_len == 0 || (size_t)off + data_len > FRAG_DATA_MAX)
     return NULL;
 
   int idx = frag_bkt_get (src_lla, msg_id);

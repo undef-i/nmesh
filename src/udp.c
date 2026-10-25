@@ -37,7 +37,6 @@ static UdpUnreachCallback g_unr_cb = NULL;
 #define UDP_RX_BUF_MAX 65535U
 #define UDP_RX_SPLIT_MAX (BATCH_MAX * 64)
 
-static void ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN]);
 static bool udp_pend_add (Udp *s, const UdpMsg *m);
 static void udp_sock_buf_set (int fd, int opt, int force_opt, int want,
                               const char *name);
@@ -211,12 +210,6 @@ udp_tx_1 (Udp *s, const UdpMsg *m)
     }
   if (is_err_unr (errno))
     {
-      char ip_str[INET6_ADDRSTRLEN] = { 0 };
-      ip_fmt (m->dst_ip, ip_str);
-      fprintf (stderr,
-               "udp: unreachable on sendto errno=%d dst=%s:%u "
-               "len=%zu\n",
-               errno, ip_str, m->dst_port, m->data_len);
       if (g_unr_cb)
         g_unr_cb (m->dst_ip, m->dst_port);
       return 0;
@@ -408,12 +401,6 @@ udp_gso_tx_seq (Udp *s, UdpMsg *msgs, int cnt)
         }
       if (is_err_unr (errno))
         {
-          char ip_str[INET6_ADDRSTRLEN] = { 0 };
-          ip_fmt (msgs[i].dst_ip, ip_str);
-          fprintf (stderr,
-                   "udp: unreachable on gso send errno=%d dst=%s:%u "
-                   "seg=%zu cnt=%d\n",
-                   errno, ip_str, msgs[i].dst_port, seg_len, grp_cnt);
           if (g_unr_cb)
             g_unr_cb (msgs[i].dst_ip, msgs[i].dst_port);
         }
@@ -541,19 +528,6 @@ udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
 #endif
 
 static void
-ip_fmt (const uint8_t ip[16], char out[INET6_ADDRSTRLEN])
-{
-  if (!ip || !out)
-    return;
-  if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 && ip[4] == 0
-      && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 && ip[8] == 0
-      && ip[9] == 0 && ip[10] == 0xff && ip[11] == 0xff)
-    inet_ntop (AF_INET, ip + 12, out, INET6_ADDRSTRLEN);
-  else
-    inet_ntop (AF_INET6, ip, out, INET6_ADDRSTRLEN);
-}
-
-static void
 udp_sock_buf_set (int fd, int opt, int force_opt, int want, const char *name)
 {
   bool is_ok = false;
@@ -627,12 +601,6 @@ udp_pend_fls (Udp *s)
             }
           if (is_err_unr (errno))
             {
-              char ip_str[INET6_ADDRSTRLEN] = { 0 };
-              ip_fmt (pm->dst_ip, ip_str);
-              fprintf (stderr,
-                       "udp: unreachable on pending flush errno=%d dst=%s:%u "
-                       "len=%zu\n",
-                       errno, ip_str, pm->dst_port, pm->data_len);
               if (g_unr_cb)
                 g_unr_cb (pm->dst_ip, pm->dst_port);
               s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
