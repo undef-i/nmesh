@@ -18,9 +18,9 @@
 #define TP_WARN_INTV RT_PRB_INTV
 #define TP_FLOW_IDLE_TMO (KA_TMO * 2ULL)
 #define TP_WIRE_SALT_SZ (CRY_NONCE_WIRE_SZ + sizeof (uint64_t))
-#define TP_WIRE_KEY_SZ crypto_aead_aegis256_KEYBYTES
-#define TP_WIRE_NONCE_SZ crypto_aead_aegis256_NPUBBYTES
-#define TP_WIRE_MAC_SZ crypto_aead_aegis256_ABYTES
+#define TP_WIRE_KEY_SZ 32
+#define TP_WIRE_NONCE_SZ CRY_NONCE_WIRE_SZ
+#define TP_WIRE_MAC_SZ CRY_MAC_SZ
 #define TP_KX_PUB_SZ crypto_scalarmult_BYTES
 #define TP_KX_SEC_SZ crypto_scalarmult_SCALARBYTES
 #define TP_TXQ_FRAME_BYTES                                                    \
