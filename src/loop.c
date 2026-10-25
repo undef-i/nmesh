@@ -917,7 +917,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
       if (rd.type == RT_REL
           && !tap_tx_use_tcp (rt, cfg, rd.rel.relay_ip, rd.rel.relay_port))
         {
-          uint64_t intv = (re->state == RT_ACT && re->rt_m < RT_M_INF)
+          uint64_t intv = (re->state == RT_ACT && re->rt_m < RT_F_INF)
                               ? KA_TMO
                               : um_prb_intv (re_probe_age_ms (re, ts));
           if (re->hp_ts != 0 && ts >= re->hp_ts && (ts - re->hp_ts) < intv)
@@ -995,25 +995,6 @@ tty_raw (void)
   t.c_cc[VMIN] = 0;
   t.c_cc[VTIME] = 0;
   tcsetattr (STDIN_FILENO, TCSANOW, &t);
-}
-
-static uint32_t
-re_show_rtt (const Re *re)
-{
-  if (!re)
-    return RT_M_INF;
-  if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK)
-    return re->sm_m;
-  for (size_t i = 0; i < RT_METRIC_WIN_BINS; i++)
-    {
-      if (re->rtt_win_id[i] != 0)
-        break;
-      if (i + 1U == RT_METRIC_WIN_BINS)
-        return RT_M_INF;
-    }
-  if (re->rt_m > 0 && re->rt_m < RT_M_INF && re->rt_m != RTT_UNK)
-    return re->rt_m;
-  return RT_M_INF;
 }
 
 static bool
@@ -1109,12 +1090,12 @@ rt_show_loss (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel,
   return false;
 }
 
-static uint32_t
+static int32_t
 rt_rel_rem_rtt (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
 {
   if (!rt || !dst_lla || !sel || sel->type != RT_REL)
-    return RT_M_INF;
-  uint32_t m_rd = RT_M_INF;
+    return RT_F_INF;
+  int32_t m_rd = RT_F_INF;
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
       const Re *re = &rt->re_arr[i];
@@ -1128,10 +1109,8 @@ rt_rel_rem_rtt (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
         continue;
       if (re->ep_port != sel->rel.relay_port)
         continue;
-      uint32_t m_adv = (re->r2d > 0) ? re->r2d : re->adv_m;
-      if (m_adv == 0 || m_adv == RTT_UNK || m_adv >= RT_M_INF)
-        m_adv = re->adv_m;
-      if (m_adv == 0 || m_adv == RTT_UNK || m_adv >= RT_M_INF)
+      int32_t m_adv = re->rt_m;
+      if (m_adv == RT_F_INF)
         continue;
       if (m_adv < m_rd)
         m_rd = m_adv;
@@ -1139,18 +1118,15 @@ rt_rel_rem_rtt (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel)
   return m_rd;
 }
 
-static uint32_t
+static int32_t
 rt_loc_rtt (const Rt *rt, const uint8_t dst_lla[16], const uint8_t ip[16],
             uint16_t port, bool use_tcp)
 {
   if (!rt || !ip || port == 0)
-    return RT_M_INF;
+    return RT_F_INF;
   if (use_tcp)
-    {
-      uint32_t tcp_rtt = 0;
-      return tp_rtt_get (ip, port, &tcp_rtt) ? tcp_rtt : RT_M_INF;
-    }
-  uint32_t best = RT_M_INF;
+    return RT_F_INF;
+  int32_t best = RT_F_INF;
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
       const Re *re = &rt->re_arr[i];
@@ -1164,31 +1140,36 @@ rt_loc_rtt (const Rt *rt, const uint8_t dst_lla[16], const uint8_t ip[16],
         continue;
       if (re->ep_port != port)
         continue;
-      uint32_t m = re_show_rtt (re);
+      int32_t m = re->rt_m;
       if (m < best)
         best = m;
     }
   return best;
 }
 
-static uint32_t
+static int32_t
 rt_show_rtt (const Rt *rt, const uint8_t dst_lla[16], const RtDec *sel,
              bool use_tcp)
 {
   if (!rt || !dst_lla || !sel)
-    return RT_M_INF;
+    return RT_F_INF;
   if (sel->type == RT_DIR)
     return rt_loc_rtt (rt, dst_lla, sel->dir.ip, sel->dir.port, use_tcp);
   if (sel->type == RT_REL)
     {
-      uint32_t m_rd = rt_rel_rem_rtt (rt, dst_lla, sel);
-      uint32_t m_lr = rt_loc_rtt (rt, NULL, sel->rel.relay_ip,
-                                  sel->rel.relay_port, use_tcp);
-      if (m_rd >= RT_M_INF || m_lr >= RT_M_INF)
-        return RT_M_INF;
-      return m_lr + m_rd;
+      int32_t m_rd = rt_rel_rem_rtt (rt, dst_lla, sel);
+      int32_t m_lr = rt_loc_rtt (rt, NULL, sel->rel.relay_ip,
+                                 sel->rel.relay_port, use_tcp);
+      if (m_rd == RT_F_INF || m_lr == RT_F_INF)
+        return RT_F_INF;
+      int64_t tot = (int64_t)m_lr + (int64_t)m_rd;
+      if (tot >= RT_F_INF)
+        return RT_F_INF - 1;
+      if (tot <= -RT_F_INF)
+        return -RT_F_INF + 1;
+      return (int32_t)tot;
     }
-  return RT_M_INF;
+  return RT_F_INF;
 }
 
 static void
@@ -4152,9 +4133,14 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
         if (rtt == 0)
           rtt = 1;
-        (void)peer_rx_ts;
-        if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, ts) && has_src)
-          rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, ts);
+        bool has_fwd = peer_rx_ts != 0;
+        int64_t fwd_obs
+            = has_fwd ? (int64_t)peer_rx_ts - (int64_t)req_ts : 0;
+        if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, fwd_obs,
+                                 has_fwd, ts)
+            && has_src)
+          rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, fwd_obs,
+                      has_fwd, ts);
         if (cfg->p2p == P2P_EN && hdr->rel_f == 0 && has_src
             && !p_is_me (rt, cfg->addr, src_ip, src_port))
           pp_add (pool, src_ip, src_port);
@@ -4480,7 +4466,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       bool is_unmapped = lla_is_z (re->lla);
       bool needs_probe = is_unmapped || re->state == RT_PND
-                         || re->rt_m >= RT_M_INF;
+                         || re->rt_m >= RT_F_INF;
       if (needs_probe)
         {
           uint64_t intv = um_prb_intv (re_probe_age_ms (re, ts));
@@ -4791,15 +4777,15 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
       else
         {
           bool use_tcp = tap_tx_use_tcp (rt, cfg, sel_ip, sel_port);
-          uint32_t show_rtt = rt_show_rtt (rt, uniq_lla[u], &sel, use_tcp);
+          int32_t show_rtt = rt_show_rtt (rt, uniq_lla[u], &sel, use_tcp);
           uint32_t show_loss = 0;
           bool has_loss
               = !use_tcp && rt_show_loss (rt, uniq_lla[u], &sel, &show_loss);
           snprintf (row->nh, sizeof (row->nh), "%s (%s)", nhop_str, ep_str);
-          if (show_rtt >= RT_M_INF)
+          if (show_rtt == RT_F_INF)
             strcpy (row->metric, "-");
           else
-            snprintf (row->metric, sizeof (row->metric), "%ums", show_rtt);
+            snprintf (row->metric, sizeof (row->metric), "%dms", show_rtt);
           if (has_loss)
             snprintf (row->loss, sizeof (row->loss), "%u%%", show_loss);
           else
@@ -4868,7 +4854,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               memcpy (alt_sel.rel.relay_lla, re->nhop_lla, 16);
             }
           bool use_tcp_alt = tap_tx_use_tcp (rt, cfg, re->ep_ip, re->ep_port);
-          uint32_t alt_rtt
+          int32_t alt_rtt
               = rt_show_rtt (rt, uniq_lla[u], &alt_sel, use_tcp_alt);
           uint32_t alt_loss = 0;
           bool has_alt_loss
@@ -4896,10 +4882,10 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             strcpy (row->st, "via");
           rt_fmt_mtu (row->mtu, sizeof (row->mtu), rt, &alt_sel,
                       use_tcp_alt);
-          if (alt_rtt >= RT_M_INF)
+          if (alt_rtt == RT_F_INF)
             strcpy (row->metric, "-");
           else
-            snprintf (row->metric, sizeof (row->metric), "%ums", alt_rtt);
+            snprintf (row->metric, sizeof (row->metric), "%dms", alt_rtt);
           if (has_alt_loss)
             snprintf (row->loss, sizeof (row->loss), "%u%%", alt_loss);
           else

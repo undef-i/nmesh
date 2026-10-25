@@ -297,16 +297,10 @@ re_rto_upd (Re *re, uint32_t rtt_ms)
   re->rto = rto;
 }
 
-static uint32_t
+static int32_t
 pth_m (const Pth *pth)
 {
-  uint32_t m = pth->sm_m;
-  if (m == 0 || m == RTT_UNK || m >= RT_M_INF)
-    m = pth->rt_m;
-  if ((m == 0 || m == RTT_UNK || m >= RT_M_INF) && pth->r2d == 0
-      && pth->is_act && pth->state == RT_ACT)
-    m = RTO_INIT;
-  return m;
+  return pth->rt_m;
 }
 
 static bool
@@ -329,8 +323,8 @@ pth_dir_btr (const Pth *cand, const Pth *best)
   if (!best)
     return true;
 
-  uint32_t cand_m = pth_m (cand);
-  uint32_t best_m = pth_m (best);
+  int32_t cand_m = pth_m (cand);
+  int32_t best_m = pth_m (best);
   if (cand_m != best_m)
     return cand_m < best_m;
 
@@ -372,6 +366,8 @@ re_metric_win_clear (Re *re)
     return;
   memset (re->rtt_win_id, 0, sizeof (re->rtt_win_id));
   memset (re->rtt_win_min, 0, sizeof (re->rtt_win_min));
+  memset (re->fwd_win_id, 0, sizeof (re->fwd_win_id));
+  memset (re->fwd_win_min, 0, sizeof (re->fwd_win_min));
 }
 
 static void
@@ -436,13 +432,76 @@ re_rtt_win_cur (const Re *re, uint64_t sys_ts)
   return best;
 }
 
+static void
+re_fwd_win_seed (Re *re, uint64_t sys_ts)
+{
+  if (!re || sys_ts == 0)
+    return;
+  for (size_t i = 0; i < RT_METRIC_WIN_BINS; i++)
+    {
+      if (re->fwd_win_id[i] != RT_METRIC_SLOT_INV)
+        return;
+    }
+  if (re->rt_m == RT_F_INF)
+    return;
+  uint64_t slot = metric_slot_id (sys_ts);
+  size_t idx = (size_t)((slot - 1ULL) % RT_METRIC_WIN_BINS);
+  re->fwd_win_id[idx] = slot;
+  re->fwd_win_min[idx] = re->rt_m;
+}
+
+static void
+re_fwd_win_add (Re *re, int64_t fwd_obs, uint64_t sys_ts)
+{
+  if (!re || sys_ts == 0)
+    return;
+  uint64_t slot = metric_slot_id (sys_ts);
+  size_t idx = (size_t)((slot - 1ULL) % RT_METRIC_WIN_BINS);
+  if (re->fwd_win_id[idx] != slot)
+    {
+      re->fwd_win_id[idx] = slot;
+      re->fwd_win_min[idx] = fwd_obs;
+      return;
+    }
+  if (fwd_obs < re->fwd_win_min[idx])
+    re->fwd_win_min[idx] = fwd_obs;
+}
+
+static int32_t
+re_fwd_win_cur (const Re *re, uint64_t sys_ts)
+{
+  if (!re || sys_ts == 0)
+    return RT_F_INF;
+  uint64_t now_slot = metric_slot_id (sys_ts);
+  int64_t best = 0;
+  bool seen = false;
+  for (size_t i = 0; i < RT_METRIC_WIN_BINS; i++)
+    {
+      uint64_t slot = re->fwd_win_id[i];
+      if (!metric_slot_in_win (now_slot, slot))
+        continue;
+      if (!seen || re->fwd_win_min[i] < best)
+        {
+          best = re->fwd_win_min[i];
+          seen = true;
+        }
+    }
+  if (!seen)
+    return RT_F_INF;
+  if (best >= RT_F_INF)
+    return RT_F_INF - 1;
+  if (best <= -RT_F_INF)
+    return -RT_F_INF + 1;
+  return (int32_t)best;
+}
+
 static bool
 re_metric_refresh (Re *re, uint64_t sys_ts)
 {
   if (!re || re->r2d != 0 || sys_ts == 0)
     return false;
   uint32_t old_sm = re->sm_m;
-  uint32_t old_rt = re->rt_m;
+  int32_t old_rt = re->rt_m;
   bool rtt_seen = false;
   for (size_t i = 0; i < RT_METRIC_WIN_BINS; i++)
     {
@@ -456,33 +515,24 @@ re_metric_refresh (Re *re, uint64_t sys_ts)
   re_rtt_win_seed (re, sys_ts);
 
   re->sm_m = re_rtt_win_cur (re, sys_ts);
-  if (re->sm_m < RT_M_INF)
-    re->rt_m = re->sm_m;
-  else if (rtt_seen)
-    re->rt_m = RT_M_INF;
+  (void)rtt_seen;
+  re_fwd_win_seed (re, sys_ts);
+  re->rt_m = re_fwd_win_cur (re, sys_ts);
   return re->sm_m != old_sm || re->rt_m != old_rt;
 }
 
 static void
-re_rtt_min_apply (Re *re, uint32_t rtt_ms, uint64_t sys_ts)
+re_rtt_min_apply (Re *re, uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
+                  uint64_t sys_ts)
 {
   if (!re)
     return;
   re_rtt_win_add (re, rtt_ms, sys_ts);
+  if (has_fwd)
+    re_fwd_win_add (re, fwd_obs, sys_ts);
   re_metric_refresh (re, sys_ts);
 }
 
-static uint32_t
-re_dir_seed_m (const Re *re)
-{
-  if (!re)
-    return RTO_INIT;
-  if (re->sm_m > 0 && re->sm_m != RTT_UNK && re->sm_m < RT_M_INF)
-    return re->sm_m;
-  if (re->rt_m > 0 && re->rt_m < RT_M_INF)
-    return re->rt_m;
-  return RTO_INIT;
-}
 
 static bool
 re_is_recent (const Re *re, uint64_t sys_ts)
@@ -746,8 +796,8 @@ rt_map_rbd (Rt *t)
           if (!rtm)
             continue;
           memcpy (rtm->lla, re->lla, 16);
-          rtm->sel_dir_m = UINT32_MAX;
-          rtm->sel_rel_m = UINT32_MAX;
+          rtm->sel_dir_m = RT_F_INF;
+          rtm->sel_rel_m = RT_F_INF;
           HASH_ADD (hh, n_map, lla, 16, rtm);
         }
 
@@ -789,11 +839,16 @@ rt_map_rbd (Rt *t)
             if (!nh || !nh->sel_dir_pth)
               continue;
 
-            uint32_t n2r = nh->sel_dir_m;
-            if (n2r >= RT_M_INF)
+            int32_t n2r = nh->sel_dir_m;
+            if (n2r == RT_F_INF || p->rt_m == RT_F_INF)
               continue;
 
-            uint32_t tot = n2r + p->r2d;
+            int64_t tot64 = (int64_t)n2r + (int64_t)p->rt_m;
+            if (tot64 >= RT_F_INF)
+              tot64 = RT_F_INF - 1;
+            if (tot64 <= -RT_F_INF)
+              tot64 = -RT_F_INF + 1;
+            int32_t tot = (int32_t)tot64;
 
             if (!rtm->sel_rel_pth || tot < rtm->sel_rel_m
                 || (tot == rtm->sel_rel_m
@@ -1240,22 +1295,12 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       cur_re->tp_mask = re->tp_mask;
       if (seq_gt (re->seq, cur_re->seq))
         cur_re->seq = re->seq;
-      if (re->adv_m > 0)
-        cur_re->adv_m = re->adv_m;
+      cur_re->adv_m = re->adv_m;
       cur_re->adv_loss = re->adv_loss;
       if (is_rel)
-        {
-          if (re->rt_m > 0)
-            cur_re->rt_m = re->rt_m;
-        }
-      else
-        {
-          if (cur_re->rt_m >= RT_M_INF || cur_re->rt_m == 0)
-            {
-              if (re->rt_m > 0)
-                cur_re->rt_m = re->rt_m;
-            }
-        }
+        cur_re->rt_m = re->rt_m;
+      else if (cur_re->rt_m == RT_F_INF && re->rt_m != RT_F_INF)
+        cur_re->rt_m = re->rt_m;
       if (re->state == RT_DED)
         {
           cur_re->state = RT_DED;
@@ -1333,14 +1378,11 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       ne.rx_bmp = is_rel ? 0x0001U : 0;
       if (ne.rto == 0)
         ne.rto = RTO_INIT;
-      if (ne.rt_m == 0)
-        {
-          if (ne.r2d > 0)
-            ne.rt_m = ne.r2d;
-          else
-            ne.rt_m = RT_M_INF;
-        }
-      if (ne.adv_m == 0)
+      if (ne.r2d > 0)
+        ne.rt_m = ne.adv_m;
+      else if (ne.rt_m == 0)
+        ne.rt_m = RT_F_INF;
+      if (ne.adv_m == 0 && ne.rt_m != RT_F_INF)
         ne.adv_m = ne.rt_m;
       if (ne.mtu == 0)
         {
@@ -1398,7 +1440,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   Pth *selected = re->sel_dir_pth;
   if (!selected)
     return false;
-  if (re->sel_dir_m >= RT_M_INF)
+  if (re->sel_dir_m >= RT_F_INF)
     return false;
 
   re->sel_pth = selected;
@@ -1448,7 +1490,8 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
 
 void
 rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
-            uint16_t port, uint32_t rtt_ms, uint64_t sys_ts)
+            uint16_t port, uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
+            uint64_t sys_ts)
 {
   if (rtt_ms == 0)
     rtt_ms = 1;
@@ -1462,7 +1505,7 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
         continue;
       if (t->re_arr[i].ep_port != port)
         continue;
-      re_rtt_min_apply (&t->re_arr[i], rtt_ms, sys_ts);
+      re_rtt_min_apply (&t->re_arr[i], rtt_ms, fwd_obs, has_fwd, sys_ts);
       re_rx_note (&t->re_arr[i], sys_ts);
       (void)re_dir_activate (&t->re_arr[i], sys_ts);
       re_rto_upd (&t->re_arr[i], rtt_ms);
@@ -1482,7 +1525,8 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
 
 bool
 rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
-                    uint32_t rtt_ms, uint64_t sys_ts)
+                    uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
+                    uint64_t sys_ts)
 {
   if (!t || !peer_lla || prb_tok == 0)
     return false;
@@ -1497,7 +1541,7 @@ rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
         continue;
       if (re->prb_tok != prb_tok)
         continue;
-      re_rtt_min_apply (re, rtt_ms, sys_ts);
+      re_rtt_min_apply (re, rtt_ms, fwd_obs, has_fwd, sys_ts);
       re_rx_note (re, sys_ts);
       (void)re_dir_activate (re, sys_ts);
       re_rto_upd (re, rtt_ms);
@@ -1618,10 +1662,6 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       if (t->re_arr[i].mtu_ukb == 0)
         t->re_arr[i].mtu_ukb = rt_mtu_ub (t);
       re_mtu_sync (t, &t->re_arr[i]);
-      if (t->re_arr[i].rt_m >= RT_M_INF)
-        {
-          t->re_arr[i].rt_m = re_dir_seed_m (&t->re_arr[i]);
-        }
       rt_map_mark (t);
       if (!is_zero_lla && should_act && (was_zero || !was_act || was_state != RT_ACT))
         {
@@ -1666,8 +1706,6 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       if (re->mtu_ukb == 0)
         re->mtu_ukb = rt_mtu_ub (t);
       re_mtu_sync (t, re);
-      if (re->rt_m >= RT_M_INF)
-        re->rt_m = re_dir_seed_m (re);
       rt_map_mark (t);
       if (should_act && (!was_act || was_state != RT_ACT || !is_zero_lla))
         rt_adv_dirty_set (t, "ep_upd (zero promote)");
@@ -1691,7 +1729,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.rx_bmp = 0x0001U;
       ne.rto = RTO_INIT;
       ne.sm_m = 0;
-      ne.rt_m = re_dir_seed_m (&ne);
+      ne.rt_m = RT_F_INF;
       ne.adv_m = ne.rt_m;
       ne.adv_loss = 0;
       ne.seq = 1;
@@ -1839,8 +1877,8 @@ rt_sel (Rt *t, const uint8_t dst_lla[16], bool is_p2p)
 
   Pth *b_dir_pth = re->sel_dir_pth;
   Pth *b_rel_pth = re->sel_rel_pth;
-  bool dir_ok = (b_dir_pth != NULL && re->sel_dir_m < RT_M_INF);
-  bool rel_ok = (b_rel_pth != NULL && re->sel_rel_m < RT_M_INF);
+  bool dir_ok = (b_dir_pth != NULL && re->sel_dir_m < RT_F_INF);
+  bool rel_ok = (b_rel_pth != NULL && re->sel_rel_m < RT_F_INF);
 
   if (!is_p2p)
     {
@@ -2431,7 +2469,7 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
         }
       re->is_act = false;
       re->state = RT_PND;
-      re->rt_m = RT_M_INF;
+      re->rt_m = RT_F_INF;
       re->sm_m = RT_M_INF;
       re_metric_win_clear (re);
       re->tx_ts = sys_ts;
@@ -2553,10 +2591,8 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
             {
               bool was_act = re->is_act;
               RtSt was_state = re->state;
-              uint32_t old_rt_m = re->rt_m;
+              int32_t old_rt_m = re->rt_m;
               re_rx_ack (re, sys_ts);
-              if (re->rt_m == 0 || re->rt_m >= RT_M_INF)
-                re->rt_m = re_dir_seed_m (re);
               if (re->is_act != was_act || re->state != was_state
                   || re->rt_m != old_rt_m)
                 is_mod = true;
@@ -2567,7 +2603,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
             {
               re->is_act = false;
               re->state = RT_PND;
-              re->rt_m = RT_M_INF;
+              re->rt_m = RT_F_INF;
               re->sm_m = RT_M_INF;
               re_metric_win_clear (re);
               re->pnd_ts = sys_ts;
@@ -2583,7 +2619,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
             any_ded = true;
           re->is_act = false;
           re->state = RT_PND;
-          re->rt_m = RT_M_INF;
+          re->rt_m = RT_F_INF;
           re->sm_m = RT_M_INF;
           re_metric_win_clear (re);
           re->pnd_ts = sys_ts;
@@ -2598,7 +2634,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
                 any_ded = true;
               re->is_act = false;
               re->state = RT_DED;
-              re->rt_m = RT_M_INF;
+              re->rt_m = RT_F_INF;
               re->sm_m = RT_M_INF;
               re_metric_win_clear (re);
               is_mod = true;
@@ -2609,7 +2645,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
                 any_ded = true;
               re->is_act = false;
               re->state = RT_PND;
-              re->rt_m = RT_M_INF;
+              re->rt_m = RT_F_INF;
               re->sm_m = RT_M_INF;
               re_metric_win_clear (re);
               re->pnd_ts = sys_ts;
@@ -2631,7 +2667,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
                     any_ded = true;
                   re->is_act = false;
                   re->state = RT_DED;
-                  re->rt_m = RT_M_INF;
+                  re->rt_m = RT_F_INF;
                   re->sm_m = RT_M_INF;
                   re_metric_win_clear (re);
                   is_mod = true;
@@ -2639,7 +2675,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
               else
                 {
                   re->state = RT_DED;
-                  re->rt_m = RT_M_INF;
+                  re->rt_m = RT_F_INF;
                   re->sm_m = RT_M_INF;
                   re_metric_win_clear (re);
                 }
@@ -2884,8 +2920,8 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
         continue;
       re->sid = peer_sid;
       re->seq = 1;
-      re->adv_m = RT_M_INF;
-      re->rt_m = (re->r2d == 0) ? RT_M_INF : re->rt_m;
+      re->adv_m = RT_F_INF;
+      re->rt_m = (re->r2d == 0) ? RT_F_INF : re->rt_m;
       if (re->r2d == 0)
         {
           re->is_act = false;

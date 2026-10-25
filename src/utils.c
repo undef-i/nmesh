@@ -37,7 +37,7 @@ rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
            uint8_t out_ip[16], uint16_t *out_port)
 {
   bool has_res = false;
-  uint32_t best = RT_M_INF;
+  int32_t best = RT_F_INF;
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
       const Re *re = &rt->re_arr[i];
@@ -49,8 +49,8 @@ rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
         continue;
       if (memcmp (re->lla, our_lla, 16) == 0)
         continue;
-      uint32_t m = re_m (re);
-      if (m >= RT_M_INF)
+      int32_t m = re_m (re);
+      if (m >= RT_F_INF)
         continue;
       if (!has_res || m < best)
         {

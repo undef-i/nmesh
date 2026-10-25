@@ -64,7 +64,7 @@ typedef struct __attribute__ ((packed))
   uint8_t state;
   uint16_t mtu;
   uint32_t seq;
-  uint32_t adv_m;
+  int32_t adv_m;
   uint8_t adv_loss;
   uint8_t nhop_lla[16];
   uint64_t ver;

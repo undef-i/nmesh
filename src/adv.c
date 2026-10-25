@@ -85,7 +85,7 @@ ent_eq (const AdvEnt *a, const AdvEnt *b)
 static bool
 ent_is_wd (const AdvEnt *e)
 {
-  return e->adv_m >= RT_M_INF && e->state == (uint8_t)RT_DED;
+  return e->adv_m >= RT_F_INF && e->state == (uint8_t)RT_DED;
 }
 
 static void
@@ -545,7 +545,7 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
                   if (has_rec)
                     continue;
                   AdvEnt wd = ses->sent[k];
-                  wd.adv_m = RT_M_INF;
+                  wd.adv_m = RT_F_INF;
                   wd.state = (uint8_t)RT_DED;
                   size_t esz = ent_sz (&wd);
                   if (ch_cnt > 0 && used + esz > budget)
@@ -830,7 +830,7 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
   out->adv_m = re->rt_m;
   if (re->r2d > 0)
     {
-      uint32_t nh_m = UINT32_MAX;
+      int32_t nh_m = RT_F_INF;
       for (uint32_t j = 0; j < rt->cnt; j++)
         {
           const Re *nh = &rt->re_arr[j];
@@ -840,25 +840,27 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
             continue;
           if (!nh->is_act || nh->state != RT_ACT)
             continue;
-          uint32_t m = nh->sm_m;
-          if (m == 0 || m >= RT_M_INF)
-            m = nh->rt_m;
-          if (m > 0 && m < nh_m)
-            nh_m = m;
+          if (nh->rt_m < nh_m)
+            nh_m = nh->rt_m;
         }
-      if (nh_m < RT_M_INF)
+      if (nh_m != RT_F_INF && re->rt_m != RT_F_INF)
         {
-          uint64_t tot = (uint64_t)nh_m + re->r2d;
-          out->adv_m = tot >= RT_M_INF ? RT_M_INF : (uint32_t)tot;
+          int64_t tot = (int64_t)nh_m + (int64_t)re->rt_m;
+          if (tot >= RT_F_INF)
+            tot = RT_F_INF - 1;
+          if (tot <= -RT_F_INF)
+            tot = -RT_F_INF + 1;
+          out->adv_m = (int32_t)tot;
         }
+      else
+        out->adv_m = RT_F_INF;
     }
   {
     uint32_t loss_pct = 0;
     out->adv_loss = rt_loss_pct_get (re, &loss_pct) ? (uint8_t)loss_pct : 0;
   }
-  if (memcmp (re->lla, our_lla, 16) == 0
-      && (out->adv_m == 0 || out->adv_m >= RT_M_INF))
-    out->adv_m = RT_M_INF;
+  if (memcmp (re->lla, our_lla, 16) == 0)
+    out->adv_m = RT_F_INF;
   memcpy (out->nhop_lla, re->nhop_lla, 16);
   out->ver = re->ver;
   uint32_t self_id = lla_id (our_lla);
@@ -992,9 +994,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           continue;
         }
       uint32_t n_seq = ent.seq;
-      uint32_t adv_m = ent.adv_m;
-      if (adv_m > RT_M_INF)
-        adv_m = RT_M_INF;
+      int32_t adv_m = ent.adv_m;
       uint16_t ent_mtu = ent.mtu;
       bool no_dir = (ent.flags & ADV_F_NO_DIR) != 0;
       uint16_t rel_mtu = 0;
@@ -1025,7 +1025,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           = !IS_LLA_VAL (ent.nhop_lla)
             || memcmp (ent.nhop_lla, ent.lla, 16) == 0;
       bool has_udp_hint = (ent.flags & ADV_F_TP_UDP) != 0;
-      if (adv_m == 0 || ent.path_len == 0)
+      if (ent.path_len == 0)
         continue;
       if (ent.path[ent.path_len - 1] != lla_id (ent.lla))
         continue;
@@ -1074,8 +1074,8 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rel_re.seq = n_seq;
           rel_re.adv_m = adv_m;
           rel_re.adv_loss = ent.adv_loss;
-          rel_re.r2d = adv_m;
-          rel_re.rt_m = rel_re.r2d;
+          rel_re.r2d = 1;
+          rel_re.rt_m = adv_m;
           rel_re.path_len = ent.path_len;
           memcpy (rel_re.path, ent.path, sizeof (rel_re.path));
           if (rel_mtu > 0)
@@ -1118,7 +1118,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           dir_re.adv_m = adv_m;
           dir_re.adv_loss = ent.adv_loss;
           dir_re.r2d = 0;
-          dir_re.rt_m = RT_M_INF;
+          dir_re.rt_m = RT_F_INF;
           dir_re.sm_m = RT_M_INF;
           dir_re.state = ((RtSt)ent.state == RT_DED) ? RT_DED : RT_PND;
           dir_re.is_act = false;

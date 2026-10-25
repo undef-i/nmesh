@@ -9,6 +9,7 @@
 #define RTO_MAX 30000U
 #define RTO_INIT 1000U
 #define RT_M_INF 0xFFFFU
+#define RT_F_INF INT32_MAX
 #define TNL_OH_MAX (40U + 8U + PKT_HDR_SZ)
 #define RT_MTU_MIN (TNL_OH_MAX + sizeof (FragHdr) + FRAG_OFF_UNIT)
 #define RT_MTU_DEF 1280U
@@ -57,9 +58,9 @@ typedef struct
   uint64_t ver;
   uint64_t sid;
   uint32_t seq;
-  uint32_t adv_m;
+  int32_t adv_m;
   uint8_t adv_loss;
-  uint32_t rt_m;
+  int32_t rt_m;
   uint8_t nhop_lla[16];
   RtSt state;
   bool is_act;
@@ -76,6 +77,8 @@ typedef struct
   uint32_t sm_m;
   uint64_t rtt_win_id[RT_METRIC_WIN_BINS];
   uint32_t rtt_win_min[RT_METRIC_WIN_BINS];
+  uint64_t fwd_win_id[RT_METRIC_WIN_BINS];
+  int64_t fwd_win_min[RT_METRIC_WIN_BINS];
   uint32_t r2d;
   uint8_t path_len;
   uint32_t path[ADV_PATH_MAX];
@@ -113,9 +116,9 @@ typedef struct Pth
   uint64_t ver;
   uint64_t sid;
   uint32_t seq;
-  uint32_t adv_m;
+  int32_t adv_m;
   uint8_t adv_loss;
-  uint32_t rt_m;
+  int32_t rt_m;
   uint8_t nhop_lla[16];
   RtSt state;
   bool is_act;
@@ -165,8 +168,8 @@ typedef struct RtMap
   Pth *sel_pth;
   Pth *sel_dir_pth;
   Pth *sel_rel_pth;
-  uint32_t sel_dir_m;
-  uint32_t sel_rel_m;
+  int32_t sel_dir_m;
+  int32_t sel_rel_m;
   bool has_pnd_dir;
   UT_hash_handle hh;
   struct RtMap *pool_next;
@@ -268,9 +271,11 @@ bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
 bool rt_dir_is_sel (Rt *t, const Re *re);
 bool rt_loss_pct_get (const Re *re, uint32_t *out_pct);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
-                 uint16_t port, uint32_t rtt_ms, uint64_t sys_ts);
+                 uint16_t port, uint32_t rtt_ms, int64_t fwd_obs,
+                 bool has_fwd, uint64_t sys_ts);
 bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
-                         uint32_t rtt_ms, uint64_t sys_ts);
+                         uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
+                         uint64_t sys_ts);
 void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
                 uint16_t port, uint8_t tp_mask, uint64_t sys_ts);
 void rt_rx_ack (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);

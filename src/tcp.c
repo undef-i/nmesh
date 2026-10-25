@@ -2553,7 +2553,7 @@ tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg)
           uint32_t rtt_ms = 0;
           if (tp_conn_rtt_ms_get (conn, &rtt_ms))
             rt_rtt_upd (rt, conn->peer_lla, conn->route_ip, conn->route_port,
-                        rtt_ms, now);
+                        rtt_ms, 0, false, now);
         }
       if (conn->st == TP_ST_CONNECTING && now > conn->ts
           && (now - conn->ts) > TP_CONN_TMO)

@@ -53,14 +53,11 @@ re_probe_age_ms (const Re *re, uint64_t now)
   return now - re->rx_ts;
 }
 
-static inline uint32_t
+
+static inline int32_t
 re_m (const Re *re)
 {
-  if (re->sm_m > 0 && re->sm_m < RT_M_INF && re->sm_m != RTT_UNK)
-    return re->sm_m;
-  if (re->rt_m > 0 && re->rt_m < RT_M_INF && re->rt_m != RTT_UNK)
-    return re->rt_m;
-  return RT_M_INF;
+  return re->rt_m;
 }
 
 static inline bool
