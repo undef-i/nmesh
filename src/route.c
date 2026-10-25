@@ -1292,7 +1292,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         continue;
       if ((is_rel || is_loc_inj) && re->is_act && rel_proof_ok)
         cur_re->is_act = true;
-      cur_re->tp_mask = re->tp_mask;
+      cur_re->tp_mask |= re->tp_mask;
       if (seq_gt (re->seq, cur_re->seq))
         cur_re->seq = re->seq;
       cur_re->adv_m = re->adv_m;
@@ -1644,7 +1644,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
         }
       re_rx_note (&t->re_arr[i], sys_ts);
       if (tp_mask != 0)
-        t->re_arr[i].tp_mask = tp_mask;
+        t->re_arr[i].tp_mask |= tp_mask;
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
         {
@@ -1690,7 +1690,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
         }
       re_rx_note (re, sys_ts);
       if (tp_mask != 0)
-        re->tp_mask = tp_mask;
+        re->tp_mask |= tp_mask;
       memcpy (re->nhop_lla, lla, 16);
       if (re->mtu == 0)
         {
