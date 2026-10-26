@@ -201,9 +201,15 @@ frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off, bool mf,
   return NULL;
 }
 
+#define FRAG_REAP_INTV_MS 50ULL
+
 void
 frag_reap_tk (uint64_t now)
 {
+  static uint64_t l_reap_ts = 0;
+  if (now < l_reap_ts + FRAG_REAP_INTV_MS)
+    return;
+  l_reap_ts = now;
   for (uint32_t i = 0; i < g_frag_cap; i++)
     {
       if (!g_frag_meta[i].is_act)
