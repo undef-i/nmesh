@@ -43,8 +43,6 @@ uint8_t *mtu_ack_bld (Cry *s, uint32_t probe_id, uint16_t probe_mtu,
                       size_t *out_len);
 int nbr_prs_mtu_prb (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
                      uint16_t *probe_mtu);
-int nbr_prs_mtu_ack (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
-                     uint16_t *probe_mtu);
 int on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
              uint8_t *lla, uint16_t *port, uint64_t *prb_tok);
 int on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
@@ -52,11 +50,8 @@ int on_pong (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
              uint64_t *prb_tok);
 const uint8_t *on_ping_kx (const uint8_t *pt, size_t pt_len);
 const uint8_t *on_pong_kx (const uint8_t *pt, size_t pt_len);
-bool is_ip_bgn (const uint8_t ip[16]);
 bool lla_inf_s (Rt *rt, const uint8_t src_ip[16], uint16_t src_port,
                 uint8_t out_lla[16]);
-uint16_t mtu_inf_s (const Rt *rt, const uint8_t src_ip[16],
-                    uint16_t src_port);
 int on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
            const Cfg *cfg, const uint8_t our_lla[16], uint64_t sid,
            uint64_t sys_ts);

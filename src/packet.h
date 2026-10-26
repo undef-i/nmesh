@@ -1,10 +1,11 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#define IS_LLA_VAL(ip) ((ip)[0] == 0xfe && ((ip)[1] & 0xc0) == 0x80)
+
 #define PT_DATA 0
 #define PT_PING 1
 #define PT_PONG 2
-#define PT_GSP 3
 #define PT_ADV_UPD 14
 #define PT_ADV_ACK 15
 #define PT_ADV_DGST 16
@@ -106,7 +107,6 @@ frag_vnet_len_max (size_t chunk_max)
 #define ADV_F_NO_DIR 0x02U
 #define ADV_F_TP_UDP 0x04U
 #define ADV_F_TP_TCP 0x08U
-#define ADV_SZ ADV_CORE_SZ
 _Static_assert (sizeof (PktHdr) == 3, "PktHdr size");
 _Static_assert (sizeof (AdvEnt)
                 == ADV_CORE_SZ + 1U + 4U * ADV_PATH_MAX, "AdvEnt size");

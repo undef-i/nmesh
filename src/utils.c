@@ -2,8 +2,6 @@
 #include <string.h>
 #include <time.h>
 
-uint64_t g_tx_ts = 0;
-uint64_t g_rx_ts = 0;
 uint32_t g_frag_mid = 1;
 uint32_t g_rnd_st = 0;
 uint64_t
@@ -41,7 +39,7 @@ rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
   for (uint32_t i = 0; i < rt->cnt; i++)
     {
       const Re *re = &rt->re_arr[i];
-      if (!re->is_act || re->state == RT_DED)
+      if (re->state != RT_ACT)
         continue;
       if (re->r2d != 0)
         continue;

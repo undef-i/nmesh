@@ -73,4 +73,4 @@ int cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
                   size_t ct_len, const uint8_t *ad, size_t ad_len,
                   const uint8_t nonce[CRY_NONCE_WIRE_SZ],
                   const uint8_t mac[CRY_MAC_SZ], uint8_t *pt,
-                  bool *used_psk, uint8_t matched_lla[16]);
+                  uint8_t matched_lla[16]);

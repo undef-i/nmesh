@@ -11,6 +11,7 @@
 #define RX_RP_LF_NUM 3U
 #define RX_RP_LF_DEN 4U
 #define RX_RP_HOT_N (RX_RP_CAP_INIT / 128U)
+#define RX_RP_STALE_MS 300000ULL
 
 typedef enum
 {
@@ -97,7 +98,7 @@ static bool
 rx_rp_slot_stale (const RxRp *slot, uint64_t now)
 {
   return slot && slot->st == RX_RP_USED && now > slot->last_ts
-         && (now - slot->last_ts) > UM_PRB_IMAX;
+         && (now - slot->last_ts) > RX_RP_STALE_MS;
 }
 
 static void
@@ -259,7 +260,7 @@ rx_rp_maybe_rehash (uint64_t now, uint32_t add_used)
 
 static RxRp *
 rx_rp_hot_lookup_idx (uint32_t idx, const uint8_t sid[RX_RP_SID_SZ],
-                      uint64_t now)
+                      uint64_t now, bool reclaim)
 {
   if (idx >= g_rx_rp_cap)
     return NULL;
@@ -268,14 +269,16 @@ rx_rp_hot_lookup_idx (uint32_t idx, const uint8_t sid[RX_RP_SID_SZ],
     return NULL;
   if (rx_rp_slot_stale (slot, now))
     {
-      rx_rp_slot_tomb (slot);
+      if (reclaim)
+        rx_rp_slot_tomb (slot);
       return NULL;
     }
   return rx_rp_sid_eq (slot, sid) ? slot : NULL;
 }
 
 static RxRp *
-rx_rp_probe_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
+rx_rp_probe_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found,
+                  bool reclaim)
 {
   if (found)
     *found = false;
@@ -303,9 +306,12 @@ rx_rp_probe_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
         }
       if (rx_rp_slot_stale (slot, now))
         {
-          rx_rp_slot_tomb (slot);
-          if (first_tomb == UINT32_MAX)
-            first_tomb = idx;
+          if (reclaim)
+            {
+              rx_rp_slot_tomb (slot);
+              if (first_tomb == UINT32_MAX)
+                first_tomb = idx;
+            }
           continue;
         }
       if (rx_rp_sid_eq (slot, sid))
@@ -321,7 +327,8 @@ rx_rp_probe_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
 }
 
 static RxRp *
-rx_rp_find_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
+rx_rp_find_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found,
+                 bool reclaim)
 {
   RxRp *slot = NULL;
   bool probe_found = false;
@@ -333,7 +340,7 @@ rx_rp_find_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
 
   if (g_rx_rp_last_idx < g_rx_rp_cap)
     {
-      slot = rx_rp_hot_lookup_idx (g_rx_rp_last_idx, sid, now);
+      slot = rx_rp_hot_lookup_idx (g_rx_rp_last_idx, sid, now, reclaim);
       if (found)
         *found = slot != NULL;
     }
@@ -344,7 +351,7 @@ rx_rp_find_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
           uint32_t idx = g_rx_rp_hot_idx[i];
           if (idx == UINT32_MAX || idx == g_rx_rp_last_idx)
             continue;
-          slot = rx_rp_hot_lookup_idx (idx, sid, now);
+          slot = rx_rp_hot_lookup_idx (idx, sid, now, reclaim);
           if (slot)
             {
               if (found)
@@ -355,7 +362,7 @@ rx_rp_find_slot (const uint8_t sid[RX_RP_SID_SZ], uint64_t now, bool *found)
     }
   if (!slot)
     {
-      slot = rx_rp_probe_slot (sid, now, &probe_found);
+      slot = rx_rp_probe_slot (sid, now, &probe_found, reclaim);
       if (found)
         *found = probe_found;
     }
@@ -372,7 +379,7 @@ rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
   uint64_t cnt = nonce_cnt_rd (nonce);
   uint64_t now = sys_ts ();
   bool found = false;
-  RxRp *slot = rx_rp_find_slot (sid, now, &found);
+  RxRp *slot = rx_rp_find_slot (sid, now, &found, false);
   if (!slot || !found)
     return true;
   if (cnt > slot->max_cnt)
@@ -396,19 +403,17 @@ rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ])
   if (g_rx_rp_cap == 0 && !rx_rp_rehash (RX_RP_CAP_INIT, now))
     return false;
 
-  slot = rx_rp_find_slot (sid, now, &found);
+  slot = rx_rp_find_slot (sid, now, &found, true);
   if (!slot)
     return false;
   if (!found)
     {
       if (!rx_rp_maybe_rehash (now, 1U))
         return false;
-      slot = rx_rp_probe_slot (sid, now, &found);
+      slot = rx_rp_probe_slot (sid, now, &found, true);
       if (!slot)
         return false;
     }
-  if (!slot)
-    return false;
   rx_rp_hot_note ((uint32_t)(slot - g_rx_rp));
   if (!found)
     {

@@ -19,14 +19,7 @@ _Static_assert (FRAG_OFF_MASK * FRAG_OFF_UNIT >= TAP_F_MAX,
 #define ID_TAP_NOTE 6
 #define TICK_INTV 1
 #define UPD_TK 30
-#define PEER_FLS_TK 5
-#define KA_TMO 20000ULL
-#define UM_PRB_A1 15000ULL
-#define UM_PRB_A2 45000ULL
-#define UM_PRB_A3 105000ULL
-#define UM_PRB_A4 225000ULL
-#define UM_PRB_A5 465000ULL
-#define UM_PRB_A6 945000ULL
+/* Age thresholds are the cumulative sums of the doubling intervals. */
 #define UM_PRB_I1 2000ULL
 #define UM_PRB_I2 4000ULL
 #define UM_PRB_I3 8000ULL
@@ -34,9 +27,13 @@ _Static_assert (FRAG_OFF_MASK * FRAG_OFF_UNIT >= TAP_F_MAX,
 #define UM_PRB_I5 32000ULL
 #define UM_PRB_I6 64000ULL
 #define UM_PRB_IMAX 120000ULL
+#define UM_PRB_A1 (UM_PRB_I1)
+#define UM_PRB_A2 (UM_PRB_A1 + UM_PRB_I2)
+#define UM_PRB_A3 (UM_PRB_A2 + UM_PRB_I3)
+#define UM_PRB_A4 (UM_PRB_A3 + UM_PRB_I4)
+#define UM_PRB_A5 (UM_PRB_A4 + UM_PRB_I5)
+#define UM_PRB_A6 (UM_PRB_A5 + UM_PRB_I6)
 
-extern uint64_t g_tx_ts;
-extern uint64_t g_rx_ts;
 extern uint32_t g_frag_mid;
 extern uint32_t g_rnd_st;
 
@@ -77,6 +74,48 @@ is_underlay_ip (const uint8_t ip[16])
 }
 
 static inline bool
+ip6_tcp_off_get (const uint8_t *pkt, size_t len, size_t *ip_hl)
+{
+  if (!pkt || !ip_hl)
+    return false;
+  if (len < 40)
+    return false;
+  uint8_t nh = pkt[6];
+  size_t off = 40;
+  while (off < len)
+    {
+      if (nh == 6)
+        {
+          *ip_hl = off;
+          return true;
+        }
+      if (nh == 0 || nh == 43 || nh == 60)
+        {
+          if (off + 2 > len)
+            return false;
+          uint8_t n_nh = pkt[off];
+          uint8_t ext_len = pkt[off + 1];
+          size_t step = 8U + ((size_t)ext_len * 8U);
+          if (step == 0 || off + step > len)
+            return false;
+          nh = n_nh;
+          off += step;
+          continue;
+        }
+      if (nh == 44)
+        {
+          if (off + 8 > len)
+            return false;
+          nh = pkt[off];
+          off += 8;
+          continue;
+        }
+      return false;
+    }
+  return false;
+}
+
+static inline bool
 is_tcp_syn (const uint8_t *l3, size_t l3_len)
 {
   if (!l3 || l3_len < 20)
@@ -93,11 +132,12 @@ is_tcp_syn (const uint8_t *l3, size_t l3_len)
     }
   if (v == 6)
     {
-      if (l3_len < 60)
+      size_t off = 0;
+      if (!ip6_tcp_off_get (l3, l3_len, &off))
         return false;
-      if (l3[6] != 6)
+      if (off + 20U > l3_len)
         return false;
-      return (l3[40 + 13] & 0x02U) != 0;
+      return (l3[off + 13] & 0x02U) != 0;
     }
   return false;
 }

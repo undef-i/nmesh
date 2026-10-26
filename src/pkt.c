@@ -60,6 +60,27 @@ hdr_bld (uint8_t pkt_type, uint8_t rel_f, uint8_t hop_c,
   hdr[1] = hop_c;
 }
 
+static uint8_t *
+pkt_enc_stage (uint8_t *buf, const uint8_t hdr[PKT_CH_SZ],
+               const uint8_t *payload, size_t pl_len)
+{
+  uint8_t *ct_ptr = buf + PKT_NONCE_SZ + PKT_MAC_SZ;
+  memcpy (ct_ptr, hdr, PKT_CH_SZ);
+  memcpy (ct_ptr + PKT_CH_SZ, payload, pl_len);
+  return ct_ptr;
+}
+
+static uint8_t *
+pkt_enc_finish (uint8_t *buf, size_t pl_len,
+                const uint8_t nonce[PKT_NONCE_SZ],
+                const uint8_t mac[PKT_MAC_SZ], size_t *out_len)
+{
+  memcpy (buf, nonce, PKT_NONCE_SZ);
+  memcpy (buf + PKT_NONCE_SZ, mac, PKT_MAC_SZ);
+  *out_len = PKT_HDR_SZ + pl_len;
+  return buf;
+}
+
 uint8_t *
 pkt_enc_psk (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
              size_t pl_len, uint8_t *buf, size_t *out_len)
@@ -71,14 +92,9 @@ pkt_enc_psk (Cry *s, const uint8_t hdr[PKT_CH_SZ], const uint8_t *payload,
       return NULL;
     }
   uint8_t nonce[PKT_NONCE_SZ], mac[PKT_MAC_SZ];
-  uint8_t *ct_ptr = buf + PKT_NONCE_SZ + PKT_MAC_SZ;
-  memcpy (ct_ptr, hdr, PKT_CH_SZ);
-  memcpy (ct_ptr + PKT_CH_SZ, payload, pl_len);
+  uint8_t *ct_ptr = pkt_enc_stage (buf, hdr, payload, pl_len);
   cry_enc (s, ct_ptr, pl_len + PKT_CH_SZ, NULL, 0, nonce, mac, ct_ptr);
-  memcpy (buf, nonce, PKT_NONCE_SZ);
-  memcpy (buf + PKT_NONCE_SZ, mac, PKT_MAC_SZ);
-  *out_len = PKT_HDR_SZ + pl_len;
-  return buf;
+  return pkt_enc_finish (buf, pl_len, nonce, mac, out_len);
 }
 
 uint8_t *
@@ -93,9 +109,7 @@ pkt_enc_to (Cry *s, const uint8_t dst_lla[16], const uint8_t hdr[PKT_CH_SZ],
       return NULL;
     }
   uint8_t nonce[PKT_NONCE_SZ], mac[PKT_MAC_SZ];
-  uint8_t *ct_ptr = buf + PKT_NONCE_SZ + PKT_MAC_SZ;
-  memcpy (ct_ptr, hdr, PKT_CH_SZ);
-  memcpy (ct_ptr + PKT_CH_SZ, payload, pl_len);
+  uint8_t *ct_ptr = pkt_enc_stage (buf, hdr, payload, pl_len);
   if (cry_enc_to (s, dst_lla, ct_ptr, pl_len + PKT_CH_SZ, NULL, 0, nonce,
                   mac, ct_ptr)
       != 0)
@@ -104,10 +118,7 @@ pkt_enc_to (Cry *s, const uint8_t dst_lla[16], const uint8_t hdr[PKT_CH_SZ],
         *out_len = 0;
       return NULL;
     }
-  memcpy (buf, nonce, PKT_NONCE_SZ);
-  memcpy (buf + PKT_NONCE_SZ, mac, PKT_MAC_SZ);
-  *out_len = PKT_HDR_SZ + pl_len;
-  return buf;
+  return pkt_enc_finish (buf, pl_len, nonce, mac, out_len);
 }
 
 uint8_t *
@@ -232,75 +243,82 @@ stat_rsp_bld (Cry *s, uint32_t req_id, uint64_t total_len, uint64_t off,
                      buf, out_len);
 }
 
-int
-pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
-         size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out, size_t *pt_len_out)
+static int
+pkt_dec_prep (uint8_t *raw, size_t raw_len, uint8_t *pt_buf, size_t pt_len,
+              const uint8_t **nonce, const uint8_t **mac,
+              const uint8_t **ct, size_t *ct_len, uint8_t **pt)
 {
   if (raw_len < PKT_HDR_SZ)
     return -1;
-  const uint8_t *nonce = raw;
-  const uint8_t *mac = raw + PKT_NONCE_SZ;
-  const uint8_t *ct = raw + PKT_NONCE_SZ + PKT_MAC_SZ;
-  size_t ct_len = raw_len - PKT_NONCE_SZ - PKT_MAC_SZ;
-  if (ct_len < PKT_CH_SZ)
+  *nonce = raw;
+  *mac = raw + PKT_NONCE_SZ;
+  *ct = raw + PKT_NONCE_SZ + PKT_MAC_SZ;
+  *ct_len = raw_len - PKT_NONCE_SZ - PKT_MAC_SZ;
+  if (*ct_len < PKT_CH_SZ)
     return -1;
-  uint8_t *pt = pt_buf ? pt_buf : (raw + PKT_NONCE_SZ + PKT_MAC_SZ);
-  size_t pt_cap = pt_buf ? pt_len : ct_len;
-  if (ct_len > pt_cap)
+  *pt = pt_buf ? pt_buf : (raw + PKT_NONCE_SZ + PKT_MAC_SZ);
+  size_t pt_cap = pt_buf ? pt_len : *ct_len;
+  if (*ct_len > pt_cap)
     return -1;
-  if (cry_dec (s, ct, ct_len, NULL, 0, nonce, mac, pt) != 0)
-    return -1;
+  return 0;
+}
+
+static void
+pkt_hdr_fill (const uint8_t *pt, size_t ct_len, PktHdr *hdr_out,
+              uint8_t **pt_out, size_t *pt_len_out)
+{
   uint8_t tf = pt[0];
   hdr_out->pkt_type = (uint8_t)(tf & PKT_TF_TYPE_MASK);
   hdr_out->rel_f = (uint8_t)((tf & PKT_TF_REL) != 0);
   hdr_out->hop_c = pt[1];
-  *pt_out = pt + PKT_CH_SZ;
+  *pt_out = (uint8_t *)pt + PKT_CH_SZ;
   *pt_len_out = ct_len - PKT_CH_SZ;
+}
+
+int
+pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
+         size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out, size_t *pt_len_out)
+{
+  const uint8_t *nonce, *mac, *ct;
+  size_t ct_len;
+  uint8_t *pt;
+  if (pkt_dec_prep (raw, raw_len, pt_buf, pt_len, &nonce, &mac, &ct,
+                    &ct_len, &pt)
+      != 0)
+    return -1;
+  if (cry_dec (s, ct, ct_len, NULL, 0, nonce, mac, pt) != 0)
+    return -1;
+  pkt_hdr_fill (pt, ct_len, hdr_out, pt_out, pt_len_out);
   return 0;
 }
 
 int
 pkt_dec_from (Cry *s, const uint8_t src_lla[16], uint8_t *raw, size_t raw_len,
               uint8_t *pt_buf, size_t pt_len, PktHdr *hdr_out,
-              uint8_t **pt_out, size_t *pt_len_out, bool allow_psk_fallback,
+              uint8_t **pt_out, size_t *pt_len_out,
               bool *used_psk, uint8_t matched_lla[16])
 {
-  if (raw_len < PKT_HDR_SZ)
-    return -1;
-  const uint8_t *nonce = raw;
-  const uint8_t *mac = raw + PKT_NONCE_SZ;
-  const uint8_t *ct = raw + PKT_NONCE_SZ + PKT_MAC_SZ;
-  size_t ct_len = raw_len - PKT_NONCE_SZ - PKT_MAC_SZ;
-  if (ct_len < PKT_CH_SZ)
-    return -1;
-  uint8_t *pt = pt_buf ? pt_buf : (raw + PKT_NONCE_SZ + PKT_MAC_SZ);
-  size_t pt_cap = pt_buf ? pt_len : ct_len;
-  if (ct_len > pt_cap)
+  const uint8_t *nonce, *mac, *ct;
+  size_t ct_len;
+  uint8_t *pt;
+  if (pkt_dec_prep (raw, raw_len, pt_buf, pt_len, &nonce, &mac, &ct,
+                    &ct_len, &pt)
+      != 0)
     return -1;
   bool psk = false;
   if (matched_lla)
     memset (matched_lla, 0, 16);
-  if (cry_dec_from (s, src_lla, ct, ct_len, NULL, 0, nonce, mac, pt, NULL,
+  if (cry_dec_from (s, src_lla, ct, ct_len, NULL, 0, nonce, mac, pt,
                     matched_lla)
       != 0)
     {
-      if (s && s->auth_ibs && !allow_psk_fallback)
-        return -1;
       if (cry_dec (s, ct, ct_len, NULL, 0, nonce, mac, pt) != 0)
         return -1;
       psk = true;
     }
-  uint8_t tf = pt[0];
-  hdr_out->pkt_type = (uint8_t)(tf & PKT_TF_TYPE_MASK);
-  hdr_out->rel_f = (uint8_t)((tf & PKT_TF_REL) != 0);
-  hdr_out->hop_c = pt[1];
-  if (psk && hdr_out->pkt_type != PT_PING && hdr_out->pkt_type != PT_PONG
-      && hdr_out->pkt_type != PT_STAT_REQ && hdr_out->pkt_type != PT_STAT_RSP)
-    return -1;
   if (used_psk)
     *used_psk = psk;
-  *pt_out = pt + PKT_CH_SZ;
-  *pt_len_out = ct_len - PKT_CH_SZ;
+  pkt_hdr_fill (pt, ct_len, hdr_out, pt_out, pt_len_out);
   return 0;
 }
 

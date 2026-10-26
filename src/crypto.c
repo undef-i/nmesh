@@ -125,9 +125,7 @@ ag_cpuid_aesni (void)
 static void
 ag_rnd (uint8_t out[16], const uint8_t in[16], const uint8_t k[16])
 {
-  uint8_t kk[16];
-  memcpy (kk, k, 16);
-  ag_rnd_soft (out, in, kk);
+  ag_rnd_soft (out, in, k);
 }
 
 static void
@@ -503,7 +501,7 @@ ag_dec_det (uint8_t *pt, const uint8_t *ct, size_t ct_len,
 static bool
 cry_lla_ok (const uint8_t lla[16])
 {
-  return lla && lla[0] == 0xfe && ((lla[1] & 0xc0) == 0x80);
+  return lla && IS_LLA_VAL (lla);
 }
 
 static CryPeer *
@@ -589,7 +587,13 @@ cry_init (Cry *s, const uint8_t psk[32], bool auth_ibs)
   else
     {
       /* Fixed salt: both ends must derive the same master key from the PSK. */
-      static const uint8_t psk_salt[crypto_pwhash_SALTBYTES]
+      /* Wire protocol: changing a separator changes every derived key. */
+#define CRY_KDF_DOM_KEY_L2H 4U
+#define CRY_KDF_DOM_KEY_H2L 5U
+#define CRY_KDF_DOM_SID_L2H 6U
+#define CRY_KDF_DOM_SID_H2L 7U
+
+static const uint8_t psk_salt[crypto_pwhash_SALTBYTES]
           = "nmesh-psk-salt01";
       if (crypto_pwhash (s->key, sizeof (s->key), (const char *)psk,
                          32, psk_salt, crypto_pwhash_OPSLIMIT_INTERACTIVE,
@@ -683,7 +687,7 @@ cry_peer_rekey (Cry *s, const uint8_t our_lla[16],
   uint8_t high_to_low_sid[CRY_NONCE_SID_SZ];
   const uint8_t *kdf_key = s->auth_ibs ? NULL : s->key;
   size_t kdf_key_len = s->auth_ibs ? 0 : sizeof (s->key);
-  seed[0] = 4;
+  seed[0] = CRY_KDF_DOM_KEY_L2H;
   memcpy (seed + 1U, shared, sizeof (shared));
   memcpy (seed + 1U + sizeof (shared), low_lla, 16);
   memcpy (seed + 1U + sizeof (shared) + 16U, high_lla, 16);
@@ -692,13 +696,13 @@ cry_peer_rekey (Cry *s, const uint8_t our_lla[16],
           CRY_KX_PUB_SZ);
   crypto_generichash (low_to_high, sizeof (low_to_high), seed, sizeof (seed),
                       kdf_key, kdf_key_len);
-  seed[0] = 5;
+  seed[0] = CRY_KDF_DOM_KEY_H2L;
   crypto_generichash (high_to_low, sizeof (high_to_low), seed, sizeof (seed),
                       kdf_key, kdf_key_len);
-  seed[0] = 6;
+  seed[0] = CRY_KDF_DOM_SID_L2H;
   crypto_generichash (low_to_high_sid, sizeof (low_to_high_sid), seed,
                       sizeof (seed), kdf_key, kdf_key_len);
-  seed[0] = 7;
+  seed[0] = CRY_KDF_DOM_SID_H2L;
   crypto_generichash (high_to_low_sid, sizeof (high_to_low_sid), seed,
                       sizeof (seed), kdf_key, kdf_key_len);
 
@@ -818,11 +822,9 @@ int
 cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
               size_t ct_len, const uint8_t *ad, size_t ad_len,
               const uint8_t nonce[CRY_NONCE_WIRE_SZ],
-              const uint8_t mac[CRY_MAC_SZ], uint8_t *pt, bool *used_psk,
+              const uint8_t mac[CRY_MAC_SZ], uint8_t *pt,
               uint8_t matched_lla[16])
 {
-  if (used_psk)
-    *used_psk = false;
   if (matched_lla)
     memset (matched_lla, 0, 16);
   if (s)
@@ -854,8 +856,6 @@ cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
           sodium_memzero (key, sizeof (key));
           if (rc == 0)
             {
-              if (used_psk)
-                *used_psk = false;
               if (matched_lla)
                 memcpy (matched_lla, lla, 16);
               sodium_memzero (lla, sizeof (lla));

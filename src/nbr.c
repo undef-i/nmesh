@@ -85,36 +85,6 @@ lla_inf_s (Rt *rt, const uint8_t src_ip[16], uint16_t src_port,
   return false;
 }
 
-uint16_t
-mtu_inf_s (const Rt *rt, const uint8_t src_ip[16], uint16_t src_port)
-{
-  uint16_t best = 0;
-  for (uint32_t re_idx = 0; re_idx < rt->cnt; re_idx++)
-    {
-      const Re *re = &rt->re_arr[re_idx];
-      if (re->r2d != 0)
-        continue;
-      if (memcmp (re->ep_ip, src_ip, 16) != 0)
-        continue;
-      if (re->ep_port != src_port)
-        continue;
-      if (!re->is_act || re->state == RT_DED)
-        continue;
-      uint16_t mtu = re->mtu;
-      if (mtu == 0)
-        continue;
-      if (best == 0 || mtu < best)
-        best = mtu;
-    }
-  return best;
-}
-
-bool
-is_ip_bgn (const uint8_t ip[16])
-{
-  return bogon_ip_match (ip);
-}
-
 uint8_t *
 ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port, uint64_t ts,
           uint64_t sid, uint64_t prb_tok, uint8_t *buf, size_t *out_len)
@@ -332,12 +302,6 @@ nbr_prs_mtu_prb (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
   return 0;
 }
 
-int
-nbr_prs_mtu_ack (const uint8_t *pt, size_t pt_len, uint32_t *probe_id,
-                 uint16_t *probe_mtu)
-{
-  return nbr_prs_mtu_prb (pt, pt_len, probe_id, probe_mtu);
-}
 
 int
 on_ping (const uint8_t *pt, size_t pt_len, uint64_t *o_ts, uint64_t *sid,
@@ -406,34 +370,13 @@ on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
   if (memcmp (tgt_lla, o_lla, 16) == 0)
     {
       Re req_re;
-      bool has_re = rt_dir_fnd (rt, req_lla, &req_re);
-      if (!has_re)
-        {
-          for (uint32_t re_idx = 0; re_idx < rt->cnt; re_idx++)
-            {
-              Re *re = &rt->re_arr[re_idx];
-              if (re->r2d != 0)
-                continue;
-              if (re->state == RT_DED)
-                continue;
-              if (memcmp (re->lla, req_lla, 16) != 0)
-                continue;
-              req_re = *re;
-              has_re = true;
-              break;
-            }
-        }
-      if (has_re)
+      if (rt_dir_fnd (rt, req_lla, &req_re))
         {
           uint8_t p_buf[UDP_PL_MAX];
           size_t p_len;
-          ping_bld (s, o_lla, cfg ? cfg->port : 0, ts, sid, 0, p_buf,
-                    &p_len);
-          if (cfg)
-            (void)tp_send_ctrl (udp, rt, cfg, req_re.ep_ip, req_re.ep_port,
-                                p_buf, p_len);
-          else
-            udp_tx (udp, req_re.ep_ip, req_re.ep_port, p_buf, p_len);
+          ping_bld (s, o_lla, cfg->port, ts, sid, 0, p_buf, &p_len);
+          (void)tp_send_ctrl (udp, rt, cfg, req_re.ep_ip, req_re.ep_port,
+                              p_buf, p_len);
         }
       return 0;
     }
@@ -445,11 +388,8 @@ on_hp (const uint8_t *pt, size_t pt_len, Cry *s, Udp *udp, Rt *rt,
       hp_bld (s, req_lla, tgt_lla, tgt_re.lla, out_buf, &out_len);
       if (out_len == 0)
         return 0;
-      if (cfg)
-        (void)tp_send_ctrl (udp, rt, cfg, tgt_re.ep_ip, tgt_re.ep_port,
-                            out_buf, out_len);
-      else
-        udp_tx (udp, tgt_re.ep_ip, tgt_re.ep_port, out_buf, out_len);
+      (void)tp_send_ctrl (udp, rt, cfg, tgt_re.ep_ip, tgt_re.ep_port,
+                          out_buf, out_len);
     }
   return 0;
 }

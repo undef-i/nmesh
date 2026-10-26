@@ -1,4 +1,5 @@
 #include "mss.h"
+#include "utils.h"
 #include <stdbool.h>
 
 static uint16_t
@@ -23,48 +24,6 @@ csum_upd_16 (uint16_t o_chk, uint16_t old_word, uint16_t n_word)
   while (sum >> 16)
     sum = (sum & 0xffffU) + (sum >> 16);
   return (uint16_t)(~sum & 0xffffU);
-}
-
-static bool
-ip6_tcp_off_get (const uint8_t *pkt, size_t len, size_t *ip_hl)
-{
-  if (!pkt || !ip_hl)
-    return false;
-  if (len < 40)
-    return false;
-  uint8_t nh = pkt[6];
-  size_t off = 40;
-  while (off < len)
-    {
-      if (nh == 6)
-        {
-          *ip_hl = off;
-          return true;
-        }
-      if (nh == 0 || nh == 43 || nh == 60)
-        {
-          if (off + 2 > len)
-            return false;
-          uint8_t n_nh = pkt[off];
-          uint8_t ext_len = pkt[off + 1];
-          size_t step = 8U + ((size_t)ext_len * 8U);
-          if (step == 0 || off + step > len)
-            return false;
-          nh = n_nh;
-          off += step;
-          continue;
-        }
-      if (nh == 44)
-        {
-          if (off + 8 > len)
-            return false;
-          nh = pkt[off];
-          off += 8;
-          continue;
-        }
-      return false;
-    }
-  return false;
 }
 
 void
@@ -105,7 +64,7 @@ mss_clp (uint8_t *l3_pkt, size_t len, uint16_t max_l3_pl)
   uint8_t data_off = (uint8_t)((tcp[12] >> 4) * 4);
   if (data_off < 20 || data_off > tcp_len)
     return;
-  uint16_t in_hl = (ver == 6) ? 60U : 40U;
+  uint16_t in_hl = (uint16_t)ip_hl + 20U;
   if (max_l3_pl <= in_hl)
     return;
   uint16_t t_mss = (uint16_t)(max_l3_pl - in_hl);
