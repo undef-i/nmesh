@@ -9,6 +9,8 @@
 
 #define ADV_DGST_INTV RT_HL_INTV
 
+#define ADV_REQ_MAX 64
+
 typedef struct
 {
   uint8_t lla[16];
@@ -19,13 +21,21 @@ typedef struct
   uint64_t unack_ts;
   uint8_t *unack_buf;
   size_t unack_len;
+  bool unack_retx;
+  uint64_t srtt_ms;
+  uint64_t rttvar_ms;
+  uint64_t rto_ms;
   AdvEnt *sent;
   uint32_t sent_cnt;
   uint32_t sent_cap;
   AdvEnt *pend;
   uint32_t pend_cnt;
   uint64_t dgst_ts;
-  uint32_t inval[64];
+  uint32_t *dgst_acc;
+  uint32_t dgst_acc_cnt;
+  uint32_t dgst_acc_cap;
+  bool dgst_open;
+  uint32_t inval[ADV_REQ_MAX];
   uint32_t inval_cnt;
 } AdvSes;
 
@@ -48,11 +58,11 @@ void adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
 int adv_on_upd (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
                 size_t pt_len, uint32_t *ack_seq);
 int adv_on_ack (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
-                size_t pt_len);
+                size_t pt_len, uint64_t now);
 int adv_on_dgst (Adv *a, Rt *rt, const uint8_t src_lla[16],
                  const uint8_t src_ip[16], uint16_t src_port,
                  const uint8_t *pt, size_t pt_len, uint8_t *req_ids,
-                 uint32_t req_cap, uint32_t *req_cnt);
+                 uint32_t req_cap, uint32_t *req_cnt, uint64_t sys_ts);
 int adv_on_req (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
                 size_t pt_len);
 uint8_t *adv_ack_bld (Cry *s, uint32_t seq, const uint8_t dst_lla[16],
@@ -64,8 +74,9 @@ uint8_t *adv_req_bld (Cry *s, const uint8_t *ids, uint32_t cnt,
 size_t adv_ent_ser (uint8_t *dst, const AdvEnt *src);
 int adv_ent_des (AdvEnt *dst, const uint8_t *src, size_t avail);
 uint32_t adv_set_bld (Rt *rt, const uint8_t our_lla[16], bool self_dir_ok,
-                      bool dst_no_dir, const uint8_t tgt_lla[16],
-                      AdvEnt *out, uint32_t max_cnt);
+                      bool dst_no_dir, bool is_p2p,
+                      const uint8_t tgt_lla[16], AdvEnt *out,
+                      uint32_t max_cnt);
 uint8_t *seq_req_bld (Cry *s, const uint8_t tgt_lla[16], uint8_t *buf,
                       const uint8_t dst_lla[16], size_t *out_len);
 int on_seq_req (const uint8_t *pt, size_t pt_len, uint8_t tgt_lla[16]);

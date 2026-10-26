@@ -1,4 +1,5 @@
 #include "adv.h"
+#include "bogon.h"
 #include "nbr.h"
 #include "pkt.h"
 #include "packet.h"
@@ -132,6 +133,10 @@ ses_clr (AdvSes *ses)
   ses->unack_len = 0;
   ses->unack_seq = 0;
   ses->unack_ts = 0;
+  ses->unack_retx = false;
+  ses->srtt_ms = 0;
+  ses->rttvar_ms = 0;
+  ses->rto_ms = 0;
   free (ses->sent);
   ses->sent = NULL;
   ses->sent_cnt = 0;
@@ -139,6 +144,11 @@ ses_clr (AdvSes *ses)
   free (ses->pend);
   ses->pend = NULL;
   ses->pend_cnt = 0;
+  free (ses->dgst_acc);
+  ses->dgst_acc = NULL;
+  ses->dgst_acc_cnt = 0;
+  ses->dgst_acc_cap = 0;
+  ses->dgst_open = false;
   ses->inval_cnt = 0;
   ses->tx_nxt = 0;
   ses->rx_last = 0;
@@ -269,7 +279,7 @@ adv_inval_dst (Adv *a, const uint8_t peer_lla[16], const uint8_t dst_lla[16])
   for (uint32_t i = 0; i < ses->inval_cnt; i++)
     if (ses->inval[i] == did)
       return;
-  if (ses->inval_cnt < 64)
+  if (ses->inval_cnt < ADV_REQ_MAX)
     ses->inval[ses->inval_cnt++] = did;
 }
 
@@ -289,7 +299,7 @@ ses_apply_pend (AdvSes *ses)
 
 int
 adv_on_ack (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
-            size_t pt_len)
+            size_t pt_len, uint64_t now)
 {
   if (!pt || pt_len < 4)
     return -1;
@@ -297,12 +307,36 @@ adv_on_ack (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
   AdvSes *ses = ses_fnd (a, src_lla);
   if (!ses || ses->unack_seq == 0 || seq != ses->unack_seq)
     return -1;
+  if (!ses->unack_retx && now > ses->unack_ts)
+    {
+      uint64_t sample = now - ses->unack_ts;
+      if (ses->srtt_ms == 0)
+        {
+          ses->srtt_ms = sample;
+          ses->rttvar_ms = sample / 2;
+        }
+      else
+        {
+          uint64_t err = (ses->srtt_ms > sample)
+                             ? ses->srtt_ms - sample
+                             : sample - ses->srtt_ms;
+          ses->rttvar_ms = (3 * ses->rttvar_ms + err) / 4;
+          ses->srtt_ms = (7 * ses->srtt_ms + sample) / 8;
+        }
+      uint64_t rto = ses->srtt_ms + 4 * ses->rttvar_ms;
+      if (rto < RTO_MIN)
+        rto = RTO_MIN;
+      if (rto > RTO_MAX)
+        rto = RTO_MAX;
+      ses->rto_ms = rto;
+    }
   ses_apply_pend (ses);
   free (ses->unack_buf);
   ses->unack_buf = NULL;
   ses->unack_len = 0;
   ses->unack_seq = 0;
   ses->unack_ts = 0;
+  ses->unack_retx = false;
   return 0;
 }
 
@@ -316,7 +350,9 @@ adv_on_upd (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
   AdvSes *ses = ses_fnd (a, src_lla);
   if (ack_seq)
     *ack_seq = seq;
-  if (ses && seq != 0 && seq <= ses->rx_last)
+  if (seq == 0)
+    return 1;
+  if (ses && seq <= ses->rx_last)
     return 1;
   if (ses)
     ses->rx_last = seq;
@@ -339,9 +375,9 @@ uint8_t *
 adv_req_bld (Cry *s, const uint8_t *ids, uint32_t cnt,
              const uint8_t dst_lla[16], uint8_t *buf, size_t *out_len)
 {
-  uint8_t payload[2 + 4 * 64];
-  if (cnt > 64)
-    cnt = 64;
+  uint8_t payload[2 + 4 * ADV_REQ_MAX];
+  if (cnt > ADV_REQ_MAX)
+    cnt = ADV_REQ_MAX;
   u16_wr (payload, (uint16_t)cnt);
   memcpy (payload + 2, ids, (size_t)cnt * 4);
   uint8_t hdr[PKT_CH_SZ];
@@ -369,20 +405,85 @@ adv_on_req (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
   return 0;
 }
 
+#define DGST_F_START 0x8000U
+#define DGST_F_END 0x4000U
+#define DGST_CNT_MASK 0x3FFFU
+
+static bool
+dgst_acc_put (AdvSes *ses, uint32_t did)
+{
+  if (ses->dgst_acc_cnt == ses->dgst_acc_cap)
+    {
+      uint32_t ncap = ses->dgst_acc_cap ? ses->dgst_acc_cap * 2 : 16;
+      uint32_t *ns
+          = realloc (ses->dgst_acc, (size_t)ncap * sizeof (uint32_t));
+      if (!ns)
+        return false;
+      ses->dgst_acc = ns;
+      ses->dgst_acc_cap = ncap;
+    }
+  ses->dgst_acc[ses->dgst_acc_cnt++] = did;
+  return true;
+}
+
+static void
+dgst_sweep (Rt *rt, const uint8_t src_lla[16], const uint8_t src_ip[16],
+            uint16_t src_port, const AdvSes *ses, uint64_t sys_ts)
+{
+  for (uint32_t i = 0; i < rt->cnt; i++)
+    {
+      const Re *re = &rt->re_arr[i];
+      if (re->r2d == 0)
+        continue;
+      if (re->state == RT_DED)
+        continue;
+      if (memcmp (re->ep_ip, src_ip, 16) != 0 || re->ep_port != src_port)
+        continue;
+      if (memcmp (re->nhop_lla, src_lla, 16) != 0)
+        continue;
+      uint32_t did = lla_id (re->lla);
+      bool offered = false;
+      for (uint32_t k = 0; k < ses->dgst_acc_cnt; k++)
+        if (ses->dgst_acc[k] == did)
+          offered = true;
+      if (offered)
+        continue;
+      Re dead_re;
+      memset (&dead_re, 0, sizeof (dead_re));
+      memcpy (dead_re.lla, re->lla, 16);
+      memcpy (dead_re.ep_ip, re->ep_ip, 16);
+      dead_re.ep_port = re->ep_port;
+      dead_re.seq = re->seq;
+      dead_re.r2d = 1;
+      dead_re.state = RT_DED;
+      memcpy (dead_re.nhop_lla, src_lla, 16);
+      rt_upd (rt, &dead_re, sys_ts);
+    }
+}
+
 int
 adv_on_dgst (Adv *a, Rt *rt, const uint8_t src_lla[16],
              const uint8_t src_ip[16], uint16_t src_port, const uint8_t *pt,
              size_t pt_len, uint8_t *req_ids, uint32_t req_cap,
-             uint32_t *req_cnt)
+             uint32_t *req_cnt, uint64_t sys_ts)
 {
   if (!pt || pt_len < 2 || !req_ids || !req_cnt)
     return -1;
-  uint16_t cnt = u16_rd (pt);
+  uint16_t raw = u16_rd (pt);
+  bool is_start = (raw & DGST_F_START) != 0;
+  bool is_end = (raw & DGST_F_END) != 0;
+  uint16_t cnt = (uint16_t)(raw & DGST_CNT_MASK);
   size_t max_cnt = (pt_len - 2) / 16;
   if (cnt > max_cnt)
-    cnt = (uint16_t)max_cnt;
+    return 0;
   *req_cnt = 0;
   uint32_t src_id = lla_id (src_lla);
+  AdvSes *ses = ses_fnd (a, src_lla);
+  if (ses && is_start)
+    {
+      ses->dgst_acc_cnt = 0;
+      ses->dgst_open = true;
+    }
   for (uint16_t j = 0; j < cnt; j++)
     {
       const uint8_t *ln = pt + 2 + (size_t)j * 16;
@@ -390,6 +491,8 @@ adv_on_dgst (Adv *a, Rt *rt, const uint8_t src_lla[16],
       uint32_t dnhop = u32_rd (ln + 4);
       uint32_t dseq = u32_rd (ln + 8);
       uint32_t dhash = u32_rd (ln + 12);
+      if (ses && ses->dgst_open && !dgst_acc_put (ses, did))
+        ses->dgst_open = false;
       bool need = false;
       if (did == src_id)
         {
@@ -431,7 +534,11 @@ adv_on_dgst (Adv *a, Rt *rt, const uint8_t src_lla[16],
           (*req_cnt)++;
         }
     }
-  (void)a;
+  if (ses && is_end && ses->dgst_open)
+    {
+      dgst_sweep (rt, src_lla, src_ip, src_port, ses, sys_ts);
+      ses->dgst_open = false;
+    }
   return 0;
 }
 
@@ -447,7 +554,7 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
       const Re *re = &rt->re_arr[i];
       if (re->r2d != 0)
         continue;
-      if (!re->is_act || re->state == RT_DED)
+      if (re->state != RT_ACT)
         continue;
       if (memcmp (re->lla, cfg->addr, 16) == 0)
         continue;
@@ -458,9 +565,10 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
         continue;
       bool peer_no_dir = false;
       (void)rt_src_no_dir_known (rt, re->lla, &peer_no_dir);
-      bool self_dir_ok = cfg->p2p == P2P_EN && !peer_no_dir;
-      bool need_set = rev_changed || ses->dgst_ts == 0
+      bool self_dir_ok = cfg->p2p && !peer_no_dir;
+      bool dgst_due = ses->dgst_ts == 0
                       || (now - ses->dgst_ts >= ADV_DGST_INTV);
+      bool need_set = rev_changed || dgst_due || ses->inval_cnt > 0;
       AdvEnt *set = NULL;
       uint32_t set_cnt = 0;
       if (need_set)
@@ -468,92 +576,78 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
           set = malloc ((size_t)(rt->cnt ? rt->cnt : 1) * sizeof (AdvEnt));
           if (set)
             set_cnt = adv_set_bld (rt, cfg->addr, self_dir_ok, peer_no_dir,
-                                   NULL, set, rt->cnt);
+                                   cfg->p2p, NULL, set, rt->cnt);
         }
-      if (ses->unack_buf)
+      uint16_t known = (re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_MIN;
+      uint32_t budget
+          = (known > TNL_OH_MAX) ? (uint32_t)(known - TNL_OH_MAX) : 1U;
+      bool sent_new = false;
+      if (set)
         {
-          uint64_t rto = re->rto ? re->rto : RTO_INIT;
-          if (now - ses->unack_ts >= rto)
-            {
-              if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_UPD,
-                            ses->unack_buf, ses->unack_len, now))
-                ses->unack_ts = now;
-            }
-        }
-      else if (set)
-        {
-          for (uint32_t q = 0; q < ses->inval_cnt; q++)
-            {
-              for (uint32_t k = 0; k < ses->sent_cnt; k++)
-                {
-                  if (lla_id (ses->sent[k].lla) != ses->inval[q])
-                    continue;
-                  bool in_cur = false;
-                  for (uint32_t m = 0; m < set_cnt; m++)
-                    if (ent_key_eq (&set[m], &ses->sent[k]))
-                      in_cur = true;
-                  if (in_cur)
-                    {
-                      AdvEnt gone = ses->sent[k];
-                      sent_del (ses, &gone);
-                      k--;
-                    }
-                }
-            }
-          ses->inval_cnt = 0;
-          uint32_t budget = rt_mtu_ub (rt);
-          if (budget > 100U)
-            budget -= 100U;
           size_t used = 6;
-          uint32_t ch_cap = set_cnt + ses->sent_cnt;
+          uint32_t ch_cap = set_cnt + ses->sent_cnt + ses->pend_cnt;
           AdvEnt *ch = malloc ((size_t)(ch_cap ? ch_cap : 1)
                                * sizeof (AdvEnt));
           uint32_t ch_cnt = 0;
           if (ch)
             {
+              for (int pass = 0; pass < 2; pass++)
+                {
+                  const AdvEnt *src_arr
+                      = pass == 0 ? ses->sent : ses->pend;
+                  uint32_t src_cnt
+                      = pass == 0 ? ses->sent_cnt : ses->pend_cnt;
+                  for (uint32_t k = 0; k < src_cnt; k++)
+                    {
+                      bool in_cur = false;
+                      for (uint32_t m = 0; m < set_cnt; m++)
+                        if (ent_key_eq (&set[m], &src_arr[k]))
+                          in_cur = true;
+                      if (in_cur)
+                        continue;
+                      bool dup = false;
+                      for (uint32_t m = 0; m < ch_cnt; m++)
+                        if (ent_key_eq (&ch[m], &src_arr[k]))
+                          dup = true;
+                      if (dup)
+                        continue;
+                      if (ch_cnt > 0 && used >= budget)
+                        break;
+                      AdvEnt wd = src_arr[k];
+                      wd.adv_m = RT_F_INF;
+                      wd.state = (uint8_t)RT_DED;
+                      ch[ch_cnt++] = wd;
+                      used += ent_sz (&wd);
+                    }
+                  if (ch_cnt > 0 && used >= budget)
+                    break;
+                }
               for (uint32_t k = 0; k < set_cnt; k++)
                 {
-                  int si = sent_fnd (ses, &set[k]);
-                  if (si >= 0 && ent_eq (&ses->sent[si], &set[k]))
-                    continue;
-                  size_t esz = ent_sz (&set[k]);
-                  if (ch_cnt > 0 && used + esz > budget)
-                    continue;
-                  ch[ch_cnt++] = set[k];
-                  used += esz;
-                }
-              for (uint32_t k = 0; k < ses->sent_cnt; k++)
-                {
-                  bool in_cur = false;
-                  for (uint32_t m = 0; m < set_cnt; m++)
-                    if (ent_key_eq (&set[m], &ses->sent[k]))
-                      in_cur = true;
-                  if (in_cur)
-                    continue;
-                  bool has_rec = false;
-                  for (uint32_t m = 0; m < rt->cnt; m++)
+                  const AdvEnt *eff = NULL;
+                  for (uint32_t m = 0; m < ses->pend_cnt; m++)
+                    if (ent_key_eq (&ses->pend[m], &set[k]))
+                      eff = &ses->pend[m];
+                  if (!eff)
                     {
-                      const Re *re = &rt->re_arr[m];
-                      if (memcmp (re->lla, ses->sent[k].lla, 16) == 0
-                          && memcmp (re->nhop_lla, ses->sent[k].nhop_lla,
-                                     16) == 0
-                          && memcmp (re->ep_ip, ses->sent[k].ep_ip, 16) == 0
-                          && re->ep_port == ses->sent[k].ep_port
-                          && ent_exp_ok (re, cfg->addr))
-                        has_rec = true;
+                      int si = sent_fnd (ses, &set[k]);
+                      if (si >= 0)
+                        eff = &ses->sent[si];
                     }
-                  if (has_rec)
+                  bool forced = false;
+                  for (uint32_t q = 0; q < ses->inval_cnt; q++)
+                    if (lla_id (set[k].lla) == ses->inval[q])
+                      forced = true;
+                  if (!forced && eff && !ent_is_wd (eff)
+                      && ent_eq (eff, &set[k]))
                     continue;
-                  AdvEnt wd = ses->sent[k];
-                  wd.adv_m = RT_F_INF;
-                  wd.state = (uint8_t)RT_DED;
-                  size_t esz = ent_sz (&wd);
-                  if (ch_cnt > 0 && used + esz > budget)
-                    continue;
-                  ch[ch_cnt++] = wd;
-                  used += esz;
+                  if (ch_cnt > 0 && used >= budget)
+                    break;
+                  ch[ch_cnt++] = set[k];
+                  used += ent_sz (&set[k]);
                 }
             }
+          ses->inval_cnt = 0;
           if (ch && ch_cnt > 0)
             {
               size_t pl_len = used;
@@ -569,14 +663,17 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
                   if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_UPD, pl,
                                 off, now))
                     {
+                      free (ses->unack_buf);
                       ses->unack_buf = pl;
                       ses->unack_len = off;
                       ses->unack_seq = seq;
                       ses->unack_ts = now;
+                      ses->unack_retx = false;
                       free (ses->pend);
                       ses->pend = ch;
                       ses->pend_cnt = ch_cnt;
                       ch = NULL;
+                      sent_new = true;
                     }
                   else
                     free (pl);
@@ -584,31 +681,64 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
             }
           free (ch);
         }
-      if (set && (ses->dgst_ts == 0
-                  || now - ses->dgst_ts >= ADV_DGST_INTV))
+      if (!sent_new && ses->unack_buf)
         {
-          size_t pl_len = 2 + (size_t)set_cnt * 16;
-          uint8_t *pl = malloc (pl_len);
-          if (pl)
+          uint64_t rto = ses->rto_ms ? ses->rto_ms : RTO_INIT;
+          if (now - ses->unack_ts >= rto)
             {
-              u16_wr (pl, (uint16_t)set_cnt);
-              for (uint32_t k = 0; k < set_cnt; k++)
+              if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_UPD,
+                            ses->unack_buf, ses->unack_len, now))
                 {
-                  uint8_t *ln = pl + 2 + (size_t)k * 16;
-                  uint32_t pth[ADV_PATH_MAX];
-                  uint8_t ent_nhop[16];
-                  memcpy (pth, set[k].path, sizeof (pth));
-                  memcpy (ent_nhop, set[k].nhop_lla, 16);
-                  u32_wr (ln, lla_id (set[k].lla));
-                  u32_wr (ln + 4, lla_id (ent_nhop));
-                  u32_wr (ln + 8, set[k].seq);
-                  u32_wr (ln + 12, path_hash (pth, set[k].path_len));
+                  ses->unack_ts = now;
+                  ses->unack_retx = true;
+                  uint64_t nrto = ses->rto_ms ? ses->rto_ms * 2 : rto * 2;
+                  ses->rto_ms = nrto > RTO_MAX ? RTO_MAX : nrto;
                 }
-              if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_DGST, pl,
-                            pl_len, now))
-                ses->dgst_ts = now;
-              free (pl);
             }
+        }
+      if (set && dgst_due)
+        {
+          uint32_t per = budget > 2 ? (budget - 2) / 16 : 1;
+          if (per == 0)
+            per = 1;
+          bool all_ok = true;
+          uint32_t done = 0;
+          do
+            {
+              uint32_t chunk = set_cnt - done;
+              if (chunk > per)
+                chunk = per;
+              size_t pl_len = 2 + (size_t)chunk * 16;
+              uint8_t *pl = malloc (pl_len);
+              if (!pl)
+                {
+                  all_ok = false;
+                  break;
+                }
+              uint16_t hdr = (uint16_t)chunk;
+              if (done == 0)
+                hdr |= (uint16_t)DGST_F_START;
+              if (done + chunk >= set_cnt)
+                hdr |= (uint16_t)DGST_F_END;
+              u16_wr (pl, hdr);
+              for (uint32_t k = 0; k < chunk; k++)
+                {
+                  const AdvEnt *e = &set[done + k];
+                  uint8_t *ln = pl + 2 + (size_t)k * 16;
+                  u32_wr (ln, lla_id (e->lla));
+                  u32_wr (ln + 4, lla_id (e->nhop_lla));
+                  u32_wr (ln + 8, e->seq);
+                  u32_wr (ln + 12, path_hash (e->path, e->path_len));
+                }
+              if (!adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_DGST, pl,
+                             pl_len, now))
+                all_ok = false;
+              free (pl);
+              done += chunk;
+            }
+          while (done < set_cnt && all_ok);
+          if (all_ok)
+            ses->dgst_ts = now;
         }
       free (set);
     }
@@ -754,7 +884,7 @@ self_ep_exp_ok (const Re *re, const uint8_t our_lla[16])
 {
   if (!re || !our_lla)
     return false;
-  if (!re->is_act || re->state != RT_ACT)
+  if (re->state != RT_ACT)
     return false;
   if (memcmp (re->lla, our_lla, 16) != 0)
     return true;
@@ -768,7 +898,7 @@ ent_exp_ok (const Re *re, const uint8_t our_lla[16])
   bool is_z = false;
   if (!re || !our_lla)
     return false;
-  if (is_ip_bgn (re->ep_ip))
+  if (bogon_ip_match (re->ep_ip))
     return false;
   is_z = (memcmp (re->lla, z, 16) == 0);
   if (!is_z && !IS_LLA_VAL (re->lla))
@@ -825,7 +955,7 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
   bool dir_hint_ok = (out->flags & ADV_F_TP_UDP) != 0;
   out->state = (uint8_t)re->state;
   out->mtu
-      = (re->is_act && re->state == RT_ACT) ? rt_dir_mtu_adv (rt, re) : 0;
+      = (re->state == RT_ACT) ? rt_dir_mtu_adv (rt, re) : 0;
   out->seq = re->seq;
   out->adv_m = re->rt_m;
   if (re->r2d > 0)
@@ -838,7 +968,7 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
             continue;
           if (memcmp (nh->lla, re->nhop_lla, 16) != 0)
             continue;
-          if (!nh->is_act || nh->state != RT_ACT)
+          if (nh->state != RT_ACT)
             continue;
           if (nh->rt_m < nh_m)
             nh_m = nh->rt_m;
@@ -896,8 +1026,8 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
 
 uint32_t
 adv_set_bld (Rt *rt, const uint8_t our_lla[16], bool self_dir_ok,
-             bool dst_no_dir, const uint8_t tgt_lla[16], AdvEnt *out,
-             uint32_t max_cnt)
+             bool dst_no_dir, bool is_p2p, const uint8_t tgt_lla[16],
+             AdvEnt *out, uint32_t max_cnt)
 {
   uint32_t n = 0;
   if (!rt)
@@ -909,6 +1039,22 @@ adv_set_bld (Rt *rt, const uint8_t our_lla[16], bool self_dir_ok,
         continue;
       if (!ent_exp_ok (re, our_lla))
         continue;
+      if (memcmp (re->lla, our_lla, 16) != 0)
+        {
+          RtDec dec = rt_sel (rt, re->lla, is_p2p);
+          bool is_sel = false;
+          if (dec.type == RT_DIR && re->r2d == 0
+              && memcmp (re->ep_ip, dec.dir.ip, 16) == 0
+              && re->ep_port == dec.dir.port)
+            is_sel = true;
+          if (dec.type == RT_REL && re->r2d > 0
+              && memcmp (re->ep_ip, dec.rel.relay_ip, 16) == 0
+              && re->ep_port == dec.rel.relay_port
+              && memcmp (re->nhop_lla, dec.rel.relay_lla, 16) == 0)
+            is_sel = true;
+          if (!is_sel)
+            continue;
+        }
       memset (&out[n], 0, sizeof (AdvEnt));
       if (!ent_bld (rt, re, our_lla, self_dir_ok, dst_no_dir, &out[n]))
         continue;
@@ -952,7 +1098,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
     {
       has_s_lla = lla_inf_s (rt, src_ip, src_port, src_lla);
     }
-  uint16_t mtu_s = mtu_inf_s (rt, src_ip, src_port);
   bool saw_self_adv = false;
   bool saw_self_sel_dir = false;
   uint16_t self_sel_dir_mtu = 0;
@@ -970,7 +1115,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         continue;
       if (is_z)
         {
-          if (is_ip_bgn (ent.ep_ip))
+          if (bogon_ip_match (ent.ep_ip))
             continue;
           if (has_mapped_ep (pt, pt_len, cnt, ent.ep_ip, ent.ep_port))
             continue;
@@ -982,8 +1127,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
                 tp_mask |= TP_MASK_UDP;
               if ((ent.flags & ADV_F_TP_TCP) != 0)
                 tp_mask |= TP_MASK_TCP;
-              if (tp_mask == 0)
-                tp_mask = TP_MASK_UDP | TP_MASK_TCP;
               rt_ep_upd (rt, z_lla, ent.ep_ip, ent.ep_port, tp_mask,
                          sys_ts);
               if (pool)
@@ -997,7 +1140,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       int32_t adv_m = ent.adv_m;
       uint16_t ent_mtu = ent.mtu;
       bool no_dir = (ent.flags & ADV_F_NO_DIR) != 0;
-      uint16_t rel_mtu = 0;
       if (memcmp (ent.lla, our_lla, 16) == 0)
         {
           saw_self_adv = true;
@@ -1008,19 +1150,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             }
           continue;
         }
-      if (mtu_s > 0 && ent_mtu > 0)
-        {
-          rel_mtu = (mtu_s < ent_mtu) ? mtu_s : ent_mtu;
-        }
-      else if (mtu_s > 0)
-        {
-          rel_mtu = mtu_s;
-        }
-      else
-        {
-          rel_mtu = ent_mtu;
-        }
-      bool is_s_alive = ((RtSt)ent.state != RT_DED);
       bool has_dir_hint
           = !IS_LLA_VAL (ent.nhop_lla)
             || memcmp (ent.nhop_lla, ent.lla, 16) == 0;
@@ -1038,7 +1167,19 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           if (ent.path[pi] == own_id)
             has_own = true;
         if (has_own)
-          continue;
+          {
+            Re dead_re;
+            memset (&dead_re, 0, sizeof (dead_re));
+            memcpy (dead_re.lla, ent.lla, 16);
+            memcpy (dead_re.ep_ip, src_ip, 16);
+            dead_re.ep_port = src_port;
+            dead_re.seq = n_seq;
+            dead_re.r2d = 1;
+            dead_re.state = RT_DED;
+            memcpy (dead_re.nhop_lla, src_lla, 16);
+            rt_upd (rt, &dead_re, sys_ts);
+            continue;
+          }
       }
       bool is_s_owner
           = has_s_lla && memcmp (src_lla, ent.lla, 16) == 0;
@@ -1078,22 +1219,17 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           rel_re.rt_m = adv_m;
           rel_re.path_len = ent.path_len;
           memcpy (rel_re.path, ent.path, sizeof (rel_re.path));
-          if (rel_mtu > 0)
+          if (ent_mtu > 0)
             {
-              rel_re.mtu = rel_mtu;
-              rel_re.mtu_lkg = rel_mtu;
-              rel_re.mtu_ukb = rel_mtu;
+              rel_re.mtu_lkg = ent_mtu;
+              rel_re.mtu_ukb = ent_mtu;
             }
-          rel_re.state = is_s_alive ? RT_ACT : RT_DED;
-          rel_re.is_act = is_s_alive;
+          rel_re.state = (RtSt)ent.state;
           rel_re.tp_mask = 0;
           if ((ent.flags & ADV_F_TP_UDP) != 0)
             rel_re.tp_mask |= TP_MASK_UDP;
           if ((ent.flags & ADV_F_TP_TCP) != 0)
             rel_re.tp_mask |= TP_MASK_TCP;
-          if (rel_re.tp_mask == 0)
-            rel_re.tp_mask = TP_MASK_UDP | TP_MASK_TCP;
-          rel_re.rto = RTO_INIT;
           memcpy (rel_re.nhop_lla, src_lla, 16);
           rt_upd (rt, &rel_re, sys_ts);
         }
@@ -1104,7 +1240,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             && (is_s_self || (ent.flags & ADV_F_SEL_DIR) != 0);
       if (import_dir_hint)
         {
-          if (is_ip_bgn (ent.ep_ip))
+          if (bogon_ip_match (ent.ep_ip))
             continue;
           if (p_is_me (rt, our_lla, ent.ep_ip, ent.ep_port))
             continue;
@@ -1120,16 +1256,12 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           dir_re.r2d = 0;
           dir_re.rt_m = RT_F_INF;
           dir_re.sm_m = RT_M_INF;
-          dir_re.state = ((RtSt)ent.state == RT_DED) ? RT_DED : RT_PND;
-          dir_re.is_act = false;
+          dir_re.state = (RtSt)ent.state;
           dir_re.tp_mask = 0;
           if ((ent.flags & ADV_F_TP_UDP) != 0)
             dir_re.tp_mask |= TP_MASK_UDP;
           if ((ent.flags & ADV_F_TP_TCP) != 0)
             dir_re.tp_mask |= TP_MASK_TCP;
-          if (dir_re.tp_mask == 0)
-            dir_re.tp_mask = TP_MASK_UDP | TP_MASK_TCP;
-          dir_re.rto = RTO_INIT;
           if (IS_LLA_VAL (ent.nhop_lla))
             memcpy (dir_re.nhop_lla, ent.nhop_lla, 16);
           else
