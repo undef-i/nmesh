@@ -136,7 +136,7 @@ rel_fwd_dat (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 {
   if (!udp || !cry_ctx || !rt || !cfg || !dest_lla || !vnet_frame)
     return false;
-  if (vnet_len < VNET_HL + ETH_HLEN || vnet_len > TAP_F_MAX
+  if (vnet_len < VNET_HL + ETH_HLEN || vnet_len > FRAG_DATA_MAX
       || vnet_len > UINT16_MAX)
     return false;
   size_t frame_len = vnet_len - VNET_HL;

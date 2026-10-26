@@ -1109,7 +1109,7 @@ udp_mtu_get (const Udp *s)
   struct ifaddrs *ifaddr, *ifa;
   if (getifaddrs (&ifaddr) != 0)
     return 0;
-  int max_mtu = 1280;
+  int max_mtu = 0;
   int fd = socket (AF_INET, SOCK_DGRAM, 0);
   if (fd >= 0)
     {

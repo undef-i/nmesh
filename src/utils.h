@@ -6,10 +6,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TAP_F_MAX (10U + 14U + 65535U)
+#define VNET_HL 10
+#define TAP_F_MAX (FRAG_DATA_MAX - VNET_HL)
 _Static_assert (FRAG_OFF_MASK * FRAG_OFF_UNIT >= TAP_F_MAX,
                 "fragment offset space must cover the largest frame");
-#define VNET_HL 10
 #define EV_MAX 10
 #define ID_TAP 1
 #define ID_UDP 2

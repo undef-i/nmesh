@@ -12,7 +12,6 @@
 #define RT_F_INF INT32_MAX
 #define TNL_OH_MAX (40U + 8U + PKT_HDR_SZ)
 #define RT_MTU_MIN (TNL_OH_MAX + sizeof (FragHdr) + FRAG_OFF_UNIT)
-#define RT_MTU_DEF 1280U
 #define RT_MTU_MAX 65535U
 #define RT_PRB_BST 5U
 #define RT_PRB_MAX 3U

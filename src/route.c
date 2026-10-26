@@ -95,10 +95,8 @@ static uint16_t
 re_mtu_boot (const Rt *t, const Re *re)
 {
   if (!re)
-    return RT_MTU_DEF;
-  if (re->r2d != 0)
-    return RT_MTU_DEF;
-  return (t && t->mtu_probe) ? RT_MTU_DEF : re_mtu_ub (t, re);
+    return RT_MTU_MIN;
+  return re_mtu_ub (t, re);
 }
 
 static uint16_t
@@ -120,7 +118,7 @@ static uint16_t
 re_mtu_cur (const Rt *t, const Re *re)
 {
   if (!re)
-    return RT_MTU_DEF;
+    return RT_MTU_MIN;
   if (re->mtu > 0)
     return re->mtu;
   if (re->mtu_lkg > 0)
@@ -1192,8 +1190,8 @@ rt_mtu_probe_set (Rt *t, bool is_on)
       uint16_t old_mtu = re->mtu;
       if (is_on)
         {
-          re->mtu = RT_MTU_DEF;
-          re->mtu_lkg = RT_MTU_DEF;
+          re->mtu = re_mtu_ub (t, re);
+          re->mtu_lkg = re->mtu;
           re->mtu_ukb = re_mtu_ub (t, re);
           re->mtu_st = MTU_ST_B;
           re->prb_i_ts = 0;
@@ -1331,10 +1329,8 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       if (cur_re->mtu < RT_MTU_MIN)
         cur_re->mtu = RT_MTU_MIN;
       if (cur_re->mtu == 0)
-        cur_re->mtu
-            = (cur_re->mtu_lkg > 0) ? cur_re->mtu_lkg
-                                    : ((cur_re->r2d == 0) ? RT_MTU_MIN
-                                                          : RT_MTU_DEF);
+        cur_re->mtu = (cur_re->mtu_lkg > 0) ? cur_re->mtu_lkg
+                                            : re_mtu_ub (t, cur_re);
       if (re->mtu_lkg > 0 && !pmtu_local)
         cur_re->mtu_lkg = re->mtu_lkg;
       if (re->mtu_ukb > 0 && !pmtu_local)
@@ -1386,12 +1382,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
         ne.adv_m = ne.rt_m;
       if (ne.mtu == 0)
         {
-          if (!t->mtu_probe && ne.r2d == 0)
-            ne.mtu = re_mtu_ub (t, &ne);
-          else
-            ne.mtu = (ne.mtu_lkg > 0) ? ne.mtu_lkg
-                                      : ((ne.r2d == 0) ? RT_MTU_DEF
-                                                       : RT_MTU_DEF);
+          ne.mtu = (ne.mtu_lkg > 0) ? ne.mtu_lkg : re_mtu_ub (t, &ne);
         }
       if (ne.mtu < RT_MTU_MIN)
         ne.mtu = RT_MTU_MIN;
@@ -1648,12 +1639,9 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       memcpy (t->re_arr[i].nhop_lla, lla, 16);
       if (t->re_arr[i].mtu == 0)
         {
-          if (!t->mtu_probe && t->re_arr[i].r2d == 0)
-            t->re_arr[i].mtu = re_mtu_ub (t, &t->re_arr[i]);
-          else
-            t->re_arr[i].mtu = (t->re_arr[i].mtu_lkg > 0)
-                                   ? t->re_arr[i].mtu_lkg
-                                   : RT_MTU_DEF;
+          t->re_arr[i].mtu = (t->re_arr[i].mtu_lkg > 0)
+                                 ? t->re_arr[i].mtu_lkg
+                                 : re_mtu_ub (t, &t->re_arr[i]);
         }
       if (t->re_arr[i].mtu < RT_MTU_MIN)
         t->re_arr[i].mtu = RT_MTU_MIN;
@@ -1694,10 +1682,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       memcpy (re->nhop_lla, lla, 16);
       if (re->mtu == 0)
         {
-          if (!t->mtu_probe && re->r2d == 0)
-            re->mtu = re_mtu_ub (t, re);
-          else
-            re->mtu = (re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_DEF;
+          re->mtu = (re->mtu_lkg > 0) ? re->mtu_lkg : re_mtu_ub (t, re);
         }
       if (re->mtu < RT_MTU_MIN)
         re->mtu = RT_MTU_MIN;
@@ -2000,13 +1985,13 @@ uint16_t
 rt_mtu (const Rt *t, const RtDec *sel)
 {
   if (!t || !sel)
-    return RT_MTU_DEF;
+    return RT_MTU_MIN;
   if (sel->type == RT_DIR)
     {
       const Re *match = rt_dir_match (t, sel);
       if (match)
         return rt_dir_mtu_get (t, match);
-      return t->mtu_probe ? RT_MTU_DEF : RT_MTU_DEF;
+      return RT_MTU_MIN;
     }
   if (sel->type == RT_REL)
     {
@@ -2048,7 +2033,7 @@ rt_mtu (const Rt *t, const RtDec *sel)
         return l2r_mtu;
       return (l2r_mtu < r2d_mtu) ? l2r_mtu : r2d_mtu;
     }
-  return RT_MTU_DEF;
+  return RT_MTU_MIN;
 }
 
 void
@@ -2240,11 +2225,7 @@ rt_mprb_rdy (Rt *t, uint64_t sys_ts, Re *out_re, uint16_t *prb_mtu,
       else
         {
           re->vfy_ts = 0;
-          if (re->mtu_st == MTU_ST_B && re->mtu_lkg < RT_MTU_DEF
-              && re->mtu_ukb > RT_MTU_DEF)
-            probe_mtu = RT_MTU_DEF;
-          else
-            probe_mtu = (uint16_t)((re->mtu_lkg + re->mtu_ukb + 1U) / 2U);
+          probe_mtu = (uint16_t)((re->mtu_lkg + re->mtu_ukb + 1U) / 2U);
           re->mtu_st = MTU_ST_S;
         }
       if (probe_mtu < RT_MTU_MIN)

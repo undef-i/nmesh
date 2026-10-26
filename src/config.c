@@ -3,6 +3,8 @@
 #include <errno.h>
 #include "bogon.h"
 #include "ibs.h"
+#include "tap.h"
+#include "utils.h"
 #include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -22,7 +24,7 @@ cfg_init (Cfg *cfg)
     return;
   memset (cfg, 0, sizeof (*cfg));
   cfg->port = 50000;
-  cfg->mtu = 1280;
+  cfg->mtu = (uint16_t) (FRAG_DATA_MAX - VNET_HL - ETH_HLEN);
   cfg->mtu_probe = false;
   cfg->p2p = P2P_EN;
   cfg->tap_mode = TAP_MODE_AUTO;
