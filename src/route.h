@@ -20,6 +20,7 @@
 #define RT_GHS_HL 30ULL
 #define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
 #define RT_PRB_INTV 5000ULL
+#define RT_KA_TMO (4 * RT_PRB_INTV)
 #define RT_METRIC_WIN_BINS (RT_GHS_TS / RT_PRB_INTV)
 
 #if (RT_GHS_TS % RT_PRB_INTV) != 0
@@ -47,8 +48,6 @@ typedef enum
   BHCK_CONFIRM = 2
 } BhckSt;
 
-#define IS_LLA_VAL(ip) ((ip)[0] == 0xfe && ((ip)[1] & 0xc0) == 0x80)
-
 typedef struct
 {
   uint8_t lla[16];
@@ -62,14 +61,11 @@ typedef struct
   int32_t rt_m;
   uint8_t nhop_lla[16];
   RtSt state;
-  bool is_act;
   bool is_static;
   uint8_t tp_mask;
   uint64_t pong_ts;
   uint64_t rx_ts;
   uint64_t tx_ts;
-  uint64_t rx_base;
-  uint16_t rx_bmp;
   uint32_t srtt;
   uint32_t rttvar;
   uint32_t rto;
@@ -81,7 +77,6 @@ typedef struct
   uint32_t r2d;
   uint8_t path_len;
   uint32_t path[ADV_PATH_MAX];
-  uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
   uint16_t peer_rev_mtu;
@@ -93,7 +88,6 @@ typedef struct
   uint8_t prb_tx;
   uint64_t prb_tx_ts;
   uint64_t prb_ddl;
-  uint64_t ack_ts;
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
@@ -120,14 +114,11 @@ typedef struct Pth
   int32_t rt_m;
   uint8_t nhop_lla[16];
   RtSt state;
-  bool is_act;
   bool is_static;
   uint8_t tp_mask;
   uint64_t pong_ts;
   uint64_t rx_ts;
   uint64_t tx_ts;
-  uint64_t rx_base;
-  uint16_t rx_bmp;
   uint32_t srtt;
   uint32_t rttvar;
   uint32_t rto;
@@ -135,7 +126,6 @@ typedef struct Pth
   uint32_t r2d;
   uint8_t path_len;
   uint32_t path[ADV_PATH_MAX];
-  uint16_t mtu;
   uint16_t mtu_lkg;
   uint16_t mtu_ukb;
   uint16_t peer_rev_mtu;
@@ -147,7 +137,6 @@ typedef struct Pth
   uint8_t prb_tx;
   uint64_t prb_tx_ts;
   uint64_t prb_ddl;
-  uint64_t ack_ts;
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
@@ -164,11 +153,8 @@ typedef struct RtMap
 {
   uint8_t lla[16];
   Pth *paths;
-  Pth *sel_pth;
   Pth *sel_dir_pth;
   Pth *sel_rel_pth;
-  int32_t sel_dir_m;
-  int32_t sel_rel_m;
   bool has_pnd_dir;
   UT_hash_handle hh;
   struct RtMap *pool_next;
@@ -195,7 +181,6 @@ typedef struct
   int cnt;
   int cap;
   const char *persist_path;
-  bool is_dirty;
 } PPool;
 
 typedef struct Rt
@@ -228,6 +213,7 @@ typedef struct Rt
   uint64_t ctrl_last_rx_b;
   uint64_t ctrl_now_tx_bps;
   uint64_t ctrl_now_rx_bps;
+  uint64_t ckie_fail_cnt;
   Pth *pth_pool;
   RtMap *rtm_pool;
 } Rt;
@@ -300,11 +286,11 @@ void rt_peer_rev_mtu_set (Rt *t, const uint8_t peer_lla[16],
 void rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port,
                   size_t atmpt_plen, uint64_t sys_ts);
 void rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
-bool rt_pmtu_st (const Rt *t, const RtDec *sel, uint16_t *out_path_mtu,
-                 uint16_t *prb_mtu, bool *out_is_searching,
-                 bool *out_is_fixed);
-bool rt_pmtu_lims (const Rt *t, const RtDec *sel, uint16_t *out_lkg,
-                   uint16_t *out_ukb, MtuSt *state);
+RtMap *rt_map_all (Rt *t);
+Pth *rt_map_pick (Rt *t, RtMap *re, bool is_p2p);
+int32_t rt_pth_metric (Rt *t, const Pth *pth);
+void rt_pth_lims (const Rt *t, const Pth *pth, uint16_t *out_lkg,
+                  uint16_t *out_ukb, bool *out_srch);
 int rt_act_get (Rt *t, Re *buf, int buf_len, int s_off);
 void rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts);
 void rt_src_gc (Rt *t, uint64_t sys_ts);
@@ -327,4 +313,4 @@ bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
 void pp_init (PPool *p, const char *persist_path);
 void pp_free (PPool *p);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
-void rt_adv_dirty_set (Rt *t, const char *r);
+void rt_adv_dirty_set (Rt *t);
