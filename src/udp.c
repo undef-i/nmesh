@@ -34,10 +34,11 @@ static UdpUnreachCallback g_unr_cb = NULL;
 #else
 #define UDP_GSO_MAX_SEGS 64
 #endif
-#define UDP_RX_BUF_MAX 65535U
-#define UDP_RX_SPLIT_MAX (BATCH_MAX * 64)
+#define UDP_RX_SPLIT_MAX (BATCH_MAX * UDP_GSO_MAX_SEGS)
+#define UDP_RX_SPLIT_DATA_MAX (BATCH_MAX * 65536U)
 
-static bool udp_pend_add (Udp *s, const UdpMsg *m);
+static int udp_pend_add (Udp *s, const UdpMsg *m);
+static void udp_pend_drop_log (int pr);
 static void udp_sock_buf_set (int fd, int opt, int force_opt, int want,
                               const char *name);
 
@@ -62,8 +63,8 @@ typedef struct
 {
   uint8_t src_ip[16];
   uint16_t src_port;
-  size_t data_len;
-  uint8_t data[UDP_PL_MAX];
+  uint32_t off;
+  uint32_t len;
 } UdpRxSeg;
 
 typedef struct
@@ -103,6 +104,8 @@ udp_pend_rsv (Udp *s, uint32_t need)
 {
   if (!s)
     return false;
+  if (need > UDP_PND_MAX)
+    need = UDP_PND_MAX;
   if (need <= s->pend_cap)
     return true;
   uint32_t old_cap = s->pend_cap;
@@ -135,39 +138,23 @@ udp_pend_rsv (Udp *s, uint32_t need)
 }
 
 static bool
-udp_rx_split_rsv (Udp *s, uint32_t need)
+udp_rx_split_init (Udp *s)
 {
   if (!s)
     return false;
-  if (need <= s->rx_split_cap)
-    return true;
-  uint32_t old_cap = s->rx_split_cap;
-  uint32_t new_cap = old_cap ? old_cap : UDP_RX_SPLIT_MAX;
-  while (new_cap < need)
-    {
-      if (new_cap > (UINT32_MAX / 2U))
-        {
-          new_cap = need;
-          break;
-        }
-      new_cap *= 2U;
-    }
-  if (!udp_ring_cap_ok (new_cap))
+  UdpRxSeg *arr = calloc (UDP_RX_SPLIT_MAX, sizeof (*arr));
+  if (!arr)
     return false;
-  UdpRxSeg *old_arr = udp_rx_split_arr_get (s);
-  UdpRxSeg *new_arr = calloc ((size_t)new_cap, sizeof (*new_arr));
-  if (!new_arr)
-    return false;
-  if (old_arr && old_cap > 0)
+  uint8_t *data = calloc (UDP_RX_SPLIT_DATA_MAX, 1);
+  if (!data)
     {
-      uint32_t mask = old_cap - 1U;
-      for (uint32_t i = 0; i < s->rx_split_cnt; i++)
-        new_arr[i] = old_arr[(s->rx_split_head + i) & mask];
-      free (old_arr);
+      free (arr);
+      return false;
     }
-  s->rx_split_arr = new_arr;
-  s->rx_split_cap = new_cap;
-  s->rx_split_head = 0;
+  s->rx_split_arr = arr;
+  s->rx_split_cap = UDP_RX_SPLIT_MAX;
+  s->rx_split_data = data;
+  s->rx_split_data_cap = UDP_RX_SPLIT_DATA_MAX;
   return true;
 }
 
@@ -197,9 +184,10 @@ udp_tx_1 (Udp *s, const UdpMsg *m)
     return 1;
   if (is_err_tns (errno))
     {
-      if (udp_pend_add (s, m))
+      int pr = udp_pend_add (s, m);
+      if (pr > 0)
         return 1;
-      fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
+      udp_pend_drop_log (pr);
       return 0;
     }
   if (errno == EMSGSIZE)
@@ -227,30 +215,38 @@ udp_rx_split_add (Udp *s, const uint8_t src_ip[16], uint16_t src_port,
   static uint64_t ovf_log_ts = 0;
   if (!s || !src_ip || !data || data_len > UDP_PL_MAX)
     return false;
-  if (s->rx_split_cnt >= s->rx_split_cap
-      && !udp_rx_split_rsv (s, s->rx_split_cnt + 1U))
+  UdpRxSeg *arr = udp_rx_split_arr_get (s);
+  if (!arr || !s->rx_split_data || s->rx_split_cnt >= s->rx_split_cap
+      || data_len > s->rx_split_data_cap - s->rx_split_data_len)
     {
       uint64_t now = sys_ts ();
       if (now - ovf_log_ts >= 1000ULL)
         {
           fprintf (stderr,
-                   "udp: rx split backlog overflow cnt=%u cap=%u len=%zu\n",
+                   "udp: rx split backlog overflow cnt=%u cap=%u bytes=%u len=%zu\n",
                    s ? (unsigned)s->rx_split_cnt : 0U,
                    s ? (unsigned)s->rx_split_cap : 0U,
-                   data_len);
+                   s ? (unsigned)s->rx_split_data_len : 0U, data_len);
           ovf_log_ts = now;
         }
       return false;
     }
-  UdpRxSeg *rx_split_arr = udp_rx_split_arr_get (s);
-  if (!rx_split_arr || s->rx_split_cap == 0)
-    return false;
-  uint32_t idx = (s->rx_split_head + s->rx_split_cnt) & (s->rx_split_cap - 1U);
-  memcpy (rx_split_arr[idx].src_ip, src_ip, 16);
-  rx_split_arr[idx].src_port = src_port;
-  rx_split_arr[idx].data_len = data_len;
-  memcpy (rx_split_arr[idx].data, data, data_len);
+  uint32_t off = (s->rx_split_data_head + s->rx_split_data_len)
+                 & (s->rx_split_data_cap - 1U);
+  uint32_t first = s->rx_split_data_cap - off;
+  if (first > data_len)
+    first = (uint32_t)data_len;
+  memcpy (s->rx_split_data + off, data, first);
+  if (data_len > first)
+    memcpy (s->rx_split_data, data + first, data_len - first);
+  uint32_t idx = (s->rx_split_head + s->rx_split_cnt)
+                 & (s->rx_split_cap - 1U);
+  memcpy (arr[idx].src_ip, src_ip, 16);
+  arr[idx].src_port = src_port;
+  arr[idx].off = off;
+  arr[idx].len = (uint32_t)data_len;
   s->rx_split_cnt++;
+  s->rx_split_data_len += (uint32_t)data_len;
   return true;
 }
 
@@ -265,11 +261,21 @@ udp_rx_split_pkt_drn (Udp *s, UdpRxPkt pkt_arr[], int max_cnt)
   while (out_cnt < max_cnt && s->rx_split_cnt > 0)
     {
       UdpRxSeg *seg = &rx_split_arr[s->rx_split_head];
-      memcpy (s->rx_split_drn_bufs[out_cnt], seg->data, seg->data_len);
+      uint32_t first = s->rx_split_data_cap - seg->off;
+      if (first > seg->len)
+        first = seg->len;
+      memcpy (s->rx_split_drn_bufs[out_cnt], s->rx_split_data + seg->off,
+              first);
+      if (seg->len > first)
+        memcpy (s->rx_split_drn_bufs[out_cnt] + first, s->rx_split_data,
+                seg->len - first);
       pkt_arr[out_cnt].data = s->rx_split_drn_bufs[out_cnt];
-      pkt_arr[out_cnt].data_len = seg->data_len;
+      pkt_arr[out_cnt].data_len = seg->len;
       memcpy (pkt_arr[out_cnt].src_ip, seg->src_ip, 16);
       pkt_arr[out_cnt].src_port = seg->src_port;
+      s->rx_split_data_head = (seg->off + seg->len)
+                              & (s->rx_split_data_cap - 1U);
+      s->rx_split_data_len -= seg->len;
       s->rx_split_head = (s->rx_split_head + 1U) & (s->rx_split_cap - 1U);
       s->rx_split_cnt--;
       out_cnt++;
@@ -383,11 +389,11 @@ udp_gso_tx_seq (Udp *s, UdpMsg *msgs, int cnt)
         {
           for (int j = 0; j < grp_cnt; j++)
             {
-              if (udp_pend_add (s, &msgs[i + j]))
+              int pr = udp_pend_add (s, &msgs[i + j]);
+              if (pr > 0)
                 acc_cnt++;
               else
-                fprintf (stderr,
-                         "udp: pending queue full, drop outgoing packet\n");
+                udp_pend_drop_log (pr);
             }
           i += grp_cnt;
           continue;
@@ -496,11 +502,11 @@ udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
             {
               for (int i = grp_bgn[grp_idx]; i < cnt; i++)
                 {
-                  if (udp_pend_add (s, &msgs[i]))
+                  int pr = udp_pend_add (s, &msgs[i]);
+                  if (pr > 0)
                     acc_cnt++;
                   else
-                    fprintf (stderr,
-                             "udp: pending queue full, drop outgoing packet\n");
+                    udp_pend_drop_log (pr);
                 }
               return acc_cnt;
             }
@@ -519,8 +525,7 @@ udp_gso_tx (Udp *s, UdpMsg *msgs, int cnt)
     {
       for (int i = grp_bgn[grp_idx]; i < cnt; i++)
         {
-          if (!udp_pend_add (s, &msgs[i]))
-            fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
+          udp_pend_drop_log (udp_pend_add (s, &msgs[i]));
         }
     }
   return acc_cnt;
@@ -551,17 +556,15 @@ udp_sock_buf_set (int fd, int opt, int force_opt, int want, const char *name)
     }
 }
 
-static bool
+static int
 udp_pend_add (Udp *s, const UdpMsg *m)
 {
   if (!s || !m)
-    return false;
+    return -1;
   if (m->data_len > UDP_PL_MAX)
-    return false;
-  if (s->pend_cnt >= s->pend_cap && !udp_pend_rsv (s, s->pend_cnt + 1U))
-    return false;
-  if (!s->pend_arr || s->pend_cap == 0)
-    return false;
+    return -1;
+  if (!s->pend_arr || s->pend_cnt >= s->pend_cap)
+    return 0;
   uint32_t idx = (s->pend_head + s->pend_cnt) & (s->pend_cap - 1U);
   UdpPMsg *pm = &s->pend_arr[idx];
   memcpy (pm->dst_ip, m->dst_ip, 16);
@@ -570,7 +573,16 @@ udp_pend_add (Udp *s, const UdpMsg *m)
   memcpy (pm->data, m->data, m->data_len);
   s->pend_cnt++;
   atomic_store_explicit (&s->pend_want, true, memory_order_relaxed);
-  return true;
+  return 1;
+}
+
+static void
+udp_pend_drop_log (int pr)
+{
+  if (pr == 0)
+    fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
+  else if (pr < 0)
+    fprintf (stderr, "udp: outgoing packet too large to queue, drop\n");
 }
 
 static int
@@ -629,7 +641,7 @@ udp_init (Udp *s, uint16_t *port)
     return -1;
   s->gso_en = true;
   s->gro_en = false;
-  if (!udp_pend_rsv (s, UDP_PND_MAX) || !udp_rx_split_rsv (s, UDP_RX_SPLIT_MAX))
+  if (!udp_pend_rsv (s, UDP_PND_MAX) || !udp_rx_split_init (s))
     {
       udp_free (s);
       return -1;
@@ -777,6 +789,11 @@ udp_free (Udp *s)
       free (rx_split_arr);
       s->rx_split_arr = NULL;
       s->rx_split_cap = 0;
+  free (s->rx_split_data);
+  s->rx_split_data = NULL;
+  s->rx_split_data_cap = 0;
+  s->rx_split_data_head = 0;
+  s->rx_split_data_len = 0;
     }
   free (s->rx_split_drn_bufs);
   s->rx_split_drn_bufs = NULL;
@@ -807,9 +824,10 @@ udp_tx_arr_lckd (Udp *s, UdpMsg *msgs, int cnt)
       int acc_cnt = 0;
       for (int i = 0; i < cnt; i++)
         {
-          if (!udp_pend_add (s, &msgs[i]))
+          int pr = udp_pend_add (s, &msgs[i]);
+          if (pr <= 0)
             {
-              fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
+              udp_pend_drop_log (pr);
               continue;
             }
           acc_cnt++;
@@ -856,14 +874,16 @@ udp_tx_arr_lckd (Udp *s, UdpMsg *msgs, int cnt)
         break;
       tx_cnt += rc;
     }
+  int acc_cnt = tx_cnt;
   for (int i = tx_cnt; i < cnt; i++)
     {
-      if (!udp_pend_add (s, &msgs[i]))
-        {
-          fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
-        }
+      int pr = udp_pend_add (s, &msgs[i]);
+      if (pr > 0)
+        acc_cnt++;
+      else
+        udp_pend_drop_log (pr);
     }
-  return cnt;
+  return acc_cnt;
 }
 
 int
@@ -1036,24 +1056,6 @@ udp_rx_pkt_arr (Udp *s, UdpRxPkt pkt_arr[], int m_cnt)
 }
 
 int
-udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
-            uint16_t src_ports[], size_t len_arr[], int m_cnt)
-{
-  static UdpRxPkt pkt_arr[BATCH_MAX];
-  int rx_cnt = udp_rx_pkt_arr (s, pkt_arr, m_cnt);
-  if (rx_cnt <= 0)
-    return rx_cnt;
-  for (int i = 0; i < rx_cnt; i++)
-    {
-      memcpy (buf_arr[i], pkt_arr[i].data, pkt_arr[i].data_len);
-      memcpy (src_ips[i], pkt_arr[i].src_ip, 16);
-      src_ports[i] = pkt_arr[i].src_port;
-      len_arr[i] = pkt_arr[i].data_len;
-    }
-  return rx_cnt;
-}
-
-int
 udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,
         const uint8_t *data, size_t data_len)
 {
@@ -1103,9 +1105,8 @@ udp_w_hnd (Udp *s)
 }
 
 uint16_t
-udp_mtu_get (const Udp *s)
+udp_host_mtu_max (void)
 {
-  (void)s;
   struct ifaddrs *ifaddr, *ifa;
   if (getifaddrs (&ifaddr) != 0)
     return 0;

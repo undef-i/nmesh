@@ -13,19 +13,22 @@
 #define TP_EV_CONN_BASE (1ULL << 32)
 #define TP_IDX_INV UINT32_MAX
 #define TP_CONN_CAP_INIT 512U
+#define TP_CONN_MAX 8192U
+#define TP_FD_RESERVE 64U
 #define TP_PREAUTH_MAX 10U
 #define TP_CONN_SYN_RETRIES 3U
 #define TP_WARN_INTV RT_PRB_INTV
-#define TP_FLOW_IDLE_TMO (KA_TMO * 2ULL)
+#define TP_PEER_DEAD_TMO RT_KA_TMO
+#define TP_FLOW_IDLE_TMO (TP_PEER_DEAD_TMO * 2ULL)
 #define TP_WIRE_SALT_SZ (CRY_NONCE_WIRE_SZ + sizeof (uint64_t))
 #define TP_WIRE_KEY_SZ 32
-#define TP_WIRE_NONCE_SZ CRY_NONCE_WIRE_SZ
 #define TP_WIRE_MAC_SZ CRY_MAC_SZ
 #define TP_KX_PUB_SZ crypto_scalarmult_BYTES
 #define TP_KX_SEC_SZ crypto_scalarmult_SCALARBYTES
 #define TP_TXQ_FRAME_BYTES                                                    \
   ((uint32_t)(sizeof (uint32_t) + TP_PL_MAX + TP_WIRE_MAC_SZ))
-#define TP_TXQ_STOP_MULT 4U
+#define TP_TXQ_SNDBUF_MULT 4U
+#define TP_PEND_CAP_BYTES (TP_TXQ_FRAME_BYTES * 4U)
 #define TP_CONN_TMO                                                           \
   (RTO_INIT * ((1ULL << (TP_CONN_SYN_RETRIES + 1U)) - 1ULL))
 
@@ -103,14 +106,9 @@ typedef struct
   bool wire_fs_ready;
   bool drain;
   uint8_t *rx_in;
-  uint8_t *rx_buf;
   uint32_t rx_in_cap;
   uint32_t rx_in_off;
   uint32_t rx_in_len;
-  uint32_t rx_cap;
-  uint32_t hdr_have;
-  uint32_t rx_len;
-  uint32_t rx_have;
   TpTxRing tx_hi;
   TpTxRing tx_lo;
   TpPendQ tx_pend;
@@ -127,6 +125,7 @@ typedef struct
   pthread_mutex_t mtx;
   TpConn **conn_arr;
   uint32_t conn_cap;
+  uint32_t conn_max;
   uint32_t *fd_idx_arr;
   uint32_t fd_idx_cap;
   uint32_t *peer_hot_idx;

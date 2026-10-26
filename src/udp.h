@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #define BATCH_MAX 256
-#define UDP_PND_MAX 256
+#define UDP_PND_MAX BATCH_MAX
 
 typedef struct
 {
@@ -28,6 +28,10 @@ typedef struct
   uint32_t rx_split_cap;
   uint32_t rx_split_head;
   uint32_t rx_split_cnt;
+  uint8_t *rx_split_data;
+  uint32_t rx_split_data_cap;
+  uint32_t rx_split_data_head;
+  uint32_t rx_split_data_len;
   uint8_t (*rx_split_drn_bufs)[UDP_PL_MAX];
   uint8_t (*rx_buf_arr)[UDP_PL_MAX];
   uint8_t (*gro_buf_arr)[65535U];
@@ -61,8 +65,6 @@ int udp_init (Udp *s, uint16_t *port);
 void udp_free (Udp *s);
 int udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt);
 int udp_rx_pkt_arr (Udp *s, UdpRxPkt pkt_arr[], int m_cnt);
-int udp_rx_arr (Udp *s, uint8_t buf_arr[][UDP_PL_MAX], uint8_t src_ips[][16],
-                uint16_t src_ports[], size_t len_arr[], int m_cnt);
 int udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,
             const uint8_t *data, size_t data_len);
 void udp_emsg_cb_set (UdpEmsgsizeCallback cb);
@@ -70,7 +72,6 @@ void udp_unr_cb_set (UdpUnreachCallback cb);
 bool udp_w_want (Udp *s);
 int udp_w_hnd (Udp *s);
 bool udp_rx_pending (const Udp *s);
-uint64_t udp_bp_ev (void);
-uint16_t udp_mtu_get (const Udp *s);
+uint16_t udp_host_mtu_max (void);
 uint16_t udp_ep_mtu_get (const uint8_t dst_ip[16]);
 int udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu);

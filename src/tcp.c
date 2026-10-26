@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -42,7 +43,6 @@ static bool tp_flow_idx_rsv (TpRt *tp, uint32_t need);
 static void tp_flow_idx_forget_conn (TpRt *tp, uint32_t conn_idx);
 static void tp_flow_idx_prune (TpRt *tp, uint64_t now);
 static bool tp_conn_rx_in_rsv (TpConn *conn, uint32_t need);
-static bool tp_conn_rx_rsv (TpConn *conn, uint32_t need);
 static bool tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len,
                              bool hi);
 static uint32_t tp_conn_rx_frame_max (const TpConn *conn);
@@ -80,7 +80,6 @@ _Static_assert (TP_KX_SEC_SZ == sizeof (((TpConn *)0)->wire_kx_sk),
 typedef enum
 {
   TP_AUTH_FAIL = 0,
-  TP_AUTH_PENDING,
   TP_AUTH_OK,
 } TpAuthRes;
 
@@ -196,7 +195,7 @@ tp_salt_rp_reap (uint64_t now)
   for (uint32_t i = 0; i < g_tp_salt_rp_cnt; i++)
     {
       bool stale = g_tp_salt_rp[i].ts != 0 && now > g_tp_salt_rp[i].ts
-                   && (now - g_tp_salt_rp[i].ts) > KA_TMO;
+                   && (now - g_tp_salt_rp[i].ts) > TP_PEER_DEAD_TMO;
       if (stale)
         continue;
       if (out != i)
@@ -522,7 +521,7 @@ tp_fd_cfg (int fd)
   (void)setsockopt (fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof (one));
   (void)setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
 #ifdef TCP_KEEPIDLE
-  int keepidle = (int)(KA_TMO / 1000ULL);
+  int keepidle = (int)(TP_PEER_DEAD_TMO / 1000ULL);
   if (keepidle < 1)
     keepidle = 1;
   (void)setsockopt (fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle,
@@ -538,7 +537,7 @@ tp_fd_cfg (int fd)
   (void)setsockopt (fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof (keepcnt));
 #endif
 #ifdef TCP_USER_TIMEOUT
-  int user_tmo = (int)KA_TMO;
+  int user_tmo = (int)TP_PEER_DEAD_TMO;
   (void)setsockopt (fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_tmo,
                     sizeof (user_tmo));
 #endif
@@ -626,7 +625,7 @@ tp_conn_limit_warn (TpRt *tp, const char *ctx)
     }
   fprintf (stderr,
            "tcp: connection table saturated (%d/%u active), rejecting %s\n",
-           live, tp ? (unsigned)tp->conn_cap : 0U,
+           live, tp ? (unsigned)tp->conn_max : 0U,
            ctx ? ctx : "connection");
   g_tp_conn_last_warn_ts = now;
 }
@@ -717,8 +716,8 @@ static uint32_t
 tp_conn_txq_stop_bytes (const TpConn *conn)
 {
   uint32_t stop = (conn && conn->sndbuf_bytes > 0) ? conn->sndbuf_bytes : 0U;
-  if (stop > 0 && stop <= (UINT32_MAX / TP_TXQ_STOP_MULT))
-    stop *= TP_TXQ_STOP_MULT;
+  if (stop > 0 && stop <= (UINT32_MAX / TP_TXQ_SNDBUF_MULT))
+    stop *= TP_TXQ_SNDBUF_MULT;
   else if (stop > 0)
     stop = UINT32_MAX;
   return (stop >= TP_TXQ_FRAME_BYTES) ? stop : TP_TXQ_FRAME_BYTES;
@@ -770,6 +769,23 @@ tp_conn_txq_sync (TpRt *tp, TpConn *conn)
     (void)__atomic_add_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
   else
     (void)__atomic_sub_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
+}
+
+static void
+tp_conn_txq_forget (TpRt *tp, TpConn *conn)
+{
+  if (!tp || !conn)
+    return;
+  if (conn->tx_qd)
+    {
+      conn->tx_qd = false;
+      (void)__atomic_sub_fetch (&tp->tx_qd_cnt, 1U, __ATOMIC_RELAXED);
+    }
+  if (conn->tx_bp)
+    {
+      conn->tx_bp = false;
+      (void)__atomic_sub_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
+    }
 }
 
 static bool
@@ -840,11 +856,11 @@ tp_conn_dedup_peer (TpRt *tp, int epfd, const uint8_t our_lla[16],
     }
 }
 
-static void
+static bool
 tp_ev_upd (int epfd, const TpConn *conn)
 {
   if (!conn || conn->fd < 0)
-    return;
+    return false;
   struct epoll_event ev;
   memset (&ev, 0, sizeof (ev));
   ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
@@ -852,14 +868,18 @@ tp_ev_upd (int epfd, const TpConn *conn)
       || (conn->auth && conn->tx_lo.len > 0))
     ev.events |= EPOLLOUT;
   ev.data.u64 = TP_EV_CONN_BASE | (uint32_t)conn->fd;
-  (void)epoll_ctl (epfd, EPOLL_CTL_MOD, conn->fd, &ev);
+  if (epoll_ctl (epfd, EPOLL_CTL_MOD, conn->fd, &ev) == 0)
+    return true;
+  if (errno == ENOENT)
+    return epoll_ctl (epfd, EPOLL_CTL_ADD, conn->fd, &ev) == 0;
+  return false;
 }
 
-static void
+static bool
 tp_ev_add (int epfd, const TpConn *conn)
 {
   if (!conn || conn->fd < 0)
-    return;
+    return false;
   struct epoll_event ev;
   memset (&ev, 0, sizeof (ev));
   ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
@@ -867,7 +887,11 @@ tp_ev_add (int epfd, const TpConn *conn)
       || (conn->auth && conn->tx_lo.len > 0))
     ev.events |= EPOLLOUT;
   ev.data.u64 = TP_EV_CONN_BASE | (uint32_t)conn->fd;
-  (void)epoll_ctl (epfd, EPOLL_CTL_ADD, conn->fd, &ev);
+  if (epoll_ctl (epfd, EPOLL_CTL_ADD, conn->fd, &ev) == 0)
+    return true;
+  if (errno == EEXIST)
+    return epoll_ctl (epfd, EPOLL_CTL_MOD, conn->fd, &ev) == 0;
+  return false;
 }
 
 static bool
@@ -1002,7 +1026,7 @@ tp_pend_write (TpPendQ *q, const uint8_t *data, size_t len, bool hi)
   if (rec_len > UINT32_MAX - q->len)
     return false;
   uint32_t need = q->len + rec_len;
-  if (need > TP_TXQ_FRAME_BYTES * TP_TXQ_STOP_MULT)
+  if (need > TP_PEND_CAP_BYTES)
     return false;
   if (!tp_pend_rsv (q, need))
     return false;
@@ -1107,20 +1131,6 @@ tp_conn_rx_in_compact (TpConn *conn)
   conn->rx_in_off = 0;
 }
 
-static bool
-tp_conn_rx_rsv (TpConn *conn, uint32_t need)
-{
-  if (!conn || need == 0 || need > (uint32_t)(TP_PL_MAX + TP_WIRE_MAC_SZ))
-    return false;
-  if (need <= conn->rx_cap && conn->rx_buf)
-    return true;
-  uint8_t *new_buf = realloc (conn->rx_buf, need);
-  if (!new_buf)
-    return false;
-  conn->rx_buf = new_buf;
-  conn->rx_cap = need;
-  return true;
-}
 
 static bool
 tp_wire_tx_rsv (uint32_t need)
@@ -1314,17 +1324,7 @@ tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
     return;
   uint32_t idx = tp_conn_idx (tp, conn);
   int fd = conn->fd;
-  tp_conn_txq_sync (tp, conn);
-  if (conn->tx_qd)
-    {
-      conn->tx_qd = false;
-      (void)__atomic_sub_fetch (&tp->tx_qd_cnt, 1U, __ATOMIC_RELAXED);
-    }
-  if (conn->tx_bp)
-    {
-      conn->tx_bp = false;
-      (void)__atomic_sub_fetch (&tp->tx_bp_cnt, 1U, __ATOMIC_RELAXED);
-    }
+  tp_conn_txq_forget (tp, conn);
   tp_conn_fd_unbind (tp, conn);
   conn->fd = -1;
   if (idx != TP_IDX_INV)
@@ -1341,7 +1341,6 @@ tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
   tp_tx_ring_free (&conn->tx_lo);
   tp_pend_free (&conn->tx_pend);
   free (conn->rx_in);
-  free (conn->rx_buf);
   free (conn);
 }
 
@@ -1370,6 +1369,8 @@ tp_conn_rsv (TpRt *tp, uint32_t need)
     return false;
   if (need <= tp->conn_cap)
     return true;
+  if (need > tp->conn_max)
+    return false;
   uint32_t new_cap = tp->conn_cap ? tp->conn_cap : TP_CONN_CAP_INIT;
   while (new_cap < need)
     {
@@ -1413,10 +1414,12 @@ tp_conn_alloc (TpRt *tp)
           return conn;
         }
     }
-  tp_conn_limit_warn (tp, "connection");
   uint32_t old_cap = tp->conn_cap;
   if (!tp_conn_rsv (tp, old_cap + 1U))
-    return NULL;
+    {
+      tp_conn_limit_warn (tp, "connection");
+      return NULL;
+    }
   TpConn *conn = tp_conn_new (old_cap);
   if (!conn)
     return NULL;
@@ -1663,6 +1666,12 @@ tp_conn_enqueue (TpConn *conn, const uint8_t *data, size_t len, bool hi)
   uint32_t rem = (uint32_t)frame_len;
   uint32_t salt_len
       = (!conn->inbound && !conn->wire_salt_tx) ? TP_WIRE_SALT_SZ : 0U;
+  {
+    uint32_t stop = tp_conn_txq_stop_bytes (conn);
+    if (conn->tx_q_bytes >= stop
+        || rem + salt_len > stop - conn->tx_q_bytes)
+      return false;
+  }
   TpTxRing *ring = hi ? &conn->tx_hi : &conn->tx_lo;
   if (salt_len > UINT32_MAX - rem
       || rem + salt_len > UINT32_MAX - conn->tx_q_bytes)
@@ -1846,7 +1855,7 @@ tp_conn_auth_finish (TpRt *tp, int epfd, TpConn *conn, Rt *rt,
 {
   if (!tp || !conn || !cfg || !peer_lla)
     return false;
-  if (conn->inbound && cfg->p2p != P2P_EN
+  if (conn->inbound && !cfg->p2p
       && !tp_inbound_static_ok (rt, peer_lla, conn->sock_ip, peer_port))
     {
       tp_conn_close (tp, epfd, conn);
@@ -1865,11 +1874,6 @@ tp_conn_auth_finish (TpRt *tp, int epfd, TpConn *conn, Rt *rt,
                now);
   uint32_t slot_idx = conn->slot_idx;
   memcpy (conn->peer_lla, peer_lla, 16);
-  if (!tp_conn_rx_rsv (conn, TP_PL_MAX))
-    {
-      tp_conn_close (tp, epfd, conn);
-      return false;
-    }
   if (conn->inbound && !tp_salt_rp_commit (conn->wire_salt, now))
     {
       tp_conn_close (tp, epfd, conn);
@@ -2007,7 +2011,20 @@ tp_rt_init (TpRt *tp, uint16_t port)
   tp->listen_fd = -1;
   pthread_mutex_init (&tp->mtx, NULL);
   tp_send_cache_reset (tp);
-  if (!tp_conn_rsv (tp, TP_CONN_CAP_INIT)
+  tp->conn_max = TP_CONN_MAX;
+  {
+    struct rlimit rl;
+    if (getrlimit (RLIMIT_NOFILE, &rl) == 0
+        && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > TP_FD_RESERVE)
+      {
+        uint64_t fd_max = (uint64_t)rl.rlim_cur - TP_FD_RESERVE;
+        if (fd_max < tp->conn_max)
+          tp->conn_max = (uint32_t)fd_max;
+      }
+  }
+  uint32_t cap_init = tp->conn_max < TP_CONN_CAP_INIT ? tp->conn_max
+                                                      : TP_CONN_CAP_INIT;
+  if (!tp_conn_rsv (tp, cap_init)
       || !tp_fd_idx_rsv (tp, TP_CONN_CAP_INIT)
       || !tp_hot_idx_rsv (tp, TP_CONN_CAP_INIT))
     {
@@ -2107,8 +2124,7 @@ tp_rt_free (TpRt *tp)
       tp_tx_ring_free (&conn->tx_lo);
       tp_pend_free (&conn->tx_pend);
       free (conn->rx_in);
-      free (conn->rx_buf);
-      free (conn);
+          free (conn);
     }
   free (tp->conn_arr);
   tp->conn_arr = NULL;
@@ -2260,6 +2276,59 @@ tp_batch_end (void)
     tp_flush_deferred ();
 }
 
+static TpConn *
+tp_conn_open (const uint8_t ip[16], uint16_t port,
+              const uint8_t peer_lla[16], bool has_peer,
+              uint32_t lane_hash, uint64_t now)
+{
+  int fd = socket (AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    return NULL;
+  tp_fd_cfg (fd);
+  int syncnt = TP_CONN_SYN_RETRIES;
+  (void)setsockopt (fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof (syncnt));
+  struct sockaddr_in6 sa;
+  memset (&sa, 0, sizeof (sa));
+  sa.sin6_family = AF_INET6;
+  sa.sin6_port = htons (port);
+  memcpy (sa.sin6_addr.s6_addr, ip, 16);
+  TpConn *conn = tp_conn_alloc (g_tp_rt);
+  if (!conn)
+    {
+      close (fd);
+      return NULL;
+    }
+  if (!tp_conn_fd_bind (g_tp_rt, conn, fd))
+    {
+      tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+      return NULL;
+    }
+  conn->st = TP_ST_CONNECTING;
+  conn->ts = now;
+  conn->inbound = false;
+  memcpy (conn->route_ip, ip, 16);
+  conn->route_port = port;
+  conn->lane_hash = lane_hash;
+  if (has_peer)
+    memcpy (conn->peer_lla, peer_lla, 16);
+  int rc = connect (fd, (struct sockaddr *)&sa, sizeof (sa));
+  if (rc == 0)
+    {
+      conn->st = TP_ST_ESTABLISHED;
+      if (!tp_send_hello (conn))
+        {
+          tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+          return NULL;
+        }
+    }
+  else if (errno != EINPROGRESS)
+    {
+      tp_conn_close (g_tp_rt, g_tp_epfd, conn);
+      return NULL;
+    }
+  return conn;
+}
+
 static bool
 tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len, bool hi,
@@ -2272,8 +2341,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
     return false;
   if (proto != TP_PROTO_TCP)
     {
-      udp_tx (udp, ip, port, data, len);
-      return true;
+      return udp_tx (udp, ip, port, data, len) == 1;
     }
   if (!g_tp_rt || g_tp_epfd < 0 || !g_tp_cry || !g_tp_cfg)
     return false;
@@ -2324,75 +2392,30 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
       return true;
     }
 
-  int fd = socket (AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-  if (fd < 0)
-    {
-      tp_unlock (g_tp_rt);
-      return false;
-    }
-  tp_fd_cfg (fd);
-  int syncnt = TP_CONN_SYN_RETRIES;
-  (void)setsockopt (fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof (syncnt));
-  struct sockaddr_in6 sa;
-  memset (&sa, 0, sizeof (sa));
-  sa.sin6_family = AF_INET6;
-  sa.sin6_port = htons (port);
-  memcpy (sa.sin6_addr.s6_addr, ip, 16);
-  TpConn *n_conn = tp_conn_alloc (g_tp_rt);
+  TpConn *n_conn = tp_conn_open (ip, port, peer_lla, has_peer, flow_hash,
+                                 now);
   if (!n_conn)
     {
-      close (fd);
       tp_unlock (g_tp_rt);
       return false;
     }
-  if (!tp_conn_fd_bind (g_tp_rt, n_conn, fd))
-    {
-      tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
-      tp_unlock (g_tp_rt);
-      return false;
-    }
-  n_conn->st = TP_ST_CONNECTING;
-  n_conn->ts = now;
-  n_conn->inbound = false;
-  memcpy (n_conn->route_ip, ip, 16);
-  n_conn->route_port = port;
-  n_conn->lane_hash = flow_hash;
-  if (has_peer)
-    memcpy (n_conn->peer_lla, peer_lla, 16);
   if (flow_hash != 0)
     (void)tp_flow_idx_note (g_tp_rt, ip, port, peer_lla, has_peer, flow_hash,
                             n_conn, now);
-  int rc = connect (fd, (struct sockaddr *)&sa, sizeof (sa));
-  if (rc == 0)
-    {
-      n_conn->st = TP_ST_ESTABLISHED;
-      if (!tp_send_hello (n_conn))
-        {
-          tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
-          tp_unlock (g_tp_rt);
-          return false;
-        }
-      if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, n_conn, data, len, hi))
-        {
-          tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
-          tp_unlock (g_tp_rt);
-          return false;
-        }
-      tp_send_cache_note (g_tp_rt, n_conn);
-    }
-  else if (errno != EINPROGRESS)
+  if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, n_conn, data, len, hi))
     {
       tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
     }
-  else if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, n_conn, data, len, false))
+  if (n_conn->st == TP_ST_ESTABLISHED)
+    tp_send_cache_note (g_tp_rt, n_conn);
+  if (!tp_ev_add (g_tp_epfd, n_conn))
     {
       tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
     }
-  tp_ev_add (g_tp_epfd, n_conn);
   tp_unlock (g_tp_rt);
   return true;
 }
@@ -2455,59 +2478,20 @@ tp_probe (const Rt *rt, const Cfg *cfg, const uint8_t ip[16], uint16_t port)
       return ok;
     }
 
-  int fd = socket (AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-  if (fd < 0)
-    {
-      tp_unlock (g_tp_rt);
-      return false;
-    }
-  tp_fd_cfg (fd);
-  int syncnt = TP_CONN_SYN_RETRIES;
-  (void)setsockopt (fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof (syncnt));
-  struct sockaddr_in6 sa;
-  memset (&sa, 0, sizeof (sa));
-  sa.sin6_family = AF_INET6;
-  sa.sin6_port = htons (port);
-  memcpy (sa.sin6_addr.s6_addr, ip, 16);
-  TpConn *n_conn = tp_conn_alloc (g_tp_rt);
+  TpConn *n_conn = tp_conn_open (ip, port, peer_lla, has_peer, 0, sys_ts ());
   if (!n_conn)
     {
-      close (fd);
       tp_unlock (g_tp_rt);
       return false;
     }
-  if (!tp_conn_fd_bind (g_tp_rt, n_conn, fd))
+  if (n_conn->st == TP_ST_ESTABLISHED)
+    tp_send_cache_note (g_tp_rt, n_conn);
+  if (!tp_ev_add (g_tp_epfd, n_conn))
     {
       tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
     }
-  n_conn->st = TP_ST_CONNECTING;
-  n_conn->ts = sys_ts ();
-  n_conn->inbound = false;
-  memcpy (n_conn->route_ip, ip, 16);
-  n_conn->route_port = port;
-  if (has_peer)
-    memcpy (n_conn->peer_lla, peer_lla, 16);
-  int rc = connect (fd, (struct sockaddr *)&sa, sizeof (sa));
-  if (rc == 0)
-    {
-      n_conn->st = TP_ST_ESTABLISHED;
-      if (!tp_send_hello (n_conn))
-        {
-          tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
-          tp_unlock (g_tp_rt);
-          return false;
-        }
-      tp_send_cache_note (g_tp_rt, n_conn);
-    }
-  else if (errno != EINPROGRESS)
-    {
-      tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
-      tp_unlock (g_tp_rt);
-      return false;
-    }
-  tp_ev_add (g_tp_epfd, n_conn);
   tp_unlock (g_tp_rt);
   return true;
 }
@@ -2628,7 +2612,8 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
       conn->ts = sys_ts ();
       memcpy (conn->sock_ip, sa.sin6_addr.s6_addr, 16);
       conn->sock_port = ntohs (sa.sin6_port);
-      tp_ev_add (epfd, conn);
+      if (!tp_ev_add (epfd, conn))
+        tp_conn_close (tp, epfd, conn);
     }
   tp_unlock (tp);
 }
@@ -2795,19 +2780,6 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
                 tp_conn_drain_start (tp, epfd, conn);
               tp_unlock (tp);
               return;
-            }
-          if (ar == TP_AUTH_PENDING)
-            {
-              if (!tp_conn_slot_live (tp, slot_idx, conn))
-                {
-                  tp_unlock (tp);
-                  return;
-                }
-              conn->ts = sys_ts ();
-              conn->rx_in_off += plain_len;
-              tp_unlock (tp);
-              events = EPOLLIN;
-              continue;
             }
           conn->ts = sys_ts ();
           conn->rx_in_off += plain_len;
