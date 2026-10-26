@@ -82,4 +82,4 @@ void cfg_reload_apply (Cfg *cfg, Cry *cry_ctx, Rt *rt, PPool *pool,
                        const char *cfg_path, uint64_t ts,
                        pthread_rwlock_t *snap_lk);
 int loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
-              bool daemon_child, LoopReadyFn ready_fn, void *ready_arg);
+              LoopReadyFn ready_fn, void *ready_arg);
