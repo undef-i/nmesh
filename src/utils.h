@@ -38,6 +38,7 @@ extern uint32_t g_frag_mid;
 extern uint32_t g_rnd_st;
 
 uint64_t sys_ts (void);
+uint64_t wall_ts (void);
 uint32_t u32_rnd (void);
 bool rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
                 uint8_t out_ip[16], uint16_t *out_port);

@@ -744,6 +744,7 @@ re_to_pth (const Re *re, Pth *pth)
   pth->vfy_ts = re->vfy_ts;
   pth->hld_ts = re->hld_ts;
   pth->prb_ts = re->prb_ts;
+  pth->prb_wts = re->prb_wts;
   pth->prb_tok = re->prb_tok;
   pth->loss_pct = re->loss_pct;
   pth->loss_ok = re->loss_ok;

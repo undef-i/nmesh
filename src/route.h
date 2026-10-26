@@ -91,6 +91,7 @@ typedef struct
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
+  uint64_t prb_wts;
   uint64_t prb_tok;
   uint64_t prb_win_id[RT_METRIC_WIN_BINS];
   uint32_t prb_win_tx[RT_METRIC_WIN_BINS];
@@ -143,6 +144,7 @@ typedef struct Pth
   uint64_t vfy_ts;
   uint64_t hld_ts;
   uint64_t prb_ts;
+  uint64_t prb_wts;
   uint64_t prb_tok;
   uint32_t loss_pct;
   bool loss_ok;

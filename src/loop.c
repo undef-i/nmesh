@@ -632,7 +632,7 @@ static bool
 ibs_ts_fresh (const uint8_t *pl)
 {
   uint64_t pkt_ts = be64_rd (pl);
-  uint64_t now = sys_ts ();
+  uint64_t now = wall_ts ();
   uint64_t delta = (now >= pkt_ts) ? (now - pkt_ts) : (pkt_ts - now);
   return delta <= IBS_TS_SKEW_MAX;
 }
@@ -666,7 +666,7 @@ ibs_gate_ok (Cry *cry_ctx, const Rt *rt, const uint8_t src_ip[16],
   for (int i = 0; i < IBS_CKIE_SZ; i++)
     if (ckie[i] != 0)
       has_ckie = true;
-  uint64_t bucket = sys_ts () / IBS_TS_SKEW_MAX;
+  uint64_t bucket = wall_ts () / IBS_TS_SKEW_MAX;
   if (has_ckie)
     {
       uint8_t want[IBS_CKIE_SZ];
@@ -963,18 +963,20 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
   size_t p_len = 0;
   bool ckie_arm = cry_ctx->auth_ibs && re->ibs_ckie_ok;
   uint64_t p_ts = ckie_arm ? re->prb_ts : sys_ts ();
+  uint64_t w_ts = ckie_arm ? re->prb_wts : wall_ts ();
   uint64_t p_tok = ckie_arm
                        ? re->prb_tok
                        : (((uint64_t)u32_rnd () << 32) | (uint64_t)u32_rnd ());
   if (cry_ctx->auth_ibs)
-    ibs_ping_bld (cry_ctx, cfg->addr, cfg->port, p_ts, sid, p_tok,
+    ibs_ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok,
                   cfg->addr, ckie_arm ? re->ibs_ckie : NULL, p_buf, &p_len);
   else
-    ping_bld (cry_ctx, cfg->addr, cfg->port, p_ts, sid, p_tok, p_buf, &p_len);
+    ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok, p_buf, &p_len);
   if (tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, p_buf, p_len))
     {
       ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port, ts);
       re->prb_ts = p_ts;
+      re->prb_wts = w_ts;
       re->prb_tok = p_tok;
       if (cry_ctx->auth_ibs)
         ibs_pl_hash (p_buf + PKT_CH_SZ, re->prb_hash);
@@ -4122,14 +4124,15 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           break;
         if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
           break;
+        uint64_t pong_wts = wall_ts ();
         const uint8_t *peer_pk = on_ping_kx (pt, pt_len);
         if (peer_pk)
           (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
         if (tp_src && tp_src->is_tcp && prb_tok != 0)
           {
             static uint8_t pong_buf[UDP_PL_MAX];
-            size_t pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid, ts,
-                                            prb_tok, pong_buf);
+            size_t pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid,
+                                            pong_wts, prb_tok, pong_buf);
             (void)ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL,
                               src_port, pong_buf, pong_len);
             break;
@@ -4145,7 +4148,7 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
             && !p_is_me (rt, cfg->addr, src_ip, src_port))
           pp_add (pool, src_ip, src_port);
         static uint8_t pong_buf[UDP_PL_MAX];
-        size_t pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid, ts,
+        size_t pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid, pong_wts,
                                         prb_tok, pong_buf);
         if (ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL, src_port,
                        pong_buf, pong_len))
@@ -4196,7 +4199,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         (void)rt_peer_sess (rt, peer_lla, peer_sid, ts);
         if (hdr->rel_f == 0 && has_src)
           rt_ep_upd (rt, peer_lla, src_ip, src_port, src_tp_mask, ts);
-        uint32_t rtt = (uint32_t)(ts >= req_ts ? (ts - req_ts) : 0);
+        uint64_t wnow = wall_ts ();
+        uint32_t rtt = (uint32_t)(wnow >= req_ts ? (wnow - req_ts) : 0);
         if (rtt == 0)
           rtt = 1;
         bool has_fwd = peer_rx_ts != 0;

@@ -12,6 +12,14 @@ sys_ts (void)
   return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+uint64_t
+wall_ts (void)
+{
+  struct timespec ts;
+  clock_gettime (CLOCK_REALTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
 uint32_t
 u32_rnd (void)
 {
