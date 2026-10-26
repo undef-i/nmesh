@@ -1,5 +1,6 @@
 #include "config.h"
 #include <stdarg.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include "bogon.h"
 #include "ibs.h"
@@ -26,7 +27,7 @@ cfg_init (Cfg *cfg)
   cfg->port = 50000;
   cfg->mtu = (uint16_t) (FRAG_DATA_MAX - VNET_HL - ETH_HLEN);
   cfg->mtu_probe = false;
-  cfg->p2p = P2P_EN;
+  cfg->p2p = true;
   cfg->tap_mode = TAP_MODE_AUTO;
   strcpy (cfg->ifname, "nmesh");
 }
@@ -38,6 +39,7 @@ cfg_free (Cfg *cfg)
     return;
   free (cfg->tp_pref);
   free (cfg->bogon_arr);
+  free (cfg->peer_arr);
   memset (cfg, 0, sizeof (*cfg));
 }
 
@@ -91,6 +93,31 @@ cfg_bogon_rsv (Cfg *cfg, size_t need)
   return 0;
 }
 
+static int
+cfg_peer_rsv (Cfg *cfg, size_t need)
+{
+  if (!cfg)
+    return -1;
+  if (need <= cfg->peer_cap)
+    return 0;
+  size_t new_cap = cfg->peer_cap ? cfg->peer_cap : PEER_CAP_INIT;
+  while (new_cap < need)
+    {
+      if (new_cap > (SIZE_MAX / 2U))
+        {
+          new_cap = need;
+          break;
+        }
+      new_cap *= 2U;
+    }
+  P *new_arr = realloc (cfg->peer_arr, sizeof (*new_arr) * new_cap);
+  if (!new_arr)
+    return -1;
+  cfg->peer_arr = new_arr;
+  cfg->peer_cap = new_cap;
+  return 0;
+}
+
 int
 cfg_cpy (Cfg *dst, const Cfg *src)
 {
@@ -102,6 +129,8 @@ cfg_cpy (Cfg *dst, const Cfg *src)
   dst->tp_pref_cap = 0;
   dst->bogon_arr = NULL;
   dst->bogon_cap = 0;
+  dst->peer_arr = NULL;
+  dst->peer_cap = 0;
   if (src->tp_pref_len > 0)
     {
       if (cfg_tp_rsv (dst, src->tp_pref_len) != 0)
@@ -120,6 +149,16 @@ cfg_cpy (Cfg *dst, const Cfg *src)
         }
       memcpy (dst->bogon_arr, src->bogon_arr,
               sizeof (*dst->bogon_arr) * src->bogon_cnt);
+    }
+  if (src->peer_cnt > 0)
+    {
+      if (cfg_peer_rsv (dst, src->peer_cnt) != 0)
+        {
+          cfg_free (dst);
+          return -1;
+        }
+      memcpy (dst->peer_arr, src->peer_arr,
+              sizeof (*dst->peer_arr) * src->peer_cnt);
     }
   return 0;
 }
@@ -148,6 +187,22 @@ char_to_hex (char c)
   return -1;
 }
 
+static int
+hex_dec (const char *s, uint8_t *out, size_t n)
+{
+  for (size_t i = 0; i < n; i++)
+    {
+      int hi = char_to_hex (s[i * 2]);
+      int lo = char_to_hex (s[i * 2 + 1]);
+      if (hi < 0 || lo < 0)
+        return -1;
+      out[i] = (uint8_t)((hi << 4) | lo);
+    }
+  return 0;
+}
+
+static int cfg_u32_prs (const char *v, unsigned long *out);
+
 int
 str_to_v6 (const char *s, uint8_t out[16])
 {
@@ -164,93 +219,19 @@ str_to_v6 (const char *s, uint8_t out[16])
       buf[t_len] = '\0';
       s = buf;
     }
-  memset (out, 0, 16);
-  if (strcmp (s, "::1") == 0)
-    {
-      out[15] = 1;
-      return 0;
-    }
-  if (strcmp (s, "::") == 0)
-    return 0;
-  const char *dbl_col = strstr (s, "::");
-  const char *l_str = s;
-  const char *r_s = NULL;
-  char l_buf[64] = { 0 };
-  char r_b[64] = { 0 };
-  if (dbl_col)
-    {
-      size_t l_len = (size_t)(dbl_col - s);
-      size_t r_len = strlen (dbl_col + 2);
-      if (l_len >= sizeof (l_buf) || r_len >= sizeof (r_b))
-        return -1;
-      memcpy (l_buf, l_str, l_len);
-      memcpy (r_b, dbl_col + 2, r_len);
-      l_str = l_buf;
-      r_s = r_b;
-    }
-  uint16_t l_grp[8] = { 0 };
-  int l_cnt = 0;
-  uint16_t r_grp[8] = { 0 };
-  int r_cnt = 0;
-  if (l_str && l_str[0])
-    {
-      char tmp[64];
-      strncpy (tmp, l_str, sizeof (tmp) - 1);
-      tmp[sizeof (tmp) - 1] = '\0';
-      char *seg = strtok (tmp, ":");
-      while (seg)
-        {
-          if (l_cnt >= 8)
-            return -1;
-          l_grp[l_cnt++] = (uint16_t)strtoul (seg, NULL, 16);
-          seg = strtok (NULL, ":");
-        }
-    }
-  if (r_s && r_s[0])
-    {
-      char tmp[64];
-      strncpy (tmp, r_s, sizeof (tmp) - 1);
-      tmp[sizeof (tmp) - 1] = '\0';
-      char *seg = strtok (tmp, ":");
-      while (seg)
-        {
-          if (r_cnt >= 8)
-            return -1;
-          r_grp[r_cnt++] = (uint16_t)strtoul (seg, NULL, 16);
-          seg = strtok (NULL, ":");
-        }
-    }
-  if (!dbl_col && l_cnt != 8)
-    return -1;
-  uint16_t grp_arr[8] = { 0 };
-  for (int g_idx = 0; g_idx < l_cnt; g_idx++)
-    grp_arr[g_idx] = l_grp[g_idx];
-  int gap = 8 - l_cnt - r_cnt;
-  for (int g_idx = 0; g_idx < r_cnt; g_idx++)
-    grp_arr[l_cnt + gap + g_idx] = r_grp[g_idx];
-  for (int g_idx = 0; g_idx < 8; g_idx++)
-    {
-      out[g_idx * 2] = (uint8_t)(grp_arr[g_idx] >> 8);
-      out[g_idx * 2 + 1] = (uint8_t)(grp_arr[g_idx] & 0xff);
-    }
-  return 0;
+  return inet_pton (AF_INET6, s, out) == 1 ? 0 : -1;
 }
 
 static int
 str_to_v4 (const char *s, uint8_t out[16])
 {
+  uint8_t v4[4];
+  if (inet_pton (AF_INET, s, v4) != 1)
+    return -1;
   memset (out, 0, 16);
   out[10] = 0xff;
   out[11] = 0xff;
-  unsigned int o1, o2, o3, o4;
-  if (sscanf (s, "%u.%u.%u.%u", &o1, &o2, &o3, &o4) != 4)
-    return -1;
-  if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255)
-    return -1;
-  out[12] = (uint8_t)o1;
-  out[13] = (uint8_t)o2;
-  out[14] = (uint8_t)o3;
-  out[15] = (uint8_t)o4;
+  memcpy (out + 12, v4, 4);
   return 0;
 }
 
@@ -303,30 +284,24 @@ str_to_p (const char *s, P *p)
               hints.ai_family = AF_UNSPEC;
               hints.ai_socktype = SOCK_DGRAM;
               struct addrinfo *res = NULL;
-              if (getaddrinfo (addr_buf, NULL, &hints, &res) != 0)
+              if (getaddrinfo (addr_buf, NULL, &hints, &res) != 0 || !res)
                 return -1;
               bool ok = false;
-              for (struct addrinfo *it = res; it != NULL; it = it->ai_next)
+              if (res->ai_family == AF_INET)
                 {
-                  if (it->ai_family == AF_INET)
-                    {
-                      struct sockaddr_in *sa4
-                          = (struct sockaddr_in *)it->ai_addr;
-                      memset (p->ip, 0, 16);
-                      p->ip[10] = 0xff;
-                      p->ip[11] = 0xff;
-                      memcpy (p->ip + 12, &sa4->sin_addr, 4);
-                      ok = true;
-                      break;
-                    }
-                  if (it->ai_family == AF_INET6)
-                    {
-                      struct sockaddr_in6 *sa6
-                          = (struct sockaddr_in6 *)it->ai_addr;
-                      memcpy (p->ip, &sa6->sin6_addr, 16);
-                      ok = true;
-                      break;
-                    }
+                  struct sockaddr_in *sa4 = (struct sockaddr_in *)res->ai_addr;
+                  memset (p->ip, 0, 16);
+                  p->ip[10] = 0xff;
+                  p->ip[11] = 0xff;
+                  memcpy (p->ip + 12, &sa4->sin_addr, 4);
+                  ok = true;
+                }
+              else if (res->ai_family == AF_INET6)
+                {
+                  struct sockaddr_in6 *sa6
+                      = (struct sockaddr_in6 *)res->ai_addr;
+                  memcpy (p->ip, &sa6->sin6_addr, 16);
+                  ok = true;
                 }
               freeaddrinfo (res);
               if (!ok)
@@ -334,8 +309,8 @@ str_to_p (const char *s, P *p)
             }
         }
     }
-  unsigned long p_v = strtoul (p_str, NULL, 10);
-  if (p_v == 0 || p_v > 65535)
+  unsigned long p_v = 0;
+  if (cfg_u32_prs (p_str, &p_v) != 0 || p_v < 1 || p_v > 65535)
     return -1;
   p->port = (uint16_t)p_v;
   return 0;
@@ -344,21 +319,17 @@ str_to_p (const char *s, P *p)
 static int
 psk_prs (const char *s, uint8_t out[32])
 {
+  if (strlen (s) != 64)
+    return -1;
+  return hex_dec (s, out, 32);
+}
+
+static int
+psk_pass_prs (const char *s, uint8_t out[32])
+{
   size_t s_len = strlen (s);
   if (s_len == 0)
     return -1;
-  if (s_len == 64)
-    {
-      for (int idx = 0; idx < 32; idx++)
-        {
-          int h_nib = char_to_hex (s[idx * 2]);
-          int l_nib = char_to_hex (s[idx * 2 + 1]);
-          if (h_nib < 0 || l_nib < 0)
-            return -1;
-          out[idx] = (uint8_t)(h_nib * 16 + l_nib);
-        }
-      return 0;
-    }
   return crypto_generichash (out, 32, (const uint8_t *)s, s_len, NULL, 0);
 }
 
@@ -497,6 +468,12 @@ cfg_u32_prs (const char *v, unsigned long *out)
   return 0;
 }
 
+static const char *const cfg_scalar_keys[] = {
+  "address", "port", "mtu", "p2p", "tap_mode", "mtu_probe",
+  "default_phys_mtu", "transport", "ifname", "psk", "psk_passphrase",
+  "auth", "ibs_mpk", "ibs_sk",
+};
+
 int
 cfg_load (const char *path, Cfg *cfg)
 {
@@ -515,6 +492,7 @@ cfg_load (const char *path, Cfg *cfg)
   char *line = NULL;
   size_t line_cap = 0;
   int line_no = 0;
+  unsigned seen = 0;
   while (getline (&line, &line_cap, fp) >= 0)
     {
       line_no++;
@@ -533,6 +511,23 @@ cfg_load (const char *path, Cfg *cfg)
       *sep = '\0';
       char *k = str_trm (l_trm);
       char *v = str_trm (sep + 1);
+      for (size_t si = 0;
+           si < sizeof (cfg_scalar_keys) / sizeof (cfg_scalar_keys[0]);
+           si++)
+        {
+          if (strcmp (k, cfg_scalar_keys[si]) != 0)
+            continue;
+          if (seen & (1U << si))
+            {
+              cfg_ln_err (path, line_no, "duplicate key: %s", k);
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          seen |= (1U << si);
+          break;
+        }
       if (strcmp (k, "address") == 0)
         {
           if (str_to_v6 (v, cfg->addr) != 0)
@@ -583,7 +578,7 @@ cfg_load (const char *path, Cfg *cfg)
               fclose (fp);
               return -1;
             }
-          cfg->p2p = en ? P2P_EN : P2P_DIS;
+          cfg->p2p = en;
         }
       else if (strcmp (k, "tap_mode") == 0)
         {
@@ -661,14 +656,33 @@ cfg_load (const char *path, Cfg *cfg)
         }
       else if (strcmp (k, "ifname") == 0)
         {
-          strncpy (cfg->ifname, v, sizeof (cfg->ifname) - 1);
-          cfg->ifname[sizeof (cfg->ifname) - 1] = '\0';
+          if (!v[0] || strlen (v) >= sizeof (cfg->ifname))
+            {
+              cfg_ln_err (path, line_no, "invalid ifname: %s", v);
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          strcpy (cfg->ifname, v);
         }
       else if (strcmp (k, "psk") == 0)
         {
           if (psk_prs (v, cfg->psk) != 0)
             {
-              cfg_ln_err (path, line_no, "invalid psk value");
+              cfg_ln_err (path, line_no,
+                          "invalid psk value (want 64 hex characters)");
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+        }
+      else if (strcmp (k, "psk_passphrase") == 0)
+        {
+          if (psk_pass_prs (v, cfg->psk) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid psk_passphrase value");
               cfg_free (cfg);
               free (line);
               fclose (fp);
@@ -692,44 +706,43 @@ cfg_load (const char *path, Cfg *cfg)
         }
       else if (strcmp (k, "ibs_mpk") == 0)
         {
-          if (strlen (v) != IBS_MPK_SZ * 2)
+          if (strlen (v) != IBS_MPK_SZ * 2
+              || hex_dec (v, cfg->ibs_mpk, IBS_MPK_SZ) != 0)
             {
-              cfg_ln_err (path, line_no, "invalid ibs_mpk length");
+              cfg_ln_err (path, line_no, "invalid ibs_mpk value");
               cfg_free (cfg); free (line); fclose (fp); return -1;
-            }
-          for (size_t i = 0; i < IBS_MPK_SZ; i++)
-            {
-              int hi = char_to_hex (v[i * 2]);
-              int lo = char_to_hex (v[i * 2 + 1]);
-              if (hi < 0 || lo < 0)
-                {
-                  cfg_ln_err (path, line_no, "invalid hex in ibs key");
-                  cfg_free (cfg); free (line); fclose (fp); return -1;
-                }
-              cfg->ibs_mpk[i] = (uint8_t)((hi << 4) | lo);
             }
         }
       else if (strcmp (k, "ibs_sk") == 0)
         {
-          if (strlen (v) != IBS_SK_SZ * 2)
+          if (strlen (v) != IBS_SK_SZ * 2
+              || hex_dec (v, cfg->ibs_sk, IBS_SK_SZ) != 0)
             {
-              cfg_ln_err (path, line_no, "invalid ibs_sk length");
+              cfg_ln_err (path, line_no, "invalid ibs_sk value");
               cfg_free (cfg); free (line); fclose (fp); return -1;
-            }
-          for (size_t i = 0; i < IBS_SK_SZ; i++)
-            {
-              int hi = char_to_hex (v[i * 2]);
-              int lo = char_to_hex (v[i * 2 + 1]);
-              if (hi < 0 || lo < 0)
-                {
-                  cfg_ln_err (path, line_no, "invalid hex in ibs key");
-                  cfg_free (cfg); free (line); fclose (fp); return -1;
-                }
-              cfg->ibs_sk[i] = (uint8_t)((hi << 4) | lo);
             }
         }
       else if (strcmp (k, "peer") == 0)
         {
+          P p;
+          if (str_to_p (v, &p) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid peer entry: %s", v);
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          if (cfg_peer_rsv (cfg, cfg->peer_cnt + 1U) != 0)
+            {
+              cfg_ln_err (path, line_no,
+                          "out of memory while expanding peer list");
+              cfg_free (cfg);
+              free (line);
+              fclose (fp);
+              return -1;
+            }
+          cfg->peer_arr[cfg->peer_cnt++] = p;
         }
       else
         {
@@ -746,6 +759,14 @@ cfg_load (const char *path, Cfg *cfg)
   if (memcmp (cfg->addr, z16, 16) == 0)
     {
       fprintf (stderr, "config: %s: address is required\n", path);
+      cfg_free (cfg);
+      return -1;
+    }
+  if (cfg->addr[0] != 0xfe || (cfg->addr[1] & 0xc0) != 0x80)
+    {
+      fprintf (stderr,
+               "config: %s: address must be link-local (fe80::/10)\n",
+               path);
       cfg_free (cfg);
       return -1;
     }
@@ -770,76 +791,5 @@ cfg_load (const char *path, Cfg *cfg)
       cfg_free (cfg);
       return -1;
     }
-  return 0;
-}
-
-int
-p_arr_load (const char *path, P **out_arr, int *out_cnt)
-{
-  if (out_arr)
-    *out_arr = NULL;
-  if (out_cnt)
-    *out_cnt = 0;
-  FILE *fp = fopen (path, "r");
-  if (!fp)
-    return 0;
-  P *arr = NULL;
-  int p_cnt = 0;
-  int p_cap = 0;
-  char *line = NULL;
-  size_t line_cap = 0;
-  int line_no = 0;
-  while (getline (&line, &line_cap, fp) >= 0)
-    {
-      line_no++;
-      char *l_trm = str_trm (line);
-      if (!l_trm[0] || l_trm[0] == '#')
-        continue;
-      char *sep = strchr (l_trm, '=');
-      if (!sep)
-        continue;
-      *sep = '\0';
-      char *k = str_trm (l_trm);
-      char *v = str_trm (sep + 1);
-      if (strcmp (k, "peer") != 0)
-        continue;
-      P p;
-      if (str_to_p (v, &p) == 0)
-        {
-          if (p_cnt >= p_cap)
-            {
-              int new_cap = (p_cap > 0) ? (p_cap * 2) : PEER_CAP_INIT;
-              P *new_arr = realloc (arr, sizeof (*arr) * (size_t)new_cap);
-              if (!new_arr)
-                {
-                  cfg_ln_err (path, line_no,
-                              "out of memory while expanding peer list");
-                  free (arr);
-                  free (line);
-                  fclose (fp);
-                  return -1;
-                }
-              arr = new_arr;
-              p_cap = new_cap;
-            }
-          arr[p_cnt++] = p;
-        }
-      else
-        {
-          cfg_ln_err (path, line_no, "invalid peer entry: %s", v);
-          free (arr);
-          free (line);
-          fclose (fp);
-          return -1;
-        }
-    }
-  free (line);
-  fclose (fp);
-  if (out_arr)
-    *out_arr = arr;
-  else
-    free (arr);
-  if (out_cnt)
-    *out_cnt = p_cnt;
   return 0;
 }

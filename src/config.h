@@ -12,12 +12,6 @@
 
 typedef enum
 {
-  P2P_EN = 0,
-  P2P_DIS
-} P2pMode;
-
-typedef enum
-{
   TAP_MODE_AUTO = 0,
   TAP_MODE_INLINE,
   TAP_MODE_PIPE
@@ -62,6 +56,12 @@ typedef struct
 
 typedef struct
 {
+  uint8_t ip[16];
+  uint16_t port;
+} P;
+
+typedef struct
+{
   char ifname[16];
   uint8_t addr[16];
   uint16_t port;
@@ -76,7 +76,10 @@ typedef struct
   size_t bogon_cnt;
   size_t bogon_cap;
   BogonRule *bogon_arr;
-  P2pMode p2p;
+  size_t peer_cnt;
+  size_t peer_cap;
+  P *peer_arr;
+  bool p2p;
   TapMode tap_mode;
   uint8_t psk[32];
   uint8_t ibs_mpk[96];
@@ -84,17 +87,10 @@ typedef struct
   bool auth_ibs;
 } Cfg;
 
-typedef struct
-{
-  uint8_t ip[16];
-  uint16_t port;
-} P;
-
 int cfg_load (const char *path, Cfg *out);
 void cfg_init (Cfg *cfg);
 void cfg_free (Cfg *cfg);
 int cfg_cpy (Cfg *dst, const Cfg *src);
-int p_arr_load (const char *path, P **out_arr, int *out_cnt);
 int str_to_v6 (const char *s, uint8_t out[16]);
 
 static inline TpProto
