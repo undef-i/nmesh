@@ -1,6 +1,8 @@
 #include "tap.h"
+#include "config.h"
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <linux/if_addr.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
 #include <stdio.h>
@@ -38,7 +40,7 @@
 #define NA_F_OVR 0x20
 #define ICMP6_OPT_TLL 2
 
-static bool g_tap_udp_gso = false;
+static TapCaps g_tap_caps;
 
 static int
 tap_ip_run (char *const argv[], const char *what, const char *name,
@@ -106,45 +108,67 @@ tap_ip_run (char *const argv[], const char *what, const char *name,
   return -1;
 }
 
-static void
+static int
 tap_txq_set (const char *name)
 {
   int sock = socket (AF_INET, SOCK_DGRAM, 0);
   if (sock < 0)
-    return;
+    return -1;
   struct ifreq q;
   memset (&q, 0, sizeof (q));
   strncpy (q.ifr_name, name, IFNAMSIZ - 1);
   q.ifr_qlen = TAP_TXQ_LEN;
-  if (ioctl (sock, SIOCSIFTXQLEN, &q) < 0)
-    {
-      perror ("tap: ioctl(SIOCSIFTXQLEN) failed");
-    }
+  int rc = ioctl (sock, SIOCSIFTXQLEN, &q);
+  if (rc < 0)
+    perror ("tap: ioctl(SIOCSIFTXQLEN) failed");
   close (sock);
+  return rc < 0 ? -1 : 0;
 }
 
-bool
-tap_udp_gso_ok (void)
+const TapCaps *
+tap_caps (void)
 {
-  return g_tap_udp_gso;
+  return &g_tap_caps;
+}
+
+static int
+tap_down_flush (const char *name)
+{
+  char *down_argv[]
+      = { "ip", "link", "set", "dev", (char *)name, "down", NULL };
+  if (tap_ip_run (down_argv, "set link down", name, NULL, 0) != 0)
+    return -1;
+  char *flush_argv[] = { "ip",  "-6",   "addr", "flush", "dev",
+                         (char *)name, "scope", "link", NULL };
+  return tap_ip_run (flush_argv, "flush addresses", name, NULL, 0);
 }
 
 void
 tap_stl_rm (const char *name)
 {
-  char out[1024];
-  char *show_argv[]
-      = { "ip", "-6", "addr", "show", "dev", (char *)name, NULL };
-  if (tap_ip_run (show_argv, NULL, name, out, sizeof (out)) != 0)
+  unsigned int ifidx = if_nametoindex (name);
+  if (ifidx == 0)
     return;
-  if (!strstr (out, "dadfailed") && !strstr (out, "tentative"))
+  FILE *f = fopen ("/proc/net/if_inet6", "r");
+  if (!f)
     return;
-  char *down_argv[]
-      = { "ip", "link", "set", "dev", (char *)name, "down", NULL };
-  (void)tap_ip_run (down_argv, "set link down", name, NULL, 0);
-  char *flush_argv[] = { "ip",  "-6",   "addr", "flush", "dev",
-                         (char *)name, "scope", "link", NULL };
-  (void)tap_ip_run (flush_argv, "flush addresses", name, NULL, 0);
+  bool stale = false;
+  char line[160];
+  while (fgets (line, sizeof (line), f))
+    {
+      unsigned int idx = 0, plen = 0, scope = 0, flags = 0;
+      if (sscanf (line, "%*s %x %x %x %x", &idx, &plen, &scope, &flags)
+          != 4)
+        continue;
+      if (idx != ifidx)
+        continue;
+      if (flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED))
+        stale = true;
+    }
+  fclose (f);
+  if (!stale)
+    return;
+  (void)tap_down_flush (name);
 }
 
 void
@@ -152,13 +176,8 @@ tap_iface_cleanup (const char *name)
 {
   if (!name || !name[0] || if_nametoindex (name) == 0)
     return;
-  char *down_argv[]
-      = { "ip", "link", "set", "dev", (char *)name, "down", NULL };
-  (void)tap_ip_run (down_argv, "set link down", name, NULL, 0);
-  char *flush_argv[] = { "ip",  "-6",   "addr", "flush", "dev",
-                         (char *)name, "scope", "link", NULL };
-  (void)tap_ip_run (flush_argv, "flush addresses", name, NULL, 0);
   char *del_argv[] = { "ip", "link", "del", "dev", (char *)name, NULL };
+  (void)tap_down_flush (name);
   (void)tap_ip_run (del_argv, "delete link", name, NULL, 0);
 }
 
@@ -183,34 +202,40 @@ tap_init (const char *name)
     if (ioctl (fd, TUNSETVNETHDRSZ, &vnet_hdr_sz) < 0)
       {
         perror ("tap: ioctl(TUNSETVNETHDRSZ) failed");
+        close (fd);
+        return -1;
       }
     int tcp_offload = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_TSO_ECN;
     int udp_offload = TUN_F_UFO | TUN_F_USO4 | TUN_F_USO6;
     int offload = tcp_offload | udp_offload;
-    g_tap_udp_gso = false;
+    memset (&g_tap_caps, 0, sizeof (g_tap_caps));
     if (ioctl (fd, TUNSETOFFLOAD, offload) == 0)
       {
-        g_tap_udp_gso = true;
+        g_tap_caps.tcp_gso = true;
+        g_tap_caps.udp_gso = true;
       }
-    else if (ioctl (fd, TUNSETOFFLOAD, tcp_offload) < 0)
+    else if (ioctl (fd, TUNSETOFFLOAD, tcp_offload) == 0)
       {
-        perror ("tap: ioctl(TUNSETOFFLOAD) failed");
+        g_tap_caps.tcp_gso = true;
+        fprintf (stderr,
+                 "tap: UDP segmentation offload unavailable; "
+                 "software segmentation is the UDP write path\n");
       }
     else
       {
         fprintf (stderr,
-                 "tap: UDP segmentation offload unavailable; "
-                 "falling back to plain UDP delivery\n");
+                 "tap: no segmentation offload available; "
+                 "software segmentation is the write path\n");
       }
   }
   {
     int sndbuf = TAP_SND_BUF;
-    if (ioctl (fd, TUNSETSNDBUF, &sndbuf) < 0)
-      {
-        perror ("tap: ioctl(TUNSETSNDBUF) failed");
-      }
+    if (ioctl (fd, TUNSETSNDBUF, &sndbuf) == 0)
+      g_tap_caps.sndbuf_ok = true;
+    else
+      perror ("tap: ioctl(TUNSETSNDBUF) failed");
   }
-  tap_txq_set (name);
+  g_tap_caps.txq_ok = tap_txq_set (name) == 0;
   {
     char *up_argv[]
         = { "ip", "link", "set", "dev", (char *)name, "up", NULL };
@@ -229,7 +254,6 @@ tap_init (const char *name)
 int
 tap_addr_set (const char *name, const uint8_t lla[16])
 {
-  tap_txq_set (name);
   char addr_str[64];
   snprintf (addr_str, sizeof (addr_str),
             "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
@@ -270,36 +294,13 @@ tap_mtu_set (const char *name, uint16_t mtu)
 {
   if (!name)
     return -1;
-  if (mtu < 128)
-    mtu = 128;
+  if (mtu < CFG_MTU_MIN || mtu > CFG_MTU_MAX)
+    return -1;
   char mtu_str[16];
   snprintf (mtu_str, sizeof (mtu_str), "%u", (unsigned)mtu);
   char *mtu_argv[] = { "ip",   "link", "set", "dev",
                        (char *)name, "mtu",  mtu_str, NULL };
   return tap_ip_run (mtu_argv, "set mtu", name, NULL, 0);
-}
-
-int
-tap_mtu_get (const char *name, uint16_t *mtu)
-{
-  if (!name || !mtu)
-    return -1;
-  int sock = socket (AF_INET, SOCK_DGRAM, 0);
-  if (sock < 0)
-    return -1;
-  struct ifreq ifr;
-  memset (&ifr, 0, sizeof (ifr));
-  strncpy (ifr.ifr_name, name, IFNAMSIZ - 1);
-  if (ioctl (sock, SIOCGIFMTU, &ifr) < 0)
-    {
-      close (sock);
-      return -1;
-    }
-  close (sock);
-  if (ifr.ifr_mtu < 0)
-    return -1;
-  *mtu = (uint16_t)ifr.ifr_mtu;
-  return 0;
 }
 
 void
@@ -345,16 +346,9 @@ tap_f_proc (uint8_t *frame, size_t n, const uint8_t our_lla[16], FRes *r)
   if (n < ETH_HLEN)
     return;
   uint16_t eth_type = ((uint16_t)frame[12] << 8) | frame[13];
-  if (eth_type == ETH_P_IP)
-    {
-      r->res_type = FRAME_V6_DAT;
-      r->pl_start = 0;
-      r->payload_len = n;
-      return;
-    }
   if (eth_type != ETH_P_IPV6)
     {
-      r->res_type = FRAME_V6_DAT;
+      r->res_type = FRAME_DAT;
       r->pl_start = 0;
       r->payload_len = n;
       return;
@@ -365,14 +359,14 @@ tap_f_proc (uint8_t *frame, size_t n, const uint8_t our_lla[16], FRes *r)
   uint8_t nh = pl_ptr[6];
   if (nh != V6_NX_ICMP6)
     {
-      r->res_type = FRAME_V6_DAT;
+      r->res_type = FRAME_DAT;
       r->pl_start = 0;
       r->payload_len = n;
       return;
     }
   if (n < ETH_HLEN + V6_HDR_LEN + 8)
     {
-      r->res_type = FRAME_V6_DAT;
+      r->res_type = FRAME_DAT;
       r->pl_start = 0;
       r->payload_len = n;
       return;
@@ -380,7 +374,7 @@ tap_f_proc (uint8_t *frame, size_t n, const uint8_t our_lla[16], FRes *r)
   uint8_t *icmp = pl_ptr + V6_HDR_LEN;
   if (icmp[0] != ICMP6_T_NS)
     {
-      r->res_type = FRAME_V6_DAT;
+      r->res_type = FRAME_DAT;
       r->pl_start = 0;
       r->payload_len = n;
       return;
@@ -454,54 +448,4 @@ tap_f_proc (uint8_t *frame, size_t n, const uint8_t our_lla[16], FRes *r)
   memcpy (buf + ETH_HLEN + 40, na_icmp, sizeof (na_icmp));
   r->na_len = ETH_HLEN + V6_HDR_LEN + sizeof (na_icmp);
   r->res_type = FRAME_NS_INT;
-}
-
-uint8_t *
-eth_bld (const uint8_t src_lla[16], const uint8_t dst_lla[16],
-         const uint8_t *ipv6, size_t ipv6_len, uint8_t *buf, size_t *out_len)
-{
-  uint8_t src_mac[6], dst_mac[6];
-  lla_to_mac (src_lla, src_mac);
-  lla_to_mac (dst_lla, dst_mac);
-  memcpy (buf, dst_mac, 6);
-  memcpy (buf + 6, src_mac, 6);
-  uint16_t eth_type = ETH_P_IPV6;
-  if (ipv6_len >= 1)
-    {
-      uint8_t ver = (uint8_t)((ipv6[0] >> 4) & 0x0f);
-      if (ver == 4)
-        eth_type = ETH_P_IP;
-      else if (ver == 6)
-        eth_type = ETH_P_IPV6;
-    }
-  buf[12] = (uint8_t)(eth_type >> 8);
-  buf[13] = (uint8_t)(eth_type & 0xff);
-  memcpy (buf + ETH_HLEN, ipv6, ipv6_len);
-  *out_len = ETH_HLEN + ipv6_len;
-  return buf;
-}
-
-uint8_t *
-eth_bld_ip (const uint8_t src_lla[16], const uint8_t dst_lla[16],
-            uint8_t *ipv6_ptr, size_t ipv6_len, size_t *out_len)
-{
-  uint8_t *eth_ptr = ipv6_ptr - ETH_HLEN;
-  uint8_t src_mac[6], dst_mac[6];
-  lla_to_mac (src_lla, src_mac);
-  lla_to_mac (dst_lla, dst_mac);
-  memcpy (eth_ptr, dst_mac, 6);
-  memcpy (eth_ptr + 6, src_mac, 6);
-  uint16_t eth_type = ETH_P_IPV6;
-  if (ipv6_len >= 1)
-    {
-      uint8_t ver = (uint8_t)((ipv6_ptr[0] >> 4) & 0x0f);
-      if (ver == 4)
-        eth_type = ETH_P_IP;
-      else if (ver == 6)
-        eth_type = ETH_P_IPV6;
-    }
-  eth_ptr[12] = (uint8_t)(eth_type >> 8);
-  eth_ptr[13] = (uint8_t)(eth_type & 0xff);
-  *out_len = ETH_HLEN + ipv6_len;
-  return eth_ptr;
 }

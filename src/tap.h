@@ -7,7 +7,7 @@
 typedef enum
 {
   FRAME_NS_INT = 0,
-  FRAME_V6_DAT,
+  FRAME_DAT,
   FRAME_OTH,
 } FResT;
 
@@ -20,17 +20,19 @@ typedef struct
   size_t payload_len;
 } FRes;
 
+typedef struct
+{
+  bool tcp_gso;
+  bool udp_gso;
+  bool sndbuf_ok;
+  bool txq_ok;
+} TapCaps;
+
 int tap_init (const char *name);
-bool tap_udp_gso_ok (void);
+const TapCaps *tap_caps (void);
 void tap_stl_rm (const char *name);
 void tap_iface_cleanup (const char *name);
 int tap_addr_set (const char *name, const uint8_t lla[16]);
 int tap_mtu_set (const char *name, uint16_t mtu);
-int tap_mtu_get (const char *name, uint16_t *mtu);
 void lla_to_mac (const uint8_t lla[16], uint8_t mac[6]);
 void tap_f_proc (uint8_t *frame, size_t n, const uint8_t our_lla[16], FRes *r);
-uint8_t *eth_bld (const uint8_t src_lla[16], const uint8_t dst_lla[16],
-                  const uint8_t *ipv6, size_t ipv6_len, uint8_t *buf,
-                  size_t *out_len);
-uint8_t *eth_bld_ip (const uint8_t src_lla[16], const uint8_t dst_lla[16],
-                     uint8_t *ipv6_ptr, size_t ipv6_len, size_t *out_len);
