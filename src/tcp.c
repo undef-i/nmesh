@@ -1818,10 +1818,10 @@ tp_send_hello (TpConn *conn)
   if (conn->auth_tok == 0)
     conn->auth_tok = tp_auth_tok_new ();
   if (conn->auth)
-    ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid,
+    ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, wall_ts (), g_tp_sid,
               conn->auth_tok, ping_buf, &ping_len);
   else if (tp_kx_ensure (conn))
-    tp_ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, sys_ts (), g_tp_sid,
+    tp_ping_bld (g_tp_cry, g_tp_cfg->addr, g_tp_cfg->port, wall_ts (), g_tp_sid,
                  conn->auth_tok, conn->wire_kx_pk, ping_buf, &ping_len);
   else
     return false;
@@ -1937,7 +1937,7 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
       uint8_t pong_buf[UDP_PL_MAX];
       size_t pong_len = 0;
       tp_pong_bld (g_tp_cry, cfg->addr, cfg->port, req_ts, g_tp_sid,
-                   sys_ts (), prb_tok, conn->wire_kx_pk, pong_buf, &pong_len);
+                   wall_ts (), prb_tok, conn->wire_kx_pk, pong_buf, &pong_len);
       if (!tp_conn_tx_frame_ex (tp, epfd, conn, pong_buf, pong_len, true,
                                 true))
         return TP_AUTH_FAIL;
