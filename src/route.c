@@ -134,11 +134,9 @@ re_mtu_search_kick (Re *re)
 bool
 rt_loss_pct_get (const Re *re, uint32_t *out_pct)
 {
-  if (!re || !out_pct || re->prb_tx_cnt == 0 || re->prb_rx_cnt > re->prb_tx_cnt)
+  if (!re || !out_pct || !re->loss_ok)
     return false;
-  uint64_t lost = re->prb_tx_cnt - re->prb_rx_cnt;
-  *out_pct = (uint32_t)((lost * 100ULL + (re->prb_tx_cnt / 2ULL))
-                        / re->prb_tx_cnt);
+  *out_pct = re->loss_pct;
   return true;
 }
 
@@ -270,12 +268,9 @@ pth_rel_tot_m (RtMap *map, const Pth *p)
 static bool
 pth_loss_pct_get (const Pth *pth, uint32_t *out_pct)
 {
-  if (!pth || !out_pct || pth->prb_tx_cnt == 0
-      || pth->prb_rx_cnt > pth->prb_tx_cnt)
+  if (!pth || !out_pct || !pth->loss_ok)
     return false;
-  uint64_t lost = pth->prb_tx_cnt - pth->prb_rx_cnt;
-  *out_pct = (uint32_t)((lost * 100ULL + (pth->prb_tx_cnt / 2ULL))
-                        / pth->prb_tx_cnt);
+  *out_pct = pth->loss_pct;
   return true;
 }
 
@@ -321,6 +316,54 @@ metric_slot_in_win (uint64_t now_slot, uint64_t slot)
   if (slot == RT_METRIC_SLOT_INV || now_slot < slot)
     return false;
   return (now_slot - slot) < RT_METRIC_WIN_BINS;
+}
+
+static void
+re_loss_upd (Re *re, uint64_t sys_ts)
+{
+  uint64_t now_slot = metric_slot_id (sys_ts);
+  uint64_t tx = 0, rx = 0;
+  for (size_t i = 0; i < RT_METRIC_WIN_BINS; i++)
+    {
+      if (!metric_slot_in_win (now_slot, re->prb_win_id[i]))
+        continue;
+      tx += re->prb_win_tx[i];
+      rx += re->prb_win_rx[i];
+    }
+  if (tx == 0 || rx > tx)
+    {
+      re->loss_ok = false;
+      re->loss_pct = 0;
+      return;
+    }
+  re->loss_ok = true;
+  re->loss_pct = (uint32_t)(((tx - rx) * 100ULL + (tx / 2ULL)) / tx);
+}
+
+static void
+prb_win_note (Re *re, uint64_t slot_ts, bool is_tx)
+{
+  uint64_t slot = metric_slot_id (slot_ts);
+  size_t idx = (size_t)((slot - 1ULL) % RT_METRIC_WIN_BINS);
+  if (re->prb_win_id[idx] != slot)
+    {
+      re->prb_win_id[idx] = slot;
+      re->prb_win_tx[idx] = 0;
+      re->prb_win_rx[idx] = 0;
+    }
+  if (is_tx)
+    re->prb_win_tx[idx]++;
+  else
+    re->prb_win_rx[idx]++;
+}
+
+void
+rt_prb_tx_note (Re *re, uint64_t sys_ts)
+{
+  if (!re || sys_ts == 0)
+    return;
+  prb_win_note (re, sys_ts, true);
+  re_loss_upd (re, sys_ts);
 }
 
 static void
@@ -702,8 +745,8 @@ re_to_pth (const Re *re, Pth *pth)
   pth->hld_ts = re->hld_ts;
   pth->prb_ts = re->prb_ts;
   pth->prb_tok = re->prb_tok;
-  pth->prb_tx_cnt = re->prb_tx_cnt;
-  pth->prb_rx_cnt = re->prb_rx_cnt;
+  pth->loss_pct = re->loss_pct;
+  pth->loss_ok = re->loss_ok;
   pth->pnd_ts = re->pnd_ts;
   pth->hp_ts = re->hp_ts;
   pth->dat_ts = re->dat_ts;
@@ -1428,7 +1471,8 @@ rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
       (void)re_dir_activate (re, sys_ts);
       re_rto_upd (re, rtt_ms);
       re->prb_tok = 0;
-      re->prb_rx_cnt++;
+      prb_win_note (re, re->prb_ts, false);
+      re_loss_upd (re, sys_ts);
       rt_map_mark (t);
       return true;
     }

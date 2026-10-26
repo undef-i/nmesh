@@ -980,7 +980,8 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
         ibs_pl_hash (p_buf + PKT_CH_SZ, re->prb_hash);
       if (ckie_arm)
         re->ibs_ckie_ok = false;
-      re->prb_tx_cnt++;
+      if (!ckie_arm)
+        rt_prb_tx_note (re, ts);
     }
 }
 
@@ -4656,7 +4657,6 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
   int um_cnt = 0;
   uint8_t z_lla[16] = { 0 };
   uint64_t now = sys_ts ();
-  uint64_t ctrl_tot_b = rt->ctrl_tx_b + rt->ctrl_rx_b;
   uint64_t up_ms = (rt->boot_ts > 0 && now > rt->boot_ts) ? (now - rt->boot_ts)
                                                            : 0;
   uint64_t ctrl_avg_tx_bps
@@ -4667,14 +4667,12 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
   char ctrl_avg_rx_str[32];
   char ctrl_now_tx_str[32];
   char ctrl_now_rx_str[32];
-  char ctrl_tot_str[32];
   char ctrl_tx_str[32];
   char ctrl_rx_str[32];
   fmt_rate (ctrl_avg_tx_str, sizeof (ctrl_avg_tx_str), ctrl_avg_tx_bps);
   fmt_rate (ctrl_avg_rx_str, sizeof (ctrl_avg_rx_str), ctrl_avg_rx_bps);
   fmt_rate (ctrl_now_tx_str, sizeof (ctrl_now_tx_str), rt->ctrl_now_tx_bps);
   fmt_rate (ctrl_now_rx_str, sizeof (ctrl_now_rx_str), rt->ctrl_now_rx_bps);
-  fmt_size (ctrl_tot_str, sizeof (ctrl_tot_str), ctrl_tot_b);
   fmt_size (ctrl_tx_str, sizeof (ctrl_tx_str), rt->ctrl_tx_b);
   fmt_size (ctrl_rx_str, sizeof (ctrl_rx_str), rt->ctrl_rx_b);
 
@@ -4755,7 +4753,6 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
         }
     }
 
-  STATUS_PUT ("links: loss = adjacency probe samples\n");
   {
     const Re **lre = NULL;
     size_t lre_cap = 0;
@@ -4799,7 +4796,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
           char ep[64];
           char st[10];
           char mtu[40];
-          char prb[16];
+          char prb[24];
           char rtt[16];
           char loss[16];
         } LRow;
@@ -4824,16 +4821,15 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             strcpy (lr->st, re->state == RT_ACT   ? "active"
                             : re->state == RT_PND ? "pending"
                                                   : "via");
-            snprintf (lr->mtu, sizeof (lr->mtu), "%u/%u/%u",
-                      rt_dir_mtu_get (rt, re), re->mtu_lkg, re->mtu_ukb);
+            snprintf (lr->mtu, sizeof (lr->mtu), "%u",
+                      rt_dir_mtu_get (rt, re));
             if (re->mtu_st == MTU_ST_F)
               strcpy (lr->prb, "fixed");
             else if (re->mtu_st == MTU_ST_B)
               strcpy (lr->prb, "base");
-            else if (re->prb_mtu > 0)
-              snprintf (lr->prb, sizeof (lr->prb), "srch %u", re->prb_mtu);
             else
-              strcpy (lr->prb, "srch");
+              snprintf (lr->prb, sizeof (lr->prb), "srch [%u, %u]",
+                        re->mtu_lkg, re->mtu_ukb);
             if (re->srtt > 0)
               snprintf (lr->rtt, sizeof (lr->rtt), "%ums", re->srtt >> 3);
             else
@@ -4932,6 +4928,9 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
       if (r_cnt - cand_start > 1)
         qsort (rows + cand_start, (size_t)(r_cnt - cand_start),
                sizeof (*rows), status_row_cmp);
+      if (r_cnt - dst_start == 1 && sel && sel->state != RT_DED
+          && sel->r2d == 0 && sel->path_len == 0)
+        r_cnt = dst_start;
       for (int k = dst_start; k < r_cnt; k++)
         {
           if ((int)strlen (rows[k].dst) > m_dst)
@@ -4990,14 +4989,14 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
 
   STATUS_PUT ("fib: active: %d/%u, static: %d, unmapped: %d\n", act_map_cnt,
               (uint32_t)rt->cnt, pool->cnt, um_cnt);
-  STATUS_PUT ("ctrl: adv_tx=%llu ping_tx=%llu pong_tx=%llu hp_tx=%llu seqreq_tx=%llu now_tx=%s now_rx=%s avg_tx=%s avg_rx=%s total=%s tx=%s rx=%s ckie_fail=%llu\n",
+  STATUS_PUT ("ctrl: adv_tx=%llu ping_tx=%llu pong_tx=%llu hp_tx=%llu seqreq_tx=%llu now_tx=%s now_rx=%s avg_tx=%s avg_rx=%s tx=%s rx=%s ckie_fail=%llu\n",
               (unsigned long long)rt->adv_tx_cnt,
               (unsigned long long)rt->ping_tx_cnt,
               (unsigned long long)rt->pong_tx_cnt,
               (unsigned long long)rt->hp_tx_cnt,
               (unsigned long long)rt->seqreq_tx_cnt, ctrl_now_tx_str,
               ctrl_now_rx_str, ctrl_avg_tx_str, ctrl_avg_rx_str,
-              ctrl_tot_str, ctrl_tx_str, ctrl_rx_str,
+              ctrl_tx_str, ctrl_rx_str,
               (unsigned long long)rt->ckie_fail_cnt);
   if (r_cnt > 0)
     {

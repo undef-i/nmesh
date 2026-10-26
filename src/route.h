@@ -92,8 +92,11 @@ typedef struct
   uint64_t hld_ts;
   uint64_t prb_ts;
   uint64_t prb_tok;
-  uint64_t prb_tx_cnt;
-  uint64_t prb_rx_cnt;
+  uint64_t prb_win_id[RT_METRIC_WIN_BINS];
+  uint32_t prb_win_tx[RT_METRIC_WIN_BINS];
+  uint32_t prb_win_rx[RT_METRIC_WIN_BINS];
+  uint32_t loss_pct;
+  bool loss_ok;
   uint64_t pnd_ts;
   uint64_t hp_ts;
   uint64_t dat_ts;
@@ -141,8 +144,8 @@ typedef struct Pth
   uint64_t hld_ts;
   uint64_t prb_ts;
   uint64_t prb_tok;
-  uint64_t prb_tx_cnt;
-  uint64_t prb_rx_cnt;
+  uint32_t loss_pct;
+  bool loss_ok;
   uint64_t pnd_ts;
   uint64_t hp_ts;
   uint64_t dat_ts;
@@ -255,6 +258,7 @@ void rt_upd (Rt *t, const Re *re, uint64_t sys_ts);
 bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
 bool rt_dir_is_sel (Rt *t, const Re *re);
 bool rt_loss_pct_get (const Re *re, uint32_t *out_pct);
+void rt_prb_tx_note (Re *re, uint64_t sys_ts);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
                  uint16_t port, uint32_t rtt_ms, int64_t fwd_obs,
                  bool has_fwd, uint64_t sys_ts);
