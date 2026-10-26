@@ -3970,15 +3970,18 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         bool has_frame_src
             = mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
               || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL, src_lla);
-        if (!rx_direct_src_lla_ok (has_src_peer, src_peer_lla,
-                                   has_frame_src ? src_lla : NULL))
-          break;
-        if (rt_dat_upd (rt, src_ip, src_port, ts))
+        if (hdr->rel_f == 0)
           {
-            if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
-                && cfg->p2p == P2P_EN)
+            if (!rx_direct_src_lla_ok (has_src_peer, src_peer_lla,
+                                       has_frame_src ? src_lla : NULL))
+              break;
+            if (rt_dat_upd (rt, src_ip, src_port, ts))
               {
-                rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
+                if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
+                    && cfg->p2p == P2P_EN)
+                  {
+                    rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
+                  }
               }
           }
         tap_deliver_vnet (tap_fd, full_l3, full_len);
