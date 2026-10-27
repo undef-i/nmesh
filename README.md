@@ -26,12 +26,18 @@ ifname = nmesh
 # Optional: listen port (default: 50000).
 port = 50000
 
-# Optional: overlay MTU (default: 1280, range: 128..65511).
-mtu = 1280
+# Optional: overlay MTU (default: 65511, range: 128..65511).
+mtu = 65511
 
 # Optional: physical MTU upper bound (default: 0, meaning auto-detect).
 # When set, caps the path MTU to this value regardless of interface scanning.
 default_phys_mtu = 1280
+
+# Optional: path MTU probing (default: disable).
+mtu_probe = enable
+
+# Optional: transport preference, comma-separated (udp, tcp).
+transport = udp,tcp
 
 # Optional: P2P behavior (default: enable).
 p2p = enable
@@ -50,22 +56,25 @@ peer = 203.0.113.1:50000
 # bogon = 10.0.0.0/8
 # bogon = fc00::/7
 
+# Optional: authentication mode (default: psk).
+# auth = ibs
+# ibs_mpk = <master public key>
+# ibs_sk = <node secret key>
+
 ```
 
 ## Run
 
 ```bash
 sudo ./build/release/nmesh -c nmesh.conf
+sudo ./build/release/nmesh status
 
 ```
-
 
 ## Planned Features
 
 - [ ] Data Channel Offload support
 - [ ] UDP path forward secrecy via ephemeral ECDH rekey
-- [ ] PMTU probing
-- [ ] IBS authentication
 
 ## Acknowledgements
 

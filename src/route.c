@@ -148,6 +148,12 @@ re_mtu_sync (Rt *t, Re *re)
   uint16_t upper = re_mtu_ub (t, re);
   if (!t->mtu_probe && re->r2d == 0)
     {
+      if (re->mtu_st == MTU_ST_B && re->mtu_lkg == RT_MTU_MIN
+          && re->mtu_ukb >= re_mtu_ub (t, re))
+        {
+          re->mtu_lkg = 0;
+          re->mtu_ukb = 0;
+        }
       uint16_t fixed = re_mtu_fix (t, re);
       re->mtu_lkg = fixed;
       re->mtu_ukb = fixed;
@@ -1605,7 +1611,7 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.adv_loss = 0;
       ne.seq = 1;
       ne.mtu_lkg = RT_MTU_MIN;
-      ne.mtu_ukb = (!t->mtu_probe) ? RT_MTU_MIN : rt_mtu_ub (t);
+      ne.mtu_ukb = rt_mtu_ub (t);
       ne.mtu_st = MTU_ST_B;
       ne.prb_i_ts = 0;
       re_mtu_sync (t, &ne);

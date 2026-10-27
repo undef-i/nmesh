@@ -629,15 +629,6 @@ be64_rd (const uint8_t *s)
 }
 
 static bool
-ibs_ts_fresh (const uint8_t *pl)
-{
-  uint64_t pkt_ts = be64_rd (pl);
-  uint64_t now = wall_ts ();
-  uint64_t delta = (now >= pkt_ts) ? (now - pkt_ts) : (pkt_ts - now);
-  return delta <= IBS_TS_SKEW_MAX;
-}
-
-static bool
 ibs_gate_ok (Cry *cry_ctx, const Rt *rt, const uint8_t src_ip[16],
              uint16_t src_port, bool is_ping, const uint8_t *pl,
              UdpDecRes *res)
@@ -731,8 +722,7 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
               const uint8_t *pl = raw + PKT_CH_SZ;
               const uint8_t *peer_lla = pl + 16;
               const uint8_t *sig = raw + PKT_CH_SZ + pl_sz;
-              if (ibs_ts_fresh (pl)
-                  && ibs_gate_ok (cry_ctx, rt, pkt_arr[i].src_ip,
+              if (ibs_gate_ok (cry_ctx, rt, pkt_arr[i].src_ip,
                                   pkt_arr[i].src_port,
                                   raw_hdr_type == PT_IBS_PING, pl,
                                   &res_arr[i])
@@ -1339,17 +1329,7 @@ status_row_fill (RRow *row, Rt *rt, const Cfg *cfg, const uint8_t dst[16],
       bool srch = false;
       rt_pth_lims (rt, p, &lkg, &ukb, &srch);
       if (srch)
-        {
-          if (p->prb_mtu > 0)
-            snprintf (row->mtu, sizeof (row->mtu), "%u (%u-%u, %u)", cur,
-                      lkg, ukb, p->prb_mtu);
-          else
-            snprintf (row->mtu, sizeof (row->mtu), "%u (%u-%u)", cur, lkg,
-                      ukb);
-        }
-      else if (p->mtu_st == MTU_ST_B)
-        snprintf (row->mtu, sizeof (row->mtu), "%u (LKG:%u, UKB:%u, base)",
-                  cur, lkg, ukb);
+        snprintf (row->mtu, sizeof (row->mtu), "[%u, %u]", lkg, ukb);
       else
         snprintf (row->mtu, sizeof (row->mtu), "%u", cur);
     }
@@ -4518,6 +4498,8 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       Re *re = &rt->re_arr[i];
       if (re->r2d != 0)
         continue;
+      if (memcmp (re->lla, cfg->addr, 16) == 0)
+        continue;
       if (!cfg->p2p && !re->is_static)
         continue;
 
@@ -4800,7 +4782,6 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
           char ep[64];
           char st[10];
           char mtu[40];
-          char prb[24];
           char rtt[16];
           char loss[16];
         } LRow;
@@ -4814,7 +4795,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             free (um_arr);
             return len;
           }
-        int w_peer = 4, w_ep = 2, w_lst = 5, w_lmtu = 3, w_prb = 5,
+        int w_peer = 4, w_ep = 2, w_lst = 5, w_lmtu = 3,
             w_lrtt = 3, w_lloss = 4;
         for (int k = 0; k < l_cnt; k++)
           {
@@ -4825,15 +4806,12 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             strcpy (lr->st, re->state == RT_ACT   ? "active"
                             : re->state == RT_PND ? "pending"
                                                   : "via");
-            snprintf (lr->mtu, sizeof (lr->mtu), "%u",
-                      rt_dir_mtu_get (rt, re));
-            if (re->mtu_st == MTU_ST_F)
-              strcpy (lr->prb, "fixed");
-            else if (re->mtu_st == MTU_ST_B)
-              strcpy (lr->prb, "base");
-            else
-              snprintf (lr->prb, sizeof (lr->prb), "srch [%u, %u]",
+            if (re->mtu_ukb > re->mtu_lkg)
+              snprintf (lr->mtu, sizeof (lr->mtu), "[%u, %u]",
                         re->mtu_lkg, re->mtu_ukb);
+            else
+              snprintf (lr->mtu, sizeof (lr->mtu), "%u",
+                        rt_dir_mtu_get (rt, re));
             if (re->srtt > 0)
               snprintf (lr->rtt, sizeof (lr->rtt), "%ums", re->srtt >> 3);
             else
@@ -4851,21 +4829,19 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               w_lst = (int)strlen (lr->st);
             if ((int)strlen (lr->mtu) > w_lmtu)
               w_lmtu = (int)strlen (lr->mtu);
-            if ((int)strlen (lr->prb) > w_prb)
-              w_prb = (int)strlen (lr->prb);
             if ((int)strlen (lr->rtt) > w_lrtt)
               w_lrtt = (int)strlen (lr->rtt);
             if ((int)strlen (lr->loss) > w_lloss)
               w_lloss = (int)strlen (lr->loss);
           }
-        STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer,
-                    "peer", w_ep, "ep", w_lst, "state", w_lmtu, "mtu", w_prb,
-                    "probe", w_lrtt, "rtt", w_lloss, "loss");
+        STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer, "peer",
+                    w_ep, "ep", w_lst, "state", w_lmtu, "mtu", w_lrtt,
+                    "rtt", w_lloss, "loss");
         for (int k = 0; k < l_cnt; k++)
-          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer,
+          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer,
                       lrows[k].peer, w_ep, lrows[k].ep, w_lst, lrows[k].st,
-                      w_lmtu, lrows[k].mtu, w_prb, lrows[k].prb, w_lrtt,
-                      lrows[k].rtt, w_lloss, lrows[k].loss);
+                      w_lmtu, lrows[k].mtu, w_lrtt, lrows[k].rtt, w_lloss,
+                      lrows[k].loss);
         free (lrows);
       }
     free (lre);

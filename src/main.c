@@ -773,12 +773,14 @@ main (int argc, char **argv)
 {
   int rc = 1;
   const char *cfg_path = "nmesh.conf";
+  bool cfg_given = false;
   CmdMode cmd = CMD_RUN;
   for (int i = 1; i < argc; i++)
     {
       if (strcmp (argv[i], "-c") == 0 && i + 1 < argc)
         {
           cfg_path = argv[++i];
+          cfg_given = true;
         }
       else if (strcmp (argv[i], "s") == 0 || strcmp (argv[i], "status") == 0)
         {
@@ -808,6 +810,14 @@ main (int argc, char **argv)
     {
       fprintf (stderr, "main: invalid config path: %s\n", cfg_path);
       return 1;
+    }
+  if (!cfg_given && access (cfg_abs, F_OK) != 0
+      && access ("/etc/nmesh/nmesh.conf", F_OK) == 0)
+    {
+      free (cfg_abs);
+      cfg_abs = str_dup ("/etc/nmesh/nmesh.conf");
+      if (!cfg_abs)
+        return 1;
     }
   if (cmd == CMD_STOP)
     {
