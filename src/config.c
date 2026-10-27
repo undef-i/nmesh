@@ -24,12 +24,6 @@ cfg_init (Cfg *cfg)
   if (!cfg)
     return;
   memset (cfg, 0, sizeof (*cfg));
-  cfg->port = 50000;
-  cfg->mtu = (uint16_t) (FRAG_DATA_MAX - VNET_HL - ETH_HLEN);
-  cfg->mtu_probe = false;
-  cfg->p2p = true;
-  cfg->tap_mode = TAP_MODE_AUTO;
-  strcpy (cfg->ifname, "nmesh");
 }
 
 void
@@ -319,18 +313,14 @@ str_to_p (const char *s, P *p)
 static int
 psk_prs (const char *s, uint8_t out[32])
 {
-  if (strlen (s) != 64)
-    return -1;
-  return hex_dec (s, out, 32);
-}
-
-static int
-psk_pass_prs (const char *s, uint8_t out[32])
-{
+  static const uint8_t salt[crypto_pwhash_SALTBYTES] = "nmesh psk derive";
   size_t s_len = strlen (s);
   if (s_len == 0)
     return -1;
-  return crypto_generichash (out, 32, (const uint8_t *)s, s_len, NULL, 0);
+  return crypto_pwhash (out, 32, s, (unsigned long long)s_len, salt,
+                        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                        crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                        crypto_pwhash_ALG_DEFAULT);
 }
 
 static int
@@ -349,20 +339,6 @@ bool_prs (const char *s, bool *out)
       return 0;
     }
   return -1;
-}
-
-static int
-tp_defaults_set (Cfg *cfg)
-{
-  if (!cfg)
-    return -1;
-  cfg->tp_mask = TP_MASK_UDP | TP_MASK_TCP;
-  cfg->tp_pref_len = 2;
-  if (cfg_tp_rsv (cfg, cfg->tp_pref_len) != 0)
-    return -1;
-  cfg->tp_pref[0] = TP_PROTO_UDP;
-  cfg->tp_pref[1] = TP_PROTO_TCP;
-  return 0;
 }
 
 static int
@@ -468,21 +444,61 @@ cfg_u32_prs (const char *v, unsigned long *out)
   return 0;
 }
 
-static const char *const cfg_scalar_keys[] = {
-  "address", "port", "mtu", "p2p", "tap_mode", "mtu_probe",
-  "default_phys_mtu", "transport", "ifname", "psk", "psk_passphrase",
-  "auth", "ibs_mpk", "ibs_sk",
+static const char *const common_keys[] = {
+  "address", "port", "mtu", "default_phys_mtu", "mtu_probe",
+  "transport", "ifname", "p2p", "tap_mode", "auth",
 };
+
+static const char *const psk_keys[] = { "key" };
+
+static const char *const ibs_keys[] = { "mpk", "sk" };
+
+enum
+{
+  SEC_NONE = 0,
+  SEC_COMMON,
+  SEC_PSK,
+  SEC_IBS
+};
+
+static int
+key_idx (const char *const *keys, size_t n, const char *k)
+{
+  for (size_t i = 0; i < n; i++)
+    {
+      if (strcmp (k, keys[i]) == 0)
+        return (int)i;
+    }
+  return -1;
+}
+
+static int
+key_home (const char *k, const char **sec_name)
+{
+  if (key_idx (common_keys, sizeof (common_keys) / sizeof (common_keys[0]),
+               k)
+      >= 0)
+    {
+      *sec_name = "common";
+      return SEC_COMMON;
+    }
+  if (key_idx (psk_keys, sizeof (psk_keys) / sizeof (psk_keys[0]), k) >= 0)
+    {
+      *sec_name = "psk";
+      return SEC_PSK;
+    }
+  if (key_idx (ibs_keys, sizeof (ibs_keys) / sizeof (ibs_keys[0]), k) >= 0)
+    {
+      *sec_name = "ibs";
+      return SEC_IBS;
+    }
+  return SEC_NONE;
+}
 
 int
 cfg_load (const char *path, Cfg *cfg)
 {
   cfg_init (cfg);
-  if (tp_defaults_set (cfg) != 0)
-    {
-      cfg_free (cfg);
-      return -1;
-    }
   FILE *fp = fopen (path, "r");
   if (!fp)
     {
@@ -492,51 +508,169 @@ cfg_load (const char *path, Cfg *cfg)
   char *line = NULL;
   size_t line_cap = 0;
   int line_no = 0;
-  unsigned seen = 0;
+  int sec = SEC_NONE;
+  unsigned sec_seen = 0;
+  unsigned seen_common = 0;
+  unsigned seen_psk = 0;
+  unsigned seen_ibs = 0;
+  int rc = -1;
   while (getline (&line, &line_cap, fp) >= 0)
     {
       line_no++;
       char *l_trm = str_trm (line);
       if (!l_trm[0] || l_trm[0] == '#')
         continue;
+      if (l_trm[0] == '[')
+        {
+          size_t ln = strlen (l_trm);
+          if (ln < 3 || l_trm[ln - 1] != ']')
+            {
+              cfg_ln_err (path, line_no, "invalid section header: %s",
+                          l_trm);
+              goto out;
+            }
+          l_trm[ln - 1] = '\0';
+          char *nm = str_trm (l_trm + 1);
+          int ns;
+          if (strcmp (nm, "common") == 0)
+            ns = SEC_COMMON;
+          else if (strcmp (nm, "psk") == 0)
+            ns = SEC_PSK;
+          else if (strcmp (nm, "ibs") == 0)
+            ns = SEC_IBS;
+          else
+            {
+              cfg_ln_err (path, line_no, "unknown section: %s", nm);
+              goto out;
+            }
+          if (sec_seen & (1U << ns))
+            {
+              cfg_ln_err (path, line_no, "duplicate section: %s", nm);
+              goto out;
+            }
+          sec_seen |= (1U << ns);
+          sec = ns;
+          continue;
+        }
+      if (sec == SEC_NONE)
+        {
+          cfg_ln_err (path, line_no, "key outside any section");
+          goto out;
+        }
       char *sep = strchr (l_trm, '=');
       if (!sep)
         {
           cfg_ln_err (path, line_no, "expected key = value");
-          cfg_free (cfg);
-          free (line);
-          fclose (fp);
-          return -1;
+          goto out;
         }
       *sep = '\0';
       char *k = str_trm (l_trm);
       char *v = str_trm (sep + 1);
-      for (size_t si = 0;
-           si < sizeof (cfg_scalar_keys) / sizeof (cfg_scalar_keys[0]);
-           si++)
+      if (sec == SEC_COMMON && strcmp (k, "peer") == 0)
         {
-          if (strcmp (k, cfg_scalar_keys[si]) != 0)
-            continue;
-          if (seen & (1U << si))
+          P p;
+          if (str_to_p (v, &p) != 0)
             {
-              cfg_ln_err (path, line_no, "duplicate key: %s", k);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              cfg_ln_err (path, line_no, "invalid peer entry: %s", v);
+              goto out;
             }
-          seen |= (1U << si);
-          break;
+          if (cfg_peer_rsv (cfg, cfg->peer_cnt + 1U) != 0)
+            {
+              cfg_ln_err (path, line_no,
+                          "out of memory while expanding peer list");
+              goto out;
+            }
+          cfg->peer_arr[cfg->peer_cnt++] = p;
+          continue;
+        }
+      if (sec == SEC_COMMON && strcmp (k, "bogon") == 0)
+        {
+          if (cfg_bogon_rsv (cfg, cfg->bogon_cnt + 1U) != 0)
+            {
+              cfg_ln_err (path, line_no,
+                          "out of memory while expanding bogon rules");
+              goto out;
+            }
+          if (!bogon_rule_parse (v, &cfg->bogon_arr[cfg->bogon_cnt]))
+            {
+              cfg_ln_err (path, line_no, "invalid bogon rule: %s", v);
+              goto out;
+            }
+          cfg->bogon_cnt++;
+          continue;
+        }
+      const char *const *keys = NULL;
+      size_t nkeys = 0;
+      unsigned *seen = NULL;
+      if (sec == SEC_COMMON)
+        {
+          keys = common_keys;
+          nkeys = sizeof (common_keys) / sizeof (common_keys[0]);
+          seen = &seen_common;
+        }
+      else if (sec == SEC_PSK)
+        {
+          keys = psk_keys;
+          nkeys = sizeof (psk_keys) / sizeof (psk_keys[0]);
+          seen = &seen_psk;
+        }
+      else
+        {
+          keys = ibs_keys;
+          nkeys = sizeof (ibs_keys) / sizeof (ibs_keys[0]);
+          seen = &seen_ibs;
+        }
+      int ki = key_idx (keys, nkeys, k);
+      if (ki < 0)
+        {
+          const char *home = NULL;
+          if (key_home (k, &home) != SEC_NONE)
+            cfg_ln_err (path, line_no, "key %s belongs in section [%s]", k,
+                        home);
+          else
+            cfg_ln_err (path, line_no, "unknown key: %s", k);
+          goto out;
+        }
+      if (*seen & (1U << ki))
+        {
+          cfg_ln_err (path, line_no, "duplicate key: %s", k);
+          goto out;
+        }
+      *seen |= (1U << ki);
+      if (sec == SEC_PSK)
+        {
+          if (psk_prs (v, cfg->psk) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid key value");
+              goto out;
+            }
+          continue;
+        }
+      if (sec == SEC_IBS)
+        {
+          if (strcmp (k, "mpk") == 0)
+            {
+              if (strlen (v) != IBS_MPK_SZ * 2
+                  || hex_dec (v, cfg->ibs_mpk, IBS_MPK_SZ) != 0)
+                {
+                  cfg_ln_err (path, line_no, "invalid mpk value");
+                  goto out;
+                }
+            }
+          else if (strlen (v) != IBS_SK_SZ * 2
+                   || hex_dec (v, cfg->ibs_sk, IBS_SK_SZ) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid sk value");
+              goto out;
+            }
+          continue;
         }
       if (strcmp (k, "address") == 0)
         {
           if (str_to_v6 (v, cfg->addr) != 0)
             {
               cfg_ln_err (path, line_no, "invalid address: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              goto out;
             }
         }
       else if (strcmp (k, "port") == 0)
@@ -545,10 +679,7 @@ cfg_load (const char *path, Cfg *cfg)
           if (cfg_u32_prs (v, &p_v) != 0 || p_v < 1 || p_v > 65535)
             {
               cfg_ln_err (path, line_no, "invalid port: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              goto out;
             }
           cfg->port = (uint16_t)p_v;
           cfg->l_exp = true;
@@ -560,12 +691,44 @@ cfg_load (const char *path, Cfg *cfg)
               || m_v > CFG_MTU_MAX)
             {
               cfg_ln_err (path, line_no, "invalid mtu: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              goto out;
             }
           cfg->mtu = (uint16_t)m_v;
+        }
+      else if (strcmp (k, "default_phys_mtu") == 0)
+        {
+          unsigned long d_v = 0;
+          if (cfg_u32_prs (v, &d_v) != 0 || d_v < CFG_MTU_MIN || d_v > 65535)
+            {
+              cfg_ln_err (path, line_no, "invalid default_phys_mtu: %s", v);
+              goto out;
+            }
+          cfg->default_phys_mtu = (uint16_t)d_v;
+        }
+      else if (strcmp (k, "mtu_probe") == 0)
+        {
+          if (bool_prs (v, &cfg->mtu_probe) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid mtu_probe value: %s", v);
+              goto out;
+            }
+        }
+      else if (strcmp (k, "transport") == 0)
+        {
+          if (tp_cfg_prs (v, cfg) != 0)
+            {
+              cfg_ln_err (path, line_no, "invalid transport: %s", v);
+              goto out;
+            }
+        }
+      else if (strcmp (k, "ifname") == 0)
+        {
+          if (!v[0] || strlen (v) >= sizeof (cfg->ifname))
+            {
+              cfg_ln_err (path, line_no, "invalid ifname: %s", v);
+              goto out;
+            }
+          strcpy (cfg->ifname, v);
         }
       else if (strcmp (k, "p2p") == 0)
         {
@@ -573,10 +736,7 @@ cfg_load (const char *path, Cfg *cfg)
           if (bool_prs (v, &en) != 0)
             {
               cfg_ln_err (path, line_no, "invalid p2p value: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              goto out;
             }
           cfg->p2p = en;
         }
@@ -591,102 +751,7 @@ cfg_load (const char *path, Cfg *cfg)
           else
             {
               cfg_ln_err (path, line_no, "invalid tap_mode: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-        }
-      else if (strcmp (k, "mtu_probe") == 0)
-        {
-          if (bool_prs (v, &cfg->mtu_probe) != 0)
-            {
-              cfg_ln_err (path, line_no, "invalid mtu_probe value: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-        }
-      else if (strcmp (k, "default_phys_mtu") == 0)
-        {
-          unsigned long d_v = 0;
-          if (cfg_u32_prs (v, &d_v) != 0 || d_v < CFG_MTU_MIN
-              || d_v > CFG_MTU_MAX)
-            {
-              cfg_ln_err (path, line_no, "invalid default_phys_mtu: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-          cfg->default_phys_mtu = (uint16_t)d_v;
-        }
-      else if (strcmp (k, "transport") == 0)
-        {
-          if (tp_cfg_prs (v, cfg) != 0)
-            {
-              cfg_ln_err (path, line_no, "invalid transport: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-        }
-      else if (strcmp (k, "bogon") == 0)
-        {
-          if (cfg_bogon_rsv (cfg, cfg->bogon_cnt + 1U) != 0)
-            {
-              cfg_ln_err (path, line_no,
-                          "out of memory while expanding bogon rules");
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-          if (!bogon_rule_parse (v, &cfg->bogon_arr[cfg->bogon_cnt]))
-            {
-              cfg_ln_err (path, line_no, "invalid bogon rule: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-          cfg->bogon_cnt++;
-        }
-      else if (strcmp (k, "ifname") == 0)
-        {
-          if (!v[0] || strlen (v) >= sizeof (cfg->ifname))
-            {
-              cfg_ln_err (path, line_no, "invalid ifname: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-          strcpy (cfg->ifname, v);
-        }
-      else if (strcmp (k, "psk") == 0)
-        {
-          if (psk_prs (v, cfg->psk) != 0)
-            {
-              cfg_ln_err (path, line_no,
-                          "invalid psk value (want 64 hex characters)");
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-        }
-      else if (strcmp (k, "psk_passphrase") == 0)
-        {
-          if (psk_pass_prs (v, cfg->psk) != 0)
-            {
-              cfg_ln_err (path, line_no, "invalid psk_passphrase value");
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              goto out;
             }
         }
       else if (strcmp (k, "auth") == 0)
@@ -698,98 +763,64 @@ cfg_load (const char *path, Cfg *cfg)
           else
             {
               cfg_ln_err (path, line_no, "invalid auth mode: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
+              goto out;
             }
-        }
-      else if (strcmp (k, "ibs_mpk") == 0)
-        {
-          if (strlen (v) != IBS_MPK_SZ * 2
-              || hex_dec (v, cfg->ibs_mpk, IBS_MPK_SZ) != 0)
-            {
-              cfg_ln_err (path, line_no, "invalid ibs_mpk value");
-              cfg_free (cfg); free (line); fclose (fp); return -1;
-            }
-        }
-      else if (strcmp (k, "ibs_sk") == 0)
-        {
-          if (strlen (v) != IBS_SK_SZ * 2
-              || hex_dec (v, cfg->ibs_sk, IBS_SK_SZ) != 0)
-            {
-              cfg_ln_err (path, line_no, "invalid ibs_sk value");
-              cfg_free (cfg); free (line); fclose (fp); return -1;
-            }
-        }
-      else if (strcmp (k, "peer") == 0)
-        {
-          P p;
-          if (str_to_p (v, &p) != 0)
-            {
-              cfg_ln_err (path, line_no, "invalid peer entry: %s", v);
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-          if (cfg_peer_rsv (cfg, cfg->peer_cnt + 1U) != 0)
-            {
-              cfg_ln_err (path, line_no,
-                          "out of memory while expanding peer list");
-              cfg_free (cfg);
-              free (line);
-              fclose (fp);
-              return -1;
-            }
-          cfg->peer_arr[cfg->peer_cnt++] = p;
-        }
-      else
-        {
-          cfg_ln_err (path, line_no, "unknown key: %s", k);
-          cfg_free (cfg);
-          free (line);
-          fclose (fp);
-          return -1;
         }
     }
-  free (line);
-  fclose (fp);
-  uint8_t z16[16] = { 0 };
-  if (memcmp (cfg->addr, z16, 16) == 0)
+  if (!(sec_seen & (1U << SEC_COMMON)))
     {
-      fprintf (stderr, "config: %s: address is required\n", path);
-      cfg_free (cfg);
-      return -1;
+      fprintf (stderr, "config: %s: missing section: [common]\n", path);
+      goto out;
+    }
+  for (size_t i = 0; i < sizeof (common_keys) / sizeof (common_keys[0]); i++)
+    {
+      if (!(seen_common & (1U << i)))
+        {
+          fprintf (stderr, "config: %s: missing key: %s\n", path,
+                   common_keys[i]);
+          goto out;
+        }
+    }
+  if ((sec_seen & (1U << SEC_PSK)) && seen_psk == 0)
+    {
+      fprintf (stderr, "config: %s: missing key: key\n", path);
+      goto out;
+    }
+  if (sec_seen & (1U << SEC_IBS))
+    {
+      for (size_t i = 0; i < sizeof (ibs_keys) / sizeof (ibs_keys[0]); i++)
+        {
+          if (!(seen_ibs & (1U << i)))
+            {
+              fprintf (stderr, "config: %s: missing key: %s\n", path,
+                       ibs_keys[i]);
+              goto out;
+            }
+        }
+    }
+  if (cfg->auth_ibs && !(sec_seen & (1U << SEC_IBS)))
+    {
+      fprintf (stderr, "config: %s: auth = ibs requires section [ibs]\n",
+               path);
+      goto out;
+    }
+  if (!cfg->auth_ibs && !(sec_seen & (1U << SEC_PSK)))
+    {
+      fprintf (stderr, "config: %s: auth = psk requires section [psk]\n",
+               path);
+      goto out;
     }
   if (cfg->addr[0] != 0xfe || (cfg->addr[1] & 0xc0) != 0x80)
     {
       fprintf (stderr,
-               "config: %s: address must be link-local (fe80::/10)\n",
-               path);
-      cfg_free (cfg);
-      return -1;
+               "config: %s: address must be link-local (fe80::/10)\n", path);
+      goto out;
     }
-  uint8_t z32[32] = { 0 };
-  if (cfg->auth_ibs)
-    {
-      uint8_t z_mpk[IBS_MPK_SZ] = { 0 };
-      uint8_t z_sk[IBS_SK_SZ] = { 0 };
-      if (memcmp (cfg->ibs_mpk, z_mpk, IBS_MPK_SZ) == 0
-          || memcmp (cfg->ibs_sk, z_sk, IBS_SK_SZ) == 0)
-        {
-          fprintf (stderr,
-                   "config: %s: auth = ibs requires ibs_mpk and ibs_sk\n",
-                   path);
-          cfg_free (cfg);
-          return -1;
-        }
-    }
-  else if (memcmp (cfg->psk, z32, 32) == 0)
-    {
-      fprintf (stderr, "config: %s: psk is required\n", path);
-      cfg_free (cfg);
-      return -1;
-    }
-  return 0;
+  rc = 0;
+out:
+  free (line);
+  fclose (fp);
+  if (rc != 0)
+    cfg_free (cfg);
+  return rc;
 }

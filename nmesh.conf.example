@@ -1,0 +1,63 @@
+[common]
+
+address = fe80::1
+
+auth = ibs
+
+ifname = nm0
+
+port = 49312
+
+mtu = 1500
+
+# Base PLPMTU. Minimum 128.
+default_phys_mtu = 128
+
+# Path MTU probing on or off.
+mtu_probe = enable
+
+# Enabled transports in order of preference.
+transport = udp,tcp
+
+# enable accepts direct connections from any node learned
+# from the mesh. disable accepts them from static peers
+# only.
+p2p = enable
+
+# Frame pump between kernel and daemon. auto uses inline
+# on single core machines and pipe on the rest.
+tap_mode = auto
+
+# Nodes to connect to at startup. May be empty and may
+# repeat.
+peer = 203.0.113.10:49312
+
+# CIDR ranges refused as endpoints. May be empty and may
+# repeat.
+bogon = 169.254.0.0/16
+
+[psk]
+
+# Used when auth is psk.
+key = correct horse battery staple
+
+[ibs]
+
+# Used when auth is ibs.
+#
+# The network administrator generates the master file
+# on one machine.
+#
+#   nmesh keygen master > master.txt
+#
+# The master file holds MSK and MPK. The administrator
+# extracts each node's secret key from it with the
+# address that node holds in common.
+#
+#   nmesh keygen extract master.txt fe80::2
+
+# The network public key.
+mpk = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+
+# This node's secret key.
+sk = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f

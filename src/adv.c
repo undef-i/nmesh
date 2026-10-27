@@ -1021,6 +1021,11 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
     ent_strip_dir (out);
   else if (!dir_hint_ok)
     ent_strip_dir (out);
+  if (!is_z && !(out->flags & ADV_F_SEL_DIR))
+    {
+      memset (out->ep_ip, 0, 16);
+      out->ep_port = 0;
+    }
   return true;
 }
 

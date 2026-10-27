@@ -1653,6 +1653,11 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   Adv adv;
   adv_init (&adv);
   rt_mtu_probe_set (&rt, cfg.mtu_probe);
+  {
+    uint16_t hw_mtu = udp_host_mtu_max ();
+    rt_pmtu_ub_set (&rt, hw_mtu);
+    rt_pmtu_base_set (&rt, cfg.default_phys_mtu);
+  }
   memcpy (rt.our_lla, cfg.addr, 16);
 
   int tap_fd = -1;
@@ -1725,12 +1730,6 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   udp_emsg_cb_set (on_udp_emsg);
   udp_unr_cb_set (on_udp_unr);
   printf ("main: udp bound to port %u\n", act_port);
-  {
-    uint16_t hw_mtu = udp_host_mtu_max ();
-    if (cfg.default_phys_mtu > 0 && cfg.default_phys_mtu < hw_mtu)
-      hw_mtu = cfg.default_phys_mtu;
-    rt_pmtu_ub_set (&rt, hw_mtu);
-  }
   rt_loc_add (&rt, cfg.addr, act_port, cfg.tp_mask, sys_ts ());
   if (tp_rt_init (&tp_rt, act_port) != 0)
     {

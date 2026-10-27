@@ -15,7 +15,6 @@
 #define RT_MTU_MAX 65535U
 #define RT_PRB_BST 5U
 #define RT_PRB_MAX 3U
-#define RT_MTU_BASE 1200U
 #define RT_HL_INTV 10000ULL
 #define RT_GHS_HL 30ULL
 #define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
@@ -200,6 +199,7 @@ typedef struct Rt
   uint8_t our_lla[16];
   uint32_t prb_nxt_id;
   uint16_t mtu_ub;
+  uint16_t mtu_base;
   bool mtu_probe;
   bool map_dirty;
   bool adv_dirty;
@@ -287,6 +287,7 @@ void rt_pmtu_ptb_ep (Rt *t, const uint8_t ip[16], uint16_t port, uint16_t pmtu,
                      uint64_t sys_ts);
 void rt_mtu_tk (Rt *t, uint64_t sys_ts);
 void rt_pmtu_ub_set (Rt *t, uint16_t mtu);
+void rt_pmtu_base_set (Rt *t, uint16_t mtu);
 void rt_peer_rev_mtu_set (Rt *t, const uint8_t peer_lla[16],
                           uint16_t peer_rev_mtu);
 void rt_emsg_hnd (Rt *t, const uint8_t ip[16], uint16_t port,

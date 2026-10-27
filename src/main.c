@@ -5,6 +5,7 @@
 #include "frag.h"
 #include "pkt.h"
 #include "gro.h"
+#include "ibs.h"
 #include "loop.h"
 #include "mss.h"
 #include "packet.h"
@@ -23,6 +24,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sodium.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -768,6 +770,133 @@ daemon_ready_hnd (void *arg)
   start_ready_ok ();
 }
 
+static void
+hex_enc (const uint8_t *in, size_t n, char *out)
+{
+  static const char hexd[] = "0123456789abcdef";
+  for (size_t i = 0; i < n; i++)
+    {
+      out[i * 2] = hexd[in[i] >> 4];
+      out[i * 2 + 1] = hexd[in[i] & 0xf];
+    }
+  out[n * 2] = '\0';
+}
+
+static int
+hex_char_val (char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+static int
+hex_dec (const char *s, uint8_t *out, size_t n)
+{
+  for (size_t i = 0; i < n; i++)
+    {
+      int hi = hex_char_val (s[i * 2]);
+      int lo = hex_char_val (s[i * 2 + 1]);
+      if (hi < 0 || lo < 0)
+        return -1;
+      out[i] = (uint8_t)((hi << 4) | lo);
+    }
+  return 0;
+}
+
+static int
+keygen_master (void)
+{
+  uint8_t msk[IBS_MSK_SZ];
+  uint8_t mpk[IBS_MPK_SZ];
+  if (!ibs_setup (msk, mpk))
+    {
+      fprintf (stderr, "main: keygen master failed\n");
+      return 1;
+    }
+  char hex[IBS_MPK_SZ * 2 + 1];
+  hex_enc (msk, IBS_MSK_SZ, hex);
+  printf ("MSK %s\n", hex);
+  hex_enc (mpk, IBS_MPK_SZ, hex);
+  printf ("MPK %s\n", hex);
+  return 0;
+}
+
+static int
+keygen_extract (const char *path, const char *addr_str)
+{
+  uint8_t id[16];
+  if (str_to_v6 (addr_str, id) != 0)
+    {
+      fprintf (stderr, "main: invalid address: %s\n", addr_str);
+      return 1;
+    }
+  FILE *fp = fopen (path, "r");
+  if (!fp)
+    {
+      fprintf (stderr, "main: cannot open master file: %s\n", path);
+      return 1;
+    }
+  uint8_t msk[IBS_MSK_SZ];
+  bool found = false;
+  char *line = NULL;
+  size_t cap = 0;
+  while (getline (&line, &cap, fp) >= 0)
+    {
+      if (strncmp (line, "MSK ", 4) != 0)
+        continue;
+      char *v = line + 4;
+      while (*v && isspace ((unsigned char)*v))
+        v++;
+      size_t ln = strlen (v);
+      while (ln > 0 && isspace ((unsigned char)v[ln - 1]))
+        v[--ln] = '\0';
+      if (ln == IBS_MSK_SZ * 2 && hex_dec (v, msk, IBS_MSK_SZ) == 0)
+        found = true;
+      break;
+    }
+  free (line);
+  fclose (fp);
+  if (!found)
+    {
+      fprintf (stderr, "main: no MSK line in master file: %s\n", path);
+      return 1;
+    }
+  uint8_t sk[IBS_SK_SZ];
+  if (!ibs_extract (msk, id, 16, sk))
+    {
+      fprintf (stderr, "main: keygen extract failed\n");
+      return 1;
+    }
+  char hex[IBS_SK_SZ * 2 + 1];
+  hex_enc (sk, IBS_SK_SZ, hex);
+  printf ("SK %s\n", hex);
+  return 0;
+}
+
+static int
+keygen_run (int argc, char **argv)
+{
+  if (sodium_init () < 0)
+    {
+      fprintf (stderr, "main: sodium init failed\n");
+      return 1;
+    }
+  if (argc == 3 && strcmp (argv[2], "master") == 0)
+    return keygen_master ();
+  if (argc == 5 && strcmp (argv[2], "extract") == 0)
+    return keygen_extract (argv[3], argv[4]);
+  fprintf (stderr,
+           "main: usage: %s keygen master, or %s keygen extract "
+           "<master file> <address>\n",
+           argv[0], argv[0]);
+  return 1;
+}
+
 int
 main (int argc, char **argv)
 {
@@ -775,6 +904,8 @@ main (int argc, char **argv)
   const char *cfg_path = "nmesh.conf";
   bool cfg_given = false;
   CmdMode cmd = CMD_RUN;
+  if (argc >= 2 && strcmp (argv[1], "keygen") == 0)
+    return keygen_run (argc, argv);
   for (int i = 1; i < argc; i++)
     {
       if (strcmp (argv[i], "-c") == 0 && i + 1 < argc)
