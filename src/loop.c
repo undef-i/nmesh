@@ -4839,9 +4839,6 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
       if (r_cnt - cand_start > 1)
         qsort (rows + cand_start, (size_t)(r_cnt - cand_start),
                sizeof (*rows), status_row_cmp);
-      if (r_cnt - dst_start == 1 && sel && sel->state != RT_DED
-          && sel->r2d == 0 && sel->path_len == 0)
-        r_cnt = dst_start;
       for (int k = dst_start; k < r_cnt; k++)
         {
           if ((int)strlen (rows[k].dst) > m_dst)
