@@ -54,7 +54,6 @@ typedef struct
   uint16_t ep_port;
   uint64_t ver;
   uint64_t sid;
-  uint32_t seq;
   int32_t adv_m;
   uint8_t adv_loss;
   int32_t rt_m;
@@ -111,7 +110,6 @@ typedef struct Pth
   uint16_t ep_port;
   uint64_t ver;
   uint64_t sid;
-  uint32_t seq;
   int32_t adv_m;
   uint8_t adv_loss;
   int32_t rt_m;
@@ -167,7 +165,6 @@ typedef struct RtMap
 typedef struct
 {
   uint8_t rt_id[16];
-  uint32_t seq;
   uint64_t last_ver;
   bool no_dir;
   uint64_t gc_ts;
@@ -210,7 +207,6 @@ typedef struct Rt
   uint64_t ping_tx_cnt;
   uint64_t pong_tx_cnt;
   uint64_t hp_tx_cnt;
-  uint64_t seqreq_tx_cnt;
   uint64_t ctrl_tx_b;
   uint64_t ctrl_rx_b;
   uint64_t ctrl_last_ts;
@@ -252,7 +248,6 @@ typedef struct
   };
 } RtDec;
 
-bool seq_lt (uint32_t a, uint32_t b);
 void rt_init (Rt *t);
 void rt_free (Rt *t);
 int rt_cpy (Rt *dst, const Rt *src);
@@ -301,9 +296,9 @@ void rt_pth_lims (const Rt *t, const Pth *pth, uint16_t *out_lkg,
 int rt_act_get (Rt *t, Re *buf, int buf_len, int s_off);
 void rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts);
 void rt_src_gc (Rt *t, uint64_t sys_ts);
-void rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq,
+void rt_src_upd (Rt *t, const uint8_t rt_id[16],
                  uint64_t ver, bool no_dir, uint64_t sys_ts);
-void rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
+void rt_src_upd_auth (Rt *t, const uint8_t rt_id[16],
                       uint64_t ver, bool no_dir,
                       bool can_clear_no_dir, uint64_t sys_ts);
 bool rt_src_no_dir (const Rt *t, const uint8_t rt_id[16]);

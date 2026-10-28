@@ -24,18 +24,6 @@
 #define RT_PRB_PACE 1000ULL
 #define RT_MTU_HLD 600000ULL
 #define RT_METRIC_SLOT_INV 0ULL
-static bool
-seq_gt (uint32_t a, uint32_t b)
-{
-  return ((int32_t)(a - b)) > 0;
-}
-
-bool
-seq_lt (uint32_t a, uint32_t b)
-{
-  return seq_gt (b, a);
-}
-
 static bool is_z16 (const uint8_t lla[16]);
 static const SrcEnt *src_fnd_c (const Rt *t, const uint8_t rt_id[16]);
 
@@ -685,7 +673,6 @@ rt_cpy (Rt *dst, const Rt *src)
   snap.ping_tx_cnt = src->ping_tx_cnt;
   snap.pong_tx_cnt = src->pong_tx_cnt;
   snap.hp_tx_cnt = src->hp_tx_cnt;
-  snap.seqreq_tx_cnt = src->seqreq_tx_cnt;
   snap.ctrl_tx_b = src->ctrl_tx_b;
   snap.ctrl_rx_b = src->ctrl_rx_b;
   snap.ctrl_last_ts = src->ctrl_last_ts;
@@ -731,7 +718,6 @@ re_to_pth (const Re *re, Pth *pth)
   pth->ep_port = re->ep_port;
   pth->ver = re->ver;
   pth->sid = re->sid;
-  pth->seq = re->seq;
   pth->adv_m = re->adv_m;
   pth->adv_loss = re->adv_loss;
   pth->rt_m = re->rt_m;
@@ -1307,8 +1293,6 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
       if (cur_re->ep_port != re->ep_port)
         continue;
       cur_re->tp_mask |= re->tp_mask;
-      if (seq_gt (re->seq, cur_re->seq))
-        cur_re->seq = re->seq;
       cur_re->adv_m = re->adv_m;
       cur_re->adv_loss = re->adv_loss;
       if (is_rel)
@@ -1430,7 +1414,6 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
   out->ep_port = selected->ep_port;
   out->ver = selected->ver;
   out->sid = selected->sid;
-  out->seq = selected->seq;
   out->adv_m = selected->adv_m;
   out->adv_loss = selected->adv_loss;
   out->rt_m = selected->rt_m;
@@ -1643,7 +1626,6 @@ rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16], uint16_t port,
       ne.rt_m = RT_F_INF;
       ne.adv_m = ne.rt_m;
       ne.adv_loss = 0;
-      ne.seq = 1;
       ne.mtu_lkg = re_mtu_base (t, &ne);
       ne.mtu_ukb = rt_mtu_ub (t);
       ne.mtu_st = MTU_ST_B;
@@ -2579,7 +2561,7 @@ rt_peer_ep_fnd (const Rt *t, const uint8_t peer_lla[16], uint8_t out_ip[16],
 }
 
 void
-rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
+rt_src_upd_auth (Rt *t, const uint8_t rt_id[16],
                  uint64_t ver, bool no_dir,
                  bool can_clear_no_dir, uint64_t sys_ts)
 {
@@ -2591,7 +2573,6 @@ rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
       se = &t->sources[t->src_cnt++];
       memset (se, 0, sizeof (*se));
       memcpy (se->rt_id, rt_id, 16);
-      se->seq = seq;
       se->last_ver = ver;
       se->no_dir = no_dir;
       se->gc_ts = sys_ts;
@@ -2599,10 +2580,6 @@ rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
       return;
     }
   bool old_no_dir = se->no_dir;
-  if (ver > 0 && se->last_ver > 0 && ver < se->last_ver)
-    se->seq = seq;
-  else if (seq_gt (seq, se->seq))
-    se->seq = seq;
   if (ver > 0)
     se->last_ver = ver;
   se->no_dir = no_dir || (old_no_dir && !can_clear_no_dir);
@@ -2612,10 +2589,10 @@ rt_src_upd_auth (Rt *t, const uint8_t rt_id[16], uint32_t seq,
 }
 
 void
-rt_src_upd (Rt *t, const uint8_t rt_id[16], uint32_t seq,
+rt_src_upd (Rt *t, const uint8_t rt_id[16],
             uint64_t ver, bool no_dir, uint64_t sys_ts)
 {
-  rt_src_upd_auth (t, rt_id, seq, ver, no_dir, false, sys_ts);
+  rt_src_upd_auth (t, rt_id, ver, no_dir, false, sys_ts);
 }
 
 void
@@ -2679,7 +2656,6 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
       if (memcmp (re->lla, rt_id, 16) != 0)
         continue;
       re->sid = peer_sid;
-      re->seq = 1;
       re->adv_m = RT_F_INF;
       re->rt_m = (re->r2d == 0) ? RT_F_INF : re->rt_m;
       if (re->r2d == 0)
@@ -2690,7 +2666,6 @@ rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
   SrcEnt *se = src_fnd (t, rt_id);
   if (se)
     {
-      se->seq = 0;
       se->last_ver = 0;
       se->gc_ts = sys_ts;
     }

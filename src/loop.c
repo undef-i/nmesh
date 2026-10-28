@@ -1485,7 +1485,6 @@ rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint8_t tp_mask,
       s_re.sm_m = 0;
       s_re.rt_m = 0;
       s_re.adv_m = 0;
-      s_re.seq = 1;
       s_re.rto = RTO_INIT;
       memcpy (s_re.nhop_lla, our_lla, 16);
       rt_upd (rt, &s_re, now);
@@ -4208,22 +4207,8 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (arc == 0)
           {
             bool is_mod = false;
-            bool req_seq = false;
-            uint8_t seq_tgt[16] = { 0 };
             adv_import (pt + 4, pt_len - 4, src_ip, src_port, src_peer_lla,
-                    cfg->addr, rt, pool, cfg->p2p, ts, &is_mod,
-                    &req_seq, seq_tgt);
-            if (req_seq)
-              {
-                static uint8_t req_buf[UDP_PL_MAX];
-                size_t req_len = 0;
-                seq_req_bld (cry_ctx, seq_tgt, req_buf, src_peer_lla,
-                             &req_len);
-                if (ctrl_send (udp, rt, cfg, tp_src, src_ip, src_port,
-                               req_buf, req_len))
-                  ctrl_tx_mark (rt, &rt->seqreq_tx_cnt, req_len, src_ip,
-                                src_port, ts);
-              }
+                    cfg->addr, rt, pool, cfg->p2p, ts, &is_mod);
           }
         {
           static uint8_t ack_buf[UDP_PL_MAX];
@@ -4241,58 +4226,6 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (!has_src_peer)
           break;
         adv_on_ack (ctx->adv, src_peer_lla, pt, pt_len, ts);
-        break;
-      }
-    case PT_ADV_DGST:
-      {
-        if (!has_src || !has_src_peer)
-          break;
-        if (!p2p_direct_peer_ok (cfg, rt, tp_src, src_ip, src_port))
-          break;
-        static uint8_t req_ids_buf[4 * 64];
-        uint32_t req_cnt = 0;
-        if (adv_on_dgst (ctx->adv, rt, src_peer_lla, src_ip, src_port, pt,
-                         pt_len, req_ids_buf, 64, &req_cnt, ts) == 0
-            && req_cnt > 0)
-          {
-            static uint8_t rq_buf[UDP_PL_MAX];
-            size_t rq_len = 0;
-            adv_req_bld (cry_ctx, req_ids_buf, req_cnt, src_peer_lla,
-                         rq_buf, &rq_len);
-            if (rq_len > 0
-                && ctrl_send (udp, rt, cfg, tp_src, src_ip, src_port,
-                              rq_buf, rq_len))
-              ctrl_tx_mark (rt, NULL, rq_len, src_ip, src_port, ts);
-          }
-        break;
-      }
-    case PT_ADV_REQ:
-      {
-        if (!has_src_peer)
-          break;
-        adv_on_req (ctx->adv, src_peer_lla, pt, pt_len);
-        break;
-      }
-    case PT_SEQ_REQ:
-      {
-        if (!has_src)
-          break;
-        uint8_t tgt_lla[16];
-        if (on_seq_req (pt, pt_len, tgt_lla) != 0)
-          break;
-        if (memcmp (tgt_lla, cfg->addr, 16) != 0)
-          break;
-        bool is_bump = false;
-        for (uint32_t j = 0; j < rt->cnt; j++)
-          {
-            if (memcmp (rt->re_arr[j].lla, cfg->addr, 16) == 0)
-              {
-                rt->re_arr[j].seq++;
-                is_bump = true;
-              }
-          }
-        if (!is_bump)
-          break;
         break;
       }
     case PT_HP:
@@ -4590,9 +4523,8 @@ static bool
 ctrl_pkt_is (uint8_t pkt_type)
 {
   return pkt_type == PT_PING || pkt_type == PT_PONG
-         || pkt_type == PT_SEQ_REQ || pkt_type == PT_ADV_UPD
-         || pkt_type == PT_ADV_ACK || pkt_type == PT_ADV_DGST
-         || pkt_type == PT_ADV_REQ;
+         || pkt_type == PT_ADV_UPD
+         || pkt_type == PT_ADV_ACK;
 }
 
 static void
@@ -4968,12 +4900,12 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
 
   STATUS_PUT ("fib: active: %d/%u, static: %d, unmapped: %d\n", act_map_cnt,
               (uint32_t)rt->cnt, pool->cnt, um_cnt);
-  STATUS_PUT ("ctrl: adv_tx=%llu ping_tx=%llu pong_tx=%llu hp_tx=%llu seqreq_tx=%llu now_tx=%s now_rx=%s avg_tx=%s avg_rx=%s tx=%s rx=%s ckie_fail=%llu\n",
+  STATUS_PUT ("ctrl: adv_tx=%llu ping_tx=%llu pong_tx=%llu hp_tx=%llu now_tx=%s now_rx=%s avg_tx=%s avg_rx=%s tx=%s rx=%s ckie_fail=%llu\n",
               (unsigned long long)rt->adv_tx_cnt,
               (unsigned long long)rt->ping_tx_cnt,
               (unsigned long long)rt->pong_tx_cnt,
               (unsigned long long)rt->hp_tx_cnt,
-              (unsigned long long)rt->seqreq_tx_cnt, ctrl_now_tx_str,
+              ctrl_now_tx_str,
               ctrl_now_rx_str, ctrl_avg_tx_str, ctrl_avg_rx_str,
               ctrl_tx_str, ctrl_rx_str,
               (unsigned long long)rt->ckie_fail_cnt);

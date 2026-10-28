@@ -8,10 +8,7 @@
 #define PT_PONG 2
 #define PT_ADV_UPD 14
 #define PT_ADV_ACK 15
-#define PT_ADV_DGST 16
-#define PT_ADV_REQ 17
 #define PT_HP 4
-#define PT_SEQ_REQ 5
 #define PT_FRAG 7
 #define PT_MTU_PRB 8
 #define PT_MTU_ACK 9
@@ -64,7 +61,6 @@ typedef struct __attribute__ ((packed))
   uint8_t flags;
   uint8_t state;
   uint16_t mtu;
-  uint32_t seq;
   int32_t adv_m;
   uint8_t adv_loss;
   uint8_t nhop_lla[16];
@@ -102,7 +98,7 @@ frag_vnet_len_max (size_t chunk_max)
   return FRAG_DATA_MAX;
 }
 
-#define ADV_CORE_SZ 71U
+#define ADV_CORE_SZ 67U
 #define ADV_F_SEL_DIR 0x01U
 #define ADV_F_NO_DIR 0x02U
 #define ADV_F_TP_UDP 0x04U

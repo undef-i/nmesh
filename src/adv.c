@@ -1,5 +1,6 @@
 #include "adv.h"
 #include "bogon.h"
+#include "utils.h"
 #include "nbr.h"
 #include "pkt.h"
 #include "packet.h"
@@ -49,22 +50,6 @@ id_lla (uint32_t id, uint8_t lla[16])
   lla[0] = 0xfe;
   lla[1] = 0x80;
   u32_wr (lla + 12, id);
-}
-
-static uint32_t
-path_hash (const uint32_t *path, uint8_t path_len)
-{
-  uint32_t h = 2166136261U;
-  for (uint8_t i = 0; i < path_len; i++)
-    {
-      uint32_t v = path[i];
-      for (int b = 0; b < 4; b++)
-        {
-          h ^= (uint8_t)(v >> (8 * b));
-          h *= 16777619U;
-        }
-    }
-  return h;
 }
 
 static size_t
@@ -144,15 +129,9 @@ ses_clr (AdvSes *ses)
   free (ses->pend);
   ses->pend = NULL;
   ses->pend_cnt = 0;
-  free (ses->dgst_acc);
-  ses->dgst_acc = NULL;
-  ses->dgst_acc_cnt = 0;
-  ses->dgst_acc_cap = 0;
-  ses->dgst_open = false;
-  ses->inval_cnt = 0;
+  ses->acc = true;
   ses->tx_nxt = 0;
   ses->rx_last = 0;
-  ses->dgst_ts = 0;
 }
 
 void
@@ -269,20 +248,6 @@ sent_del (AdvSes *ses, const AdvEnt *key)
   ses->sent_cnt--;
 }
 
-void
-adv_inval_dst (Adv *a, const uint8_t peer_lla[16], const uint8_t dst_lla[16])
-{
-  AdvSes *ses = ses_fnd (a, peer_lla);
-  if (!ses)
-    return;
-  uint32_t did = lla_id (dst_lla);
-  for (uint32_t i = 0; i < ses->inval_cnt; i++)
-    if (ses->inval[i] == did)
-      return;
-  if (ses->inval_cnt < ADV_REQ_MAX)
-    ses->inval[ses->inval_cnt++] = did;
-}
-
 static void
 ses_apply_pend (AdvSes *ses)
 {
@@ -371,179 +336,6 @@ adv_ack_bld (Cry *s, uint32_t seq, const uint8_t dst_lla[16], uint8_t *buf,
                      out_len);
 }
 
-uint8_t *
-adv_req_bld (Cry *s, const uint8_t *ids, uint32_t cnt,
-             const uint8_t dst_lla[16], uint8_t *buf, size_t *out_len)
-{
-  uint8_t payload[2 + 4 * ADV_REQ_MAX];
-  if (cnt > ADV_REQ_MAX)
-    cnt = ADV_REQ_MAX;
-  u16_wr (payload, (uint16_t)cnt);
-  memcpy (payload + 2, ids, (size_t)cnt * 4);
-  uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_ADV_REQ, 0, 32, hdr);
-  return pkt_enc_to (s, dst_lla, hdr, payload, 2 + (size_t)cnt * 4, buf,
-                     out_len);
-}
-
-int
-adv_on_req (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
-            size_t pt_len)
-{
-  if (!pt || pt_len < 2)
-    return -1;
-  uint16_t cnt = u16_rd (pt);
-  size_t max_cnt = (pt_len - 2) / 4;
-  if (cnt > max_cnt)
-    cnt = (uint16_t)max_cnt;
-  for (uint16_t i = 0; i < cnt; i++)
-    {
-      uint8_t dst_lla[16];
-      id_lla (u32_rd (pt + 2 + (size_t)i * 4), dst_lla);
-      adv_inval_dst (a, src_lla, dst_lla);
-    }
-  return 0;
-}
-
-#define DGST_F_START 0x8000U
-#define DGST_F_END 0x4000U
-#define DGST_CNT_MASK 0x3FFFU
-
-static bool
-dgst_acc_put (AdvSes *ses, uint32_t did)
-{
-  if (ses->dgst_acc_cnt == ses->dgst_acc_cap)
-    {
-      uint32_t ncap = ses->dgst_acc_cap ? ses->dgst_acc_cap * 2 : 16;
-      uint32_t *ns
-          = realloc (ses->dgst_acc, (size_t)ncap * sizeof (uint32_t));
-      if (!ns)
-        return false;
-      ses->dgst_acc = ns;
-      ses->dgst_acc_cap = ncap;
-    }
-  ses->dgst_acc[ses->dgst_acc_cnt++] = did;
-  return true;
-}
-
-static void
-dgst_sweep (Rt *rt, const uint8_t src_lla[16], const uint8_t src_ip[16],
-            uint16_t src_port, const AdvSes *ses, uint64_t sys_ts)
-{
-  for (uint32_t i = 0; i < rt->cnt; i++)
-    {
-      const Re *re = &rt->re_arr[i];
-      if (re->r2d == 0)
-        continue;
-      if (re->state == RT_DED)
-        continue;
-      if (memcmp (re->ep_ip, src_ip, 16) != 0 || re->ep_port != src_port)
-        continue;
-      if (memcmp (re->nhop_lla, src_lla, 16) != 0)
-        continue;
-      uint32_t did = lla_id (re->lla);
-      bool offered = false;
-      for (uint32_t k = 0; k < ses->dgst_acc_cnt; k++)
-        if (ses->dgst_acc[k] == did)
-          offered = true;
-      if (offered)
-        continue;
-      Re dead_re;
-      memset (&dead_re, 0, sizeof (dead_re));
-      memcpy (dead_re.lla, re->lla, 16);
-      memcpy (dead_re.ep_ip, re->ep_ip, 16);
-      dead_re.ep_port = re->ep_port;
-      dead_re.seq = re->seq;
-      dead_re.r2d = 1;
-      dead_re.state = RT_DED;
-      memcpy (dead_re.nhop_lla, src_lla, 16);
-      rt_upd (rt, &dead_re, sys_ts);
-    }
-}
-
-int
-adv_on_dgst (Adv *a, Rt *rt, const uint8_t src_lla[16],
-             const uint8_t src_ip[16], uint16_t src_port, const uint8_t *pt,
-             size_t pt_len, uint8_t *req_ids, uint32_t req_cap,
-             uint32_t *req_cnt, uint64_t sys_ts)
-{
-  if (!pt || pt_len < 2 || !req_ids || !req_cnt)
-    return -1;
-  uint16_t raw = u16_rd (pt);
-  bool is_start = (raw & DGST_F_START) != 0;
-  bool is_end = (raw & DGST_F_END) != 0;
-  uint16_t cnt = (uint16_t)(raw & DGST_CNT_MASK);
-  size_t max_cnt = (pt_len - 2) / 16;
-  if (cnt > max_cnt)
-    return 0;
-  *req_cnt = 0;
-  uint32_t src_id = lla_id (src_lla);
-  AdvSes *ses = ses_fnd (a, src_lla);
-  if (ses && is_start)
-    {
-      ses->dgst_acc_cnt = 0;
-      ses->dgst_open = true;
-    }
-  for (uint16_t j = 0; j < cnt; j++)
-    {
-      const uint8_t *ln = pt + 2 + (size_t)j * 16;
-      uint32_t did = u32_rd (ln);
-      uint32_t dnhop = u32_rd (ln + 4);
-      uint32_t dseq = u32_rd (ln + 8);
-      uint32_t dhash = u32_rd (ln + 12);
-      if (ses && ses->dgst_open && !dgst_acc_put (ses, did))
-        ses->dgst_open = false;
-      bool need = false;
-      if (did == src_id)
-        {
-          Re dir_re;
-          if (!rt_dir_fnd (rt, src_lla, &dir_re))
-            need = true;
-          else if (dir_re.seq != dseq)
-            need = true;
-        }
-      else
-        {
-          uint8_t dst_lla[16];
-          id_lla (did, dst_lla);
-          const Re *held = NULL;
-          for (uint32_t i = 0; i < rt->cnt; i++)
-            {
-              const Re *re = &rt->re_arr[i];
-              if (re->r2d == 0)
-                continue;
-              if (memcmp (re->lla, dst_lla, 16) != 0)
-                continue;
-              if (memcmp (re->ep_ip, src_ip, 16) != 0
-                  || re->ep_port != src_port)
-                continue;
-              if (lla_id (re->nhop_lla) != dnhop)
-                continue;
-              held = re;
-              break;
-            }
-          if (!held)
-            need = true;
-          else if (held->seq != dseq
-                   || path_hash (held->path, held->path_len) != dhash)
-            need = true;
-        }
-      if (need && *req_cnt < req_cap)
-        {
-          u32_wr (req_ids + (size_t)*req_cnt * 4, did);
-          (*req_cnt)++;
-        }
-    }
-  if (ses && is_end && ses->dgst_open)
-    {
-      dgst_sweep (rt, src_lla, src_ip, src_port, ses, sys_ts);
-      ses->dgst_open = false;
-    }
-  return 0;
-}
-
-static bool ent_exp_ok (const Re *re, const uint8_t our_lla[16]);
-
 void
 adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
           uint64_t now)
@@ -563,183 +355,124 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
       AdvSes *ses = adv_ses_get (a, re->lla, re->sid);
       if (!ses)
         continue;
+      if (rev_changed)
+        ses->acc = true;
+      if (ses->unack_seq != 0)
+        {
+          uint64_t rto = ses->rto_ms ? ses->rto_ms : RTO_INIT;
+          if (now - ses->unack_ts < rto)
+            continue;
+          free (ses->unack_buf);
+          ses->unack_buf = NULL;
+          ses->unack_len = 0;
+          ses->unack_seq = 0;
+          ses->unack_ts = 0;
+          free (ses->pend);
+          ses->pend = NULL;
+          ses->pend_cnt = 0;
+          ses->unack_retx = true;
+          uint64_t nrto = rto * 2;
+          ses->rto_ms = nrto > RTO_MAX ? RTO_MAX : nrto;
+          ses->acc = true;
+        }
+      if (!ses->acc)
+        continue;
       bool peer_no_dir = false;
       (void)rt_src_no_dir_known (rt, re->lla, &peer_no_dir);
       bool self_dir_ok = cfg->p2p && !peer_no_dir;
-      bool dgst_due = ses->dgst_ts == 0
-                      || (now - ses->dgst_ts >= ADV_DGST_INTV);
-      bool need_set = rev_changed || dgst_due || ses->inval_cnt > 0;
-      AdvEnt *set = NULL;
-      uint32_t set_cnt = 0;
-      if (need_set)
-        {
-          set = malloc ((size_t)(rt->cnt ? rt->cnt : 1) * sizeof (AdvEnt));
-          if (set)
-            set_cnt = adv_set_bld (rt, cfg->addr, self_dir_ok, peer_no_dir,
-                                   cfg->p2p, NULL, set, rt->cnt);
-        }
+      AdvEnt *set = malloc ((size_t)(rt->cnt ? rt->cnt : 1)
+                            * sizeof (AdvEnt));
+      if (!set)
+        continue;
+      uint32_t set_cnt = adv_set_bld (rt, cfg->addr, self_dir_ok,
+                                      peer_no_dir, cfg->p2p, NULL, set,
+                                      rt->cnt);
       uint16_t known = (re->mtu_lkg > 0) ? re->mtu_lkg : RT_MTU_MIN;
       uint32_t budget
           = (known > TNL_OH_MAX) ? (uint32_t)(known - TNL_OH_MAX) : 1U;
-      bool sent_new = false;
-      if (set)
+      size_t used = 6;
+      uint32_t ch_cap = set_cnt + ses->sent_cnt;
+      AdvEnt *ch = malloc ((size_t)(ch_cap ? ch_cap : 1)
+                           * sizeof (AdvEnt));
+      uint32_t ch_cnt = 0;
+      bool more = false;
+      if (ch)
         {
-          size_t used = 6;
-          uint32_t ch_cap = set_cnt + ses->sent_cnt + ses->pend_cnt;
-          AdvEnt *ch = malloc ((size_t)(ch_cap ? ch_cap : 1)
-                               * sizeof (AdvEnt));
-          uint32_t ch_cnt = 0;
-          if (ch)
+          for (uint32_t k = 0; k < ses->sent_cnt; k++)
             {
-              for (int pass = 0; pass < 2; pass++)
+              bool in_cur = false;
+              for (uint32_t m = 0; m < set_cnt; m++)
+                if (ent_key_eq (&set[m], &ses->sent[k]))
+                  in_cur = true;
+              if (in_cur)
+                continue;
+              if (ch_cnt > 0 && used >= budget)
                 {
-                  const AdvEnt *src_arr
-                      = pass == 0 ? ses->sent : ses->pend;
-                  uint32_t src_cnt
-                      = pass == 0 ? ses->sent_cnt : ses->pend_cnt;
-                  for (uint32_t k = 0; k < src_cnt; k++)
-                    {
-                      bool in_cur = false;
-                      for (uint32_t m = 0; m < set_cnt; m++)
-                        if (ent_key_eq (&set[m], &src_arr[k]))
-                          in_cur = true;
-                      if (in_cur)
-                        continue;
-                      bool dup = false;
-                      for (uint32_t m = 0; m < ch_cnt; m++)
-                        if (ent_key_eq (&ch[m], &src_arr[k]))
-                          dup = true;
-                      if (dup)
-                        continue;
-                      if (ch_cnt > 0 && used >= budget)
-                        break;
-                      AdvEnt wd = src_arr[k];
-                      wd.adv_m = RT_F_INF;
-                      wd.state = (uint8_t)RT_DED;
-                      ch[ch_cnt++] = wd;
-                      used += ent_sz (&wd);
-                    }
-                  if (ch_cnt > 0 && used >= budget)
-                    break;
+                  more = true;
+                  break;
                 }
+              AdvEnt wd = ses->sent[k];
+              wd.adv_m = RT_F_INF;
+              wd.state = (uint8_t)RT_DED;
+              ch[ch_cnt++] = wd;
+              used += ent_sz (&wd);
+            }
+          if (!more)
+            {
               for (uint32_t k = 0; k < set_cnt; k++)
                 {
-                  const AdvEnt *eff = NULL;
-                  for (uint32_t m = 0; m < ses->pend_cnt; m++)
-                    if (ent_key_eq (&ses->pend[m], &set[k]))
-                      eff = &ses->pend[m];
-                  if (!eff)
-                    {
-                      int si = sent_fnd (ses, &set[k]);
-                      if (si >= 0)
-                        eff = &ses->sent[si];
-                    }
-                  bool forced = false;
-                  for (uint32_t q = 0; q < ses->inval_cnt; q++)
-                    if (lla_id (set[k].lla) == ses->inval[q])
-                      forced = true;
-                  if (!forced && eff && !ent_is_wd (eff)
-                      && ent_eq (eff, &set[k]))
+                  int si = sent_fnd (ses, &set[k]);
+                  if (si >= 0 && ent_eq (&ses->sent[si], &set[k]))
                     continue;
                   if (ch_cnt > 0 && used >= budget)
-                    break;
+                    {
+                      more = true;
+                      break;
+                    }
                   ch[ch_cnt++] = set[k];
                   used += ent_sz (&set[k]);
                 }
             }
-          ses->inval_cnt = 0;
-          if (ch && ch_cnt > 0)
-            {
-              size_t pl_len = used;
-              uint8_t *pl = malloc (pl_len);
-              if (pl)
-                {
-                  uint32_t seq = ++ses->tx_nxt;
-                  u32_wr (pl, seq);
-                  u16_wr (pl + 4, (uint16_t)ch_cnt);
-                  size_t off = 6;
-                  for (uint32_t k = 0; k < ch_cnt; k++)
-                    off += adv_ent_ser (pl + off, &ch[k]);
-                  if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_UPD, pl,
-                                off, now))
-                    {
-                      free (ses->unack_buf);
-                      ses->unack_buf = pl;
-                      ses->unack_len = off;
-                      ses->unack_seq = seq;
-                      ses->unack_ts = now;
-                      ses->unack_retx = false;
-                      free (ses->pend);
-                      ses->pend = ch;
-                      ses->pend_cnt = ch_cnt;
-                      ch = NULL;
-                      sent_new = true;
-                    }
-                  else
-                    free (pl);
-                }
-            }
-          free (ch);
         }
-      if (!sent_new && ses->unack_buf)
+      bool sent_new = false;
+      if (ch && ch_cnt > 0)
         {
-          uint64_t rto = ses->rto_ms ? ses->rto_ms : RTO_INIT;
-          if (now - ses->unack_ts >= rto)
+          size_t pl_len = used;
+          uint8_t *pl = malloc (pl_len);
+          if (pl)
             {
-              if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_UPD,
-                            ses->unack_buf, ses->unack_len, now))
+              uint32_t seq = ++ses->tx_nxt;
+              u32_wr (pl, seq);
+              u16_wr (pl + 4, (uint16_t)ch_cnt);
+              size_t off = 6;
+              for (uint32_t k = 0; k < ch_cnt; k++)
+                off += adv_ent_ser (pl + off, &ch[k]);
+              if (adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_UPD, pl,
+                            off, now))
                 {
+                  free (ses->unack_buf);
+                  ses->unack_buf = pl;
+                  ses->unack_len = off;
+                  ses->unack_seq = seq;
                   ses->unack_ts = now;
-                  ses->unack_retx = true;
-                  uint64_t nrto = ses->rto_ms ? ses->rto_ms * 2 : rto * 2;
-                  ses->rto_ms = nrto > RTO_MAX ? RTO_MAX : nrto;
+                  free (ses->pend);
+                  ses->pend = ch;
+                  ses->pend_cnt = ch_cnt;
+                  ch = NULL;
+                  sent_new = true;
                 }
+              else
+                free (pl);
             }
         }
-      if (set && dgst_due)
+      if (sent_new)
         {
-          uint32_t per = budget > 2 ? (budget - 2) / 16 : 1;
-          if (per == 0)
-            per = 1;
-          bool all_ok = true;
-          uint32_t done = 0;
-          do
-            {
-              uint32_t chunk = set_cnt - done;
-              if (chunk > per)
-                chunk = per;
-              size_t pl_len = 2 + (size_t)chunk * 16;
-              uint8_t *pl = malloc (pl_len);
-              if (!pl)
-                {
-                  all_ok = false;
-                  break;
-                }
-              uint16_t hdr = (uint16_t)chunk;
-              if (done == 0)
-                hdr |= (uint16_t)DGST_F_START;
-              if (done + chunk >= set_cnt)
-                hdr |= (uint16_t)DGST_F_END;
-              u16_wr (pl, hdr);
-              for (uint32_t k = 0; k < chunk; k++)
-                {
-                  const AdvEnt *e = &set[done + k];
-                  uint8_t *ln = pl + 2 + (size_t)k * 16;
-                  u32_wr (ln, lla_id (e->lla));
-                  u32_wr (ln + 4, lla_id (e->nhop_lla));
-                  u32_wr (ln + 8, e->seq);
-                  u32_wr (ln + 12, path_hash (e->path, e->path_len));
-                }
-              if (!adv_send (udp, cry_ctx, rt, cfg, re, PT_ADV_DGST, pl,
-                             pl_len, now))
-                all_ok = false;
-              free (pl);
-              done += chunk;
-            }
-          while (done < set_cnt && all_ok);
-          if (all_ok)
-            ses->dgst_ts = now;
+          if (!more)
+            ses->acc = false;
         }
+      else if (ch && !more)
+        ses->acc = false;
+      free (ch);
       free (set);
     }
   for (uint32_t i = 0; i < a->cnt;)
@@ -794,14 +527,13 @@ adv_ent_ser (uint8_t *dst, const AdvEnt *src)
   dst[34] = src->flags;
   dst[35] = src->state;
   u16_wr (dst + 36, src->mtu);
-  u32_wr (dst + 38, src->seq);
-  u32_wr (dst + 42, src->adv_m);
-  dst[46] = src->adv_loss;
-  memcpy (dst + 47, src->nhop_lla, 16);
-  u64_wr (dst + 63, src->ver);
-  dst[71] = src->path_len;
+  u32_wr (dst + 38, src->adv_m);
+  dst[42] = src->adv_loss;
+  memcpy (dst + 43, src->nhop_lla, 16);
+  u64_wr (dst + 59, src->ver);
+  dst[67] = src->path_len;
   for (uint8_t i = 0; i < src->path_len; i++)
-    u32_wr (dst + 72 + (size_t)i * 4, src->path[i]);
+    u32_wr (dst + 68 + (size_t)i * 4, src->path[i]);
   return ADV_CORE_SZ + 1 + (size_t)src->path_len * 4;
 }
 
@@ -816,19 +548,18 @@ adv_ent_des (AdvEnt *dst, const uint8_t *src, size_t avail)
   dst->flags = src[34];
   dst->state = src[35];
   dst->mtu = u16_rd (src + 36);
-  dst->seq = u32_rd (src + 38);
-  dst->adv_m = u32_rd (src + 42);
-  dst->adv_loss = src[46];
-  memcpy (dst->nhop_lla, src + 47, 16);
-  dst->ver = u64_rd (src + 63);
-  dst->path_len = src[71];
+  dst->adv_m = u32_rd (src + 38);
+  dst->adv_loss = src[42];
+  memcpy (dst->nhop_lla, src + 43, 16);
+  dst->ver = u64_rd (src + 59);
+  dst->path_len = src[67];
   if (dst->path_len > ADV_PATH_MAX)
     return -1;
   size_t need = ADV_CORE_SZ + 1 + (size_t)dst->path_len * 4;
   if (avail < need)
     return -1;
   for (uint8_t i = 0; i < dst->path_len; i++)
-    dst->path[i] = u32_rd (src + 72 + (size_t)i * 4);
+    dst->path[i] = u32_rd (src + 68 + (size_t)i * 4);
   return (int)need;
 }
 
@@ -956,7 +687,6 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
   out->state = (uint8_t)re->state;
   out->mtu
       = (re->state == RT_ACT) ? rt_dir_mtu_adv (rt, re) : 0;
-  out->seq = re->seq;
   out->adv_m = re->rt_m;
   if (re->r2d > 0)
     {
@@ -1068,30 +798,17 @@ adv_set_bld (Rt *rt, const uint8_t our_lla[16], bool self_dir_ok,
   return n;
 }
 
-uint8_t *
-seq_req_bld (Cry *s, const uint8_t tgt_lla[16], uint8_t *buf,
-             const uint8_t dst_lla[16], size_t *out_len)
-{
-  uint8_t payload[16];
-  memcpy (payload, tgt_lla, 16);
-  uint8_t hdr[PKT_CH_SZ];
-  hdr_bld (PT_SEQ_REQ, 0, 32, hdr);
-  return pkt_enc_to (s, dst_lla, hdr, payload, sizeof (payload), buf, out_len);
-}
-
 int
 adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         uint16_t src_port, const uint8_t src_lla_hint[16],
         const uint8_t our_lla[16], Rt *rt, PPool *pool, bool allow_dir_hint,
-        uint64_t sys_ts, bool *is_mod, bool *o_req_seq, uint8_t seq_tgt[16])
+        uint64_t sys_ts, bool *is_mod)
 {
   if (!pt || pt_len < 2)
     return -1;
   uint16_t cnt = u16_rd (pt);
   uint32_t rt_c_old = rt->cnt;
   *is_mod = false;
-  if (o_req_seq)
-    *o_req_seq = false;
   uint8_t src_lla[16] = { 0 };
   bool has_s_lla = false;
   if (src_lla_hint && IS_LLA_VAL (src_lla_hint))
@@ -1141,7 +858,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             }
           continue;
         }
-      uint32_t n_seq = ent.seq;
       int32_t adv_m = ent.adv_m;
       uint16_t ent_mtu = ent.mtu;
       bool no_dir = (ent.flags & ADV_F_NO_DIR) != 0;
@@ -1178,7 +894,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
             memcpy (dead_re.lla, ent.lla, 16);
             memcpy (dead_re.ep_ip, src_ip, 16);
             dead_re.ep_port = src_port;
-            dead_re.seq = n_seq;
             dead_re.r2d = 1;
             dead_re.state = RT_DED;
             memcpy (dead_re.nhop_lla, src_lla, 16);
@@ -1188,21 +903,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       }
       bool is_s_owner
           = has_s_lla && memcmp (src_lla, ent.lla, 16) == 0;
-      SrcEnt *se = NULL;
-      for (uint32_t si = 0; si < rt->src_cnt; si++)
-        {
-          if (memcmp (rt->sources[si].rt_id, ent.lla, 16) == 0)
-            {
-              se = &rt->sources[si];
-              break;
-            }
-        }
-      if (se && seq_lt (n_seq, se->seq) && o_req_seq && seq_tgt)
-        {
-          *o_req_seq = true;
-          memcpy (seq_tgt, ent.lla, 16);
-        }
-      rt_src_upd_auth (rt, ent.lla, n_seq, ent.ver, no_dir,
+      rt_src_upd_auth (rt, ent.lla, ent.ver, no_dir,
                        is_s_owner, sys_ts);
       bool eff_no_dir = no_dir || (!is_s_owner && rt_src_no_dir (rt, ent.lla));
       bool is_s_self = (memcmp (ent.ep_ip, src_ip, 16) == 0
@@ -1217,7 +918,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           memcpy (rel_re.ep_ip, src_ip, 16);
           rel_re.ep_port = src_port;
           rel_re.ver = ent.ver;
-          rel_re.seq = n_seq;
           rel_re.adv_m = adv_m;
           rel_re.adv_loss = ent.adv_loss;
           rel_re.r2d = 1;
@@ -1255,7 +955,6 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           memcpy (dir_re.ep_ip, ent.ep_ip, 16);
           dir_re.ep_port = ent.ep_port;
           dir_re.ver = ent.ver;
-          dir_re.seq = n_seq;
           dir_re.adv_m = adv_m;
           dir_re.adv_loss = ent.adv_loss;
           dir_re.r2d = 0;
@@ -1288,13 +987,3 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
   return 0;
 }
 
-int
-on_seq_req (const uint8_t *pt, size_t pt_len, uint8_t tgt_lla[16])
-{
-  if (!pt)
-    return -1;
-  if (pt_len < 16)
-    return -1;
-  memcpy (tgt_lla, pt, 16);
-  return 0;
-}
