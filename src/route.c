@@ -889,30 +889,6 @@ rt_map_all (Rt *t)
   return t->map;
 }
 
-void
-rt_pth_lims (const Rt *t, const Pth *pth, uint16_t *out_lkg,
-             uint16_t *out_ukb, bool *out_srch)
-{
-  uint16_t lkg = pth->mtu_lkg ? pth->mtu_lkg : RT_MTU_MIN;
-  uint16_t ukb = pth->mtu_ukb ? pth->mtu_ukb : rt_mtu_ub (t);
-  uint16_t cap = pth->peer_rev_mtu >= RT_MTU_MIN ? pth->peer_rev_mtu : 0;
-  if (cap)
-    {
-      if (lkg > cap)
-        lkg = cap;
-      if (ukb > cap)
-        ukb = cap;
-    }
-  if (ukb < lkg)
-    ukb = lkg;
-  if (out_lkg)
-    *out_lkg = lkg;
-  if (out_ukb)
-    *out_ukb = ukb;
-  if (out_srch)
-    *out_srch = ukb > lkg;
-}
-
 static bool
 rt_cap_chk (Rt *t, uint32_t extra)
 {
@@ -1076,10 +1052,9 @@ rt_dir_has_other_ep (const Rt *t, const uint8_t lla[16], const uint8_t ip[16],
 }
 
 void
-pp_init (PPool *p, const char *persist_path)
+pp_init (PPool *p)
 {
   memset (p, 0, sizeof (*p));
-  p->persist_path = persist_path;
 }
 
 void
@@ -2310,20 +2285,6 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
     rt_map_mark (t);
 }
 
-int
-rt_act_get (Rt *t, Re *buf, int buf_len, int s_off)
-{
-  int act_cnt = 0;
-  for (uint32_t scan_idx = 0; scan_idx < t->cnt && act_cnt < buf_len;
-       scan_idx++)
-    {
-      uint32_t re_idx = ((uint32_t)s_off + scan_idx) % t->cnt;
-      if (t->re_arr[re_idx].state == RT_ACT)
-        buf[act_cnt++] = t->re_arr[re_idx];
-    }
-  return act_cnt;
-}
-
 void
 rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
 {
@@ -2586,13 +2547,6 @@ rt_src_upd_auth (Rt *t, const uint8_t rt_id[16],
   se->gc_ts = sys_ts;
   if (se->no_dir != old_no_dir)
     rt_map_mark (t);
-}
-
-void
-rt_src_upd (Rt *t, const uint8_t rt_id[16],
-            uint64_t ver, bool no_dir, uint64_t sys_ts)
-{
-  rt_src_upd_auth (t, rt_id, ver, no_dir, false, sys_ts);
 }
 
 void

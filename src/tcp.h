@@ -86,7 +86,6 @@ typedef struct
   uint64_t ts;
   uint8_t peer_lla[16];
   uint8_t sock_ip[16];
-  uint16_t sock_port;
   uint8_t route_ip[16];
   uint16_t route_port;
   uint32_t lane_hash;
@@ -148,7 +147,6 @@ int tp_rt_listen_fd_get (const TpRt *tp);
 void tp_glb_bind (TpRt *tp, int epfd, Cry *cry_ctx, const Cfg *cfg,
                   uint64_t sid);
 void tp_glb_unbind (void);
-bool tp_rtt_get (const uint8_t ip[16], uint16_t port, uint32_t *out_rtt_ms);
 bool tp_alive_get (const uint8_t peer_lla[16], const uint8_t ip[16],
                    uint16_t port);
 bool tp_send (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],

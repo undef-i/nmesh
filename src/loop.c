@@ -326,7 +326,6 @@ tap_pipe_sync (TapPipe *tap_pipe, const Rt *rt, const Cfg *cfg, uint64_t now)
         {
           cfg_free (&tap_pipe->cfg);
           tap_pipe->cfg = new_cfg;
-          tap_pipe->snap_ts = now;
         }
       else
         {
@@ -1308,7 +1307,7 @@ status_row_fill (RRow *row, Rt *rt, const Cfg *cfg, const uint8_t dst[16],
   else
     snprintf (row->rtt_s, sizeof (row->rtt_s), "%dms", row->rtt);
   uint32_t loss_pct = 0;
-  if (!use_tcp && rt_show_loss (rt, dst, &dec, &loss_pct))
+  if (!use_tcp && p->r2d != 0 && rt_show_loss (rt, dst, &dec, &loss_pct))
     {
       row->loss = (int)loss_pct;
       snprintf (row->loss_s, sizeof (row->loss_s), "%u%%", loss_pct);
@@ -1320,19 +1319,8 @@ status_row_fill (RRow *row, Rt *rt, const Cfg *cfg, const uint8_t dst[16],
     }
   if (use_tcp)
     strcpy (row->mtu, "-");
-  else if (p->r2d != 0)
-    snprintf (row->mtu, sizeof (row->mtu), "%u", rt_mtu (rt, &dec));
   else
-    {
-      uint16_t cur = rt_mtu (rt, &dec);
-      uint16_t lkg = 0, ukb = 0;
-      bool srch = false;
-      rt_pth_lims (rt, p, &lkg, &ukb, &srch);
-      if (srch)
-        snprintf (row->mtu, sizeof (row->mtu), "[%u, %u]", lkg, ukb);
-      else
-        snprintf (row->mtu, sizeof (row->mtu), "%u", cur);
-    }
+    snprintf (row->mtu, sizeof (row->mtu), "%u", rt_mtu (rt, &dec));
 }
 
 static void
@@ -1646,7 +1634,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   if (cfg_cpy (&cfg, cfg_in) != 0)
     return 1;
   PPool pool;
-  pp_init (&pool, cfg_path);
+  pp_init (&pool);
   Rt rt;
   rt_init (&rt);
   Adv adv;

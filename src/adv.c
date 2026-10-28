@@ -43,15 +43,6 @@ lla_id (const uint8_t lla[16])
   return u32_rd (lla + 12);
 }
 
-static void
-id_lla (uint32_t id, uint8_t lla[16])
-{
-  memset (lla, 0, 16);
-  lla[0] = 0xfe;
-  lla[1] = 0x80;
-  u32_wr (lla + 12, id);
-}
-
 static size_t
 ent_sz (const AdvEnt *e)
 {

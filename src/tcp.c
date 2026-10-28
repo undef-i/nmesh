@@ -2186,18 +2186,6 @@ tp_glb_unbind (void)
 }
 
 bool
-tp_rtt_get (const uint8_t ip[16], uint16_t port, uint32_t *out_rtt_ms)
-{
-  if (!g_tp_rt || !ip || port == 0 || !out_rtt_ms)
-    return false;
-  tp_lock (g_tp_rt);
-  TpConn *conn = tp_conn_by_ep (g_tp_rt, ip, port);
-  bool ok = tp_conn_rtt_ms_get (conn, out_rtt_ms);
-  tp_unlock (g_tp_rt);
-  return ok;
-}
-
-bool
 tp_alive_get (const uint8_t peer_lla[16], const uint8_t ip[16], uint16_t port)
 {
   if (!g_tp_rt || !peer_lla || !ip || port == 0 || tp_lla_is_zero (peer_lla))
@@ -2611,7 +2599,6 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
       conn->inbound = true;
       conn->ts = sys_ts ();
       memcpy (conn->sock_ip, sa.sin6_addr.s6_addr, 16);
-      conn->sock_port = ntohs (sa.sin6_port);
       if (!tp_ev_add (epfd, conn))
         tp_conn_close (tp, epfd, conn);
     }

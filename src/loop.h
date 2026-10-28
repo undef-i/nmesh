@@ -41,7 +41,6 @@ typedef struct
   TapSlot *q_arr;
   Rt rt;
   Cfg cfg;
-  uint64_t snap_ts;
 } TapPipe;
 
 typedef void (*LoopReadyFn) (void *arg);

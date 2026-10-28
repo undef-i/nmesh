@@ -181,7 +181,6 @@ typedef struct
   PAnc *re_arr;
   int cnt;
   int cap;
-  const char *persist_path;
 } PPool;
 
 typedef struct Rt
@@ -291,13 +290,8 @@ void rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts);
 RtMap *rt_map_all (Rt *t);
 Pth *rt_map_pick (Rt *t, RtMap *re, bool is_p2p);
 int32_t rt_pth_metric (Rt *t, const Pth *pth);
-void rt_pth_lims (const Rt *t, const Pth *pth, uint16_t *out_lkg,
-                  uint16_t *out_ukb, bool *out_srch);
-int rt_act_get (Rt *t, Re *buf, int buf_len, int s_off);
 void rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts);
 void rt_src_gc (Rt *t, uint64_t sys_ts);
-void rt_src_upd (Rt *t, const uint8_t rt_id[16],
-                 uint64_t ver, bool no_dir, uint64_t sys_ts);
 void rt_src_upd_auth (Rt *t, const uint8_t rt_id[16],
                       uint64_t ver, bool no_dir,
                       bool can_clear_no_dir, uint64_t sys_ts);
@@ -312,7 +306,7 @@ bool rt_peer_ep_fnd (const Rt *t, const uint8_t peer_lla[16],
 void rt_dir_hint_prune (Rt *t, const uint8_t lla[16]);
 bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
                    uint64_t sys_ts);
-void pp_init (PPool *p, const char *persist_path);
+void pp_init (PPool *p);
 void pp_free (PPool *p);
 void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
 void rt_adv_dirty_set (Rt *t);
