@@ -25,6 +25,39 @@
 
 static UdpEmsgsizeCallback g_emsg_cb = NULL;
 static UdpUnreachCallback g_unr_cb = NULL;
+static UdpDrainCallback g_drn_cb = NULL;
+
+static _Atomic uint64_t g_udp_drop_q;
+static _Atomic uint64_t g_udp_drop_e;
+static _Atomic uint64_t g_udp_drop_x;
+static _Atomic uint64_t g_udp_rx_ovf;
+
+void
+udp_drop_get (uint64_t out[4])
+{
+  out[0] = atomic_load_explicit (&g_udp_drop_q, memory_order_relaxed);
+  out[1] = atomic_load_explicit (&g_udp_drop_e, memory_order_relaxed);
+  out[2] = atomic_load_explicit (&g_udp_drop_x, memory_order_relaxed);
+  out[3] = atomic_load_explicit (&g_udp_rx_ovf, memory_order_relaxed);
+}
+
+static void
+udp_drop_q_note (void)
+{
+  atomic_fetch_add_explicit (&g_udp_drop_q, 1, memory_order_relaxed);
+}
+
+static void
+udp_drop_e_note (uint64_t n)
+{
+  atomic_fetch_add_explicit (&g_udp_drop_e, n, memory_order_relaxed);
+}
+
+static void
+udp_drop_x_note (uint64_t n)
+{
+  atomic_fetch_add_explicit (&g_udp_drop_x, n, memory_order_relaxed);
+}
 #if defined(__linux__) && defined(UDP_SEGMENT)
 #define UDP_GSO_MAX_SEGS 64
 #define UDP_GSO_MAX_BYTES 65535U
@@ -194,16 +227,22 @@ udp_tx_1 (Udp *s, const UdpMsg *m)
     {
       if (g_emsg_cb)
         g_emsg_cb (m->dst_ip, m->dst_port, m->data_len);
+      udp_drop_x_note (1);
       return 0;
     }
   if (is_err_unr (errno))
     {
       if (g_unr_cb)
         g_unr_cb (m->dst_ip, m->dst_port);
+      udp_drop_x_note (1);
       return 0;
     }
   if (errno == ENOBUFS)
-    return 0;
+    {
+      udp_drop_e_note (1);
+      return 0;
+    }
+  udp_drop_e_note (1);
   fprintf (stderr, "udp: sendto fallback drop errno=%d\n", errno);
   return 0;
 }
@@ -219,6 +258,7 @@ udp_rx_split_add (Udp *s, const uint8_t src_ip[16], uint16_t src_port,
   if (!arr || !s->rx_split_data || s->rx_split_cnt >= s->rx_split_cap
       || data_len > s->rx_split_data_cap - s->rx_split_data_len)
     {
+      atomic_fetch_add_explicit (&g_udp_rx_ovf, 1, memory_order_relaxed);
       uint64_t now = sys_ts ();
       if (now - ovf_log_ts >= 1000ULL)
         {
@@ -402,6 +442,7 @@ udp_gso_tx_seq (Udp *s, UdpMsg *msgs, int cnt)
         {
           if (g_emsg_cb)
             g_emsg_cb (msgs[i].dst_ip, msgs[i].dst_port, seg_len);
+          udp_drop_x_note ((uint64_t)grp_cnt);
           i += grp_cnt;
           continue;
         }
@@ -409,9 +450,13 @@ udp_gso_tx_seq (Udp *s, UdpMsg *msgs, int cnt)
         {
           if (g_unr_cb)
             g_unr_cb (msgs[i].dst_ip, msgs[i].dst_port);
+          udp_drop_x_note ((uint64_t)grp_cnt);
         }
-      else if (errno != ENOBUFS)
+      else if (errno == ENOBUFS)
+        udp_drop_e_note ((uint64_t)grp_cnt);
+      else
         {
+          udp_drop_e_note ((uint64_t)grp_cnt);
           fprintf (stderr, "udp: gso send drop errno=%d seg=%zu cnt=%d\n",
                    errno, seg_len, grp_cnt);
         }
@@ -579,6 +624,7 @@ udp_pend_add (Udp *s, const UdpMsg *m)
 static void
 udp_pend_drop_log (int pr)
 {
+  udp_drop_q_note ();
   if (pr == 0)
     fprintf (stderr, "udp: pending queue full, drop outgoing packet\n");
   else if (pr < 0)
@@ -589,6 +635,7 @@ static int
 udp_pend_fls (Udp *s)
 {
   int flush_cnt = 0;
+  bool had_pend = s->pend_cnt > 0;
   while (s->pend_cnt > 0)
     {
       UdpPMsg *pm = &s->pend_arr[s->pend_head];
@@ -607,6 +654,7 @@ udp_pend_fls (Udp *s)
             {
               if (g_emsg_cb)
                 g_emsg_cb (pm->dst_ip, pm->dst_port, pm->data_len);
+              udp_drop_x_note (1);
               s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
               s->pend_cnt--;
               continue;
@@ -615,10 +663,12 @@ udp_pend_fls (Udp *s)
             {
               if (g_unr_cb)
                 g_unr_cb (pm->dst_ip, pm->dst_port);
+              udp_drop_x_note (1);
               s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
               s->pend_cnt--;
               continue;
             }
+          udp_drop_e_note (1);
           s->pend_head = (s->pend_head + 1U) & (s->pend_cap - 1U);
           s->pend_cnt--;
           continue;
@@ -628,6 +678,8 @@ udp_pend_fls (Udp *s)
       flush_cnt++;
     }
   atomic_store_explicit (&s->pend_want, s->pend_cnt > 0, memory_order_relaxed);
+  if (had_pend && s->pend_cnt == 0 && g_drn_cb)
+    g_drn_cb ();
   return flush_cnt;
 }
 
@@ -1077,6 +1129,12 @@ void
 udp_unr_cb_set (UdpUnreachCallback cb)
 {
   g_unr_cb = cb;
+}
+
+void
+udp_drn_cb_set (UdpDrainCallback cb)
+{
+  g_drn_cb = cb;
 }
 
 bool

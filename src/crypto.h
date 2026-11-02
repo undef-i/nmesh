@@ -51,6 +51,8 @@ bool cry_peer_rekey (Cry *s, const uint8_t our_lla[16],
                      const uint8_t peer_lla[16],
                      const uint8_t peer_pk[CRY_KX_PUB_SZ]);
 bool cry_peer_ready (Cry *s, const uint8_t peer_lla[16]);
+bool cry_rx_sid_known (Cry *s, const uint8_t sid[CRY_NONCE_SID_SZ]);
+void cry_peer_drop (Cry *s, const uint8_t peer_lla[16]);
 void cry_enc (Cry *s, const uint8_t *pt, size_t pt_len, const uint8_t *ad,
               size_t ad_len, uint8_t nonce[CRY_NONCE_WIRE_SZ],
               uint8_t mac[CRY_MAC_SZ], uint8_t *ct);
@@ -73,4 +75,4 @@ int cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
                   size_t ct_len, const uint8_t *ad, size_t ad_len,
                   const uint8_t nonce[CRY_NONCE_WIRE_SZ],
                   const uint8_t mac[CRY_MAC_SZ], uint8_t *pt,
-                  uint8_t matched_lla[16]);
+                  uint8_t matched_lla[16], bool *sid_hit);

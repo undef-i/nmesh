@@ -391,7 +391,7 @@ rx_rp_chk (const uint8_t nonce[PKT_NONCE_SZ])
 }
 
 bool
-rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ])
+rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ], bool *known)
 {
   uint8_t sid[RX_RP_SID_SZ];
   nonce_sid_rd (nonce, sid);
@@ -400,6 +400,8 @@ rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ])
   bool found = false;
   RxRp *slot = NULL;
 
+  if (known)
+    *known = false;
   if (g_rx_rp_cap == 0 && !rx_rp_rehash (RX_RP_CAP_INIT, now))
     return false;
 
@@ -420,6 +422,8 @@ rx_rp_cmt (const uint8_t nonce[PKT_NONCE_SZ])
       rx_rp_slot_init (slot, sid, cnt, now);
       return true;
     }
+  if (known)
+    *known = true;
   if (cnt > slot->max_cnt)
     {
       uint64_t sh = cnt - slot->max_cnt;

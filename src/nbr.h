@@ -7,8 +7,9 @@
 #include <stdint.h>
 #define IBS_PING_PL_SZ (PING_PL_SZ + CRY_KX_PUB_SZ + 16 + IBS_CKIE_SZ)
 #define IBS_PONG_PL_SZ (PONG_PL_SZ + CRY_KX_PUB_SZ + 16)
-#define IBS_CKIE_PL_SZ (IBS_CKIE_SZ + IBS_CKIE_SZ)
+#define IBS_CKIE_PL_SZ (IBS_CKIE_SZ)
 #define IBS_PING_CKIE_OFF (IBS_PING_PL_SZ - IBS_CKIE_SZ)
+#define IBS_TS_SKEW_MAX 120000ULL
 uint8_t *ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                    uint64_t ts, uint64_t sid, uint64_t prb_tok, uint8_t *buf,
                    size_t *out_len);
@@ -24,10 +25,8 @@ size_t ibs_ping_pl_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                         uint64_t ts, uint64_t sid, uint64_t prb_tok,
                         const uint8_t our_ip[16],
                         const uint8_t ckie[IBS_CKIE_SZ], uint8_t *pl);
-void ibs_pl_hash (const uint8_t *pl, uint8_t out[IBS_CKIE_SZ]);
 void ibs_ckie_calc (const uint8_t key[IBS_CKIE_SZ], const uint8_t lla[16],
-                    const uint8_t ip[16], uint16_t port,
-                    const uint8_t pl_hash[IBS_CKIE_SZ], uint64_t bucket,
+                    const uint8_t ip[16], uint16_t port, uint64_t bucket,
                     uint8_t out[IBS_CKIE_SZ]);
 uint8_t *ibs_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
                        uint64_t o_ts, uint64_t sid, uint64_t rx_ts,

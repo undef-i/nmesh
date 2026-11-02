@@ -1,5 +1,6 @@
 #include "loop.h"
 #include "adv.h"
+#include "adm.h"
 #include "bogon.h"
 #include "config.h"
 #include "crypto.h"
@@ -144,6 +145,9 @@ typedef struct LoopRxCtx
   uint64_t sid;
   PPool *pool;
   Adv *adv;
+  Adm *adm;
+  uint8_t id_lla[16];
+  bool has_id;
 } LoopRxCtx;
 static bool on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src,
                           void *arg);
@@ -303,6 +307,14 @@ tap_pipe_kick (TapPipe *tap_pipe)
   pthread_mutex_unlock (&tap_pipe->q_mtx);
 }
 
+static TapPipe *g_tap_pipe_drn;
+
+static void
+on_udp_drn (void)
+{
+  tap_pipe_kick (g_tap_pipe_drn);
+}
+
 void
 tap_pipe_note_hnd (TapPipe *tap_pipe)
 {
@@ -339,17 +351,30 @@ tap_pipe_sync (TapPipe *tap_pipe, const Rt *rt, const Cfg *cfg, uint64_t now)
   pthread_rwlock_unlock (&tap_pipe->snap_lk);
 }
 
+#define NM_THREAD_STACK_SZ (1024 * 1024)
+
+static int
+nm_thread_start (pthread_t *tid, void *(*fn) (void *), void *arg)
+{
+  pthread_attr_t at;
+  if (pthread_attr_init (&at) != 0)
+    return -1;
+  (void)pthread_attr_setstacksize (&at, NM_THREAD_STACK_SZ);
+  int rc = pthread_create (tid, &at, fn, arg);
+  pthread_attr_destroy (&at);
+  return rc == 0 ? 0 : -1;
+}
+
 int
 tap_pipe_start (TapPipe *tap_pipe)
 {
   if (!tap_pipe)
     return -1;
-  if (pthread_create (&tap_pipe->tid_arr[0], NULL, tap_read_loop, tap_pipe)
+  if (nm_thread_start (&tap_pipe->tid_arr[0], tap_read_loop, tap_pipe)
       != 0)
     return -1;
   tap_pipe->tid_on[0] = true;
-  if (pthread_create (&tap_pipe->tid_arr[1], NULL, tap_loop, tap_pipe)
-      != 0)
+  if (nm_thread_start (&tap_pipe->tid_arr[1], tap_loop, tap_pipe) != 0)
     {
       tap_pipe_stop_wake (tap_pipe);
       pthread_join (tap_pipe->tid_arr[0], NULL);
@@ -584,11 +609,12 @@ tap_loop (void *arg)
         }
       if (want_w)
         tap_note_tx (tap_pipe->note_fd);
-      if (!tap_ok || !flush_ok)
+      if (!tap_ok || !flush_ok || done_cnt < take_cnt)
         {
           pthread_mutex_lock (&tap_pipe->q_mtx);
-          if (!atomic_load_explicit (&tap_pipe->stop_req,
-                                     memory_order_acquire))
+          while (!atomic_load_explicit (&tap_pipe->stop_req,
+                                        memory_order_acquire)
+                 && (tap_pipe->q_cnt == 0 || udp_w_want (tap_pipe->udp)))
             pthread_cond_wait (&tap_pipe->q_ne, &tap_pipe->q_mtx);
           pthread_mutex_unlock (&tap_pipe->q_mtx);
         }
@@ -596,8 +622,47 @@ tap_loop (void *arg)
   return NULL;
 }
 
-static uint64_t um_prb_intv (uint64_t age_ms);
 static bool lla_is_z (const uint8_t lla[16]);
+
+static _Atomic uint64_t g_pulse_none_cnt;
+static _Atomic uint64_t g_fwd_noroute_cnt;
+static _Atomic uint64_t g_fwd_drop_cnt;
+static _Atomic uint64_t g_tap_drop_cnt;
+
+#define PRB_KICK_MAX 16
+static pthread_mutex_t g_kick_lk = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t g_kick_lla[PRB_KICK_MAX][16];
+static int g_kick_cnt;
+
+void
+fwd_drop_note (void)
+{
+  atomic_fetch_add_explicit (&g_fwd_drop_cnt, 1, memory_order_relaxed);
+}
+
+void
+fwd_noroute_note (const uint8_t dest_lla[16])
+{
+  atomic_fetch_add_explicit (&g_fwd_noroute_cnt, 1, memory_order_relaxed);
+  if (!dest_lla || lla_is_z (dest_lla))
+    return;
+  pthread_mutex_lock (&g_kick_lk);
+  bool dup = false;
+  for (int i = 0; i < g_kick_cnt; i++)
+    {
+      if (memcmp (g_kick_lla[i], dest_lla, 16) == 0)
+        {
+          dup = true;
+          break;
+        }
+    }
+  if (!dup && g_kick_cnt < PRB_KICK_MAX)
+    {
+      memcpy (g_kick_lla[g_kick_cnt], dest_lla, 16);
+      g_kick_cnt++;
+    }
+  pthread_mutex_unlock (&g_kick_lk);
+}
 static bool is_ip_loopback (const uint8_t ip[16]);
 static void pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re,
                       uint64_t ts, uint64_t sid, bool may_rel);
@@ -612,68 +677,28 @@ typedef struct
   uint8_t peer_lla[16];
   bool has_peer_lla;
   bool want_ckie;
+  uint8_t drop_why;
+  uint8_t drop_rsn;
+  bool rp_known;
+  int aead_fail;
+  const uint8_t *sig;
   uint8_t ckie_pl[IBS_CKIE_PL_SZ];
 } UdpDecRes;
 
-/* Assumes node clocks are synchronized well within two minutes. */
-#define IBS_TS_SKEW_MAX 120000ULL
+#define DROP_WHY_IBS 1
+#define DROP_WHY_RP 2
+#define DROP_WHY_AEAD 3
 
-static uint64_t
-be64_rd (const uint8_t *s)
+static void
+aead_drop_note (Rt *rt, int fail)
 {
-  uint64_t v = 0;
-  for (int i = 0; i < 8; i++)
-    v = (v << 8) | (uint64_t)s[i];
-  return v;
-}
-
-static bool
-ibs_gate_ok (Cry *cry_ctx, const Rt *rt, const uint8_t src_ip[16],
-             uint16_t src_port, bool is_ping, const uint8_t *pl,
-             UdpDecRes *res)
-{
-  const uint8_t *peer_lla = pl + 16;
-  uint8_t bound_lla[16];
-  if (rt_ep_peer_lla (rt, src_ip, src_port, bound_lla)
-      && memcmp (bound_lla, peer_lla, 16) == 0
-      && cry_peer_ready (cry_ctx, peer_lla))
-    return true;
-  if (!is_ping)
-    {
-      uint64_t tok = be64_rd (pl + 42);
-      if (tok == 0)
-        return false;
-      for (uint32_t i = 0; i < rt->cnt; i++)
-        if (memcmp (rt->re_arr[i].lla, peer_lla, 16) == 0
-            && rt->re_arr[i].prb_tok == tok)
-          return true;
-      return false;
-    }
-  uint8_t pl_hash[IBS_CKIE_SZ];
-  ibs_pl_hash (pl, pl_hash);
-  const uint8_t *ckie = pl + IBS_PING_CKIE_OFF;
-  bool has_ckie = false;
-  for (int i = 0; i < IBS_CKIE_SZ; i++)
-    if (ckie[i] != 0)
-      has_ckie = true;
-  uint64_t bucket = wall_ts () / IBS_TS_SKEW_MAX;
-  if (has_ckie)
-    {
-      uint8_t want[IBS_CKIE_SZ];
-      ibs_ckie_calc (cry_ctx->ibs_ckie_key, peer_lla, src_ip, src_port,
-                     pl_hash, bucket, want);
-      if (memcmp (want, ckie, IBS_CKIE_SZ) == 0)
-        return true;
-      ibs_ckie_calc (cry_ctx->ibs_ckie_key, peer_lla, src_ip, src_port,
-                     pl_hash, bucket - 1, want);
-      if (memcmp (want, ckie, IBS_CKIE_SZ) == 0)
-        return true;
-    }
-  ibs_ckie_calc (cry_ctx->ibs_ckie_key, peer_lla, src_ip, src_port, pl_hash,
-                 bucket, res->ckie_pl);
-  memcpy (res->ckie_pl + IBS_CKIE_SZ, pl_hash, IBS_CKIE_SZ);
-  res->want_ckie = true;
-  return false;
+  rt->aead_drop_cnt++;
+  if (fail == PKT_DEC_FAIL_AUTH)
+    rt->aead_au_drop_cnt++;
+  else if (fail == PKT_DEC_FAIL_PRE)
+    rt->aead_pr_drop_cnt++;
+  else
+    rt->aead_un_drop_cnt++;
 }
 
 static bool
@@ -694,11 +719,25 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
       size_t raw_len = pkt_arr[i].data_len;
       bool is_loopback = is_ip_loopback (pkt_arr[i].src_ip);
       res_arr[i].want_ckie = false;
-      bool is_ibs = cry_ctx->auth_ibs && raw_len >= PKT_CH_SZ + IBS_SIG_SZ;
+      res_arr[i].sig = NULL;
+      res_arr[i].dec_res = -1;
+      res_arr[i].drop_why = 0;
+      res_arr[i].drop_rsn = 0;
+      res_arr[i].rp_known = false;
+      res_arr[i].aead_fail = 0;
+      res_arr[i].has_peer_lla = false;
       uint8_t raw_hdr_type = 0;
       if (cry_ctx->auth_ibs && raw_len >= PKT_CH_SZ)
         raw_hdr_type = (uint8_t)(raw[0] & PKT_TF_TYPE_MASK);
-      if (cry_ctx->auth_ibs && raw_hdr_type == PT_IBS_CKIE
+      bool sid_live = cry_ctx->auth_ibs
+                      && (raw_hdr_type == PT_IBS_PING
+                          || raw_hdr_type == PT_IBS_PONG
+                          || raw_hdr_type == PT_IBS_CKIE)
+                      && raw_len >= CRY_NONCE_SID_SZ
+                      && cry_rx_sid_known (cry_ctx, raw);
+      bool is_ibs = cry_ctx->auth_ibs && !sid_live
+                    && raw_len >= PKT_CH_SZ + IBS_SIG_SZ;
+      if (cry_ctx->auth_ibs && !sid_live && raw_hdr_type == PT_IBS_CKIE
           && raw_len == PKT_CH_SZ + IBS_CKIE_PL_SZ)
         {
           res_arr[i].hdr.pkt_type = PT_IBS_CKIE;
@@ -721,34 +760,40 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
               const uint8_t *pl = raw + PKT_CH_SZ;
               const uint8_t *peer_lla = pl + 16;
               const uint8_t *sig = raw + PKT_CH_SZ + pl_sz;
-              if (ibs_gate_ok (cry_ctx, rt, pkt_arr[i].src_ip,
-                                  pkt_arr[i].src_port,
-                                  raw_hdr_type == PT_IBS_PING, pl,
-                                  &res_arr[i])
-                  && ibs_verify (cry_ctx->ibs_mpk, peer_lla, 16, pl, pl_sz,
-                                 sig))
-                {
-                  res_arr[i].hdr.pkt_type = (raw_hdr_type == PT_IBS_PING)
-                                                ? PT_PING
-                                                : PT_PONG;
-                  res_arr[i].hdr.rel_f = 0;
-                  res_arr[i].hdr.hop_c = raw[1];
-                  res_arr[i].pt = raw + PKT_CH_SZ;
-                  res_arr[i].pt_len = pl_sz;
-                  res_arr[i].dec_res = 0;
-                  res_arr[i].used_psk = false;
-                  memcpy (res_arr[i].peer_lla, peer_lla, 16);
-                  res_arr[i].has_peer_lla = IS_LLA_VAL (peer_lla);
-                }
+              memcpy (res_arr[i].peer_lla, peer_lla, 16);
+              res_arr[i].has_peer_lla = IS_LLA_VAL (peer_lla);
+              res_arr[i].sig = sig;
+              {
+                res_arr[i].hdr.pkt_type = (raw_hdr_type == PT_IBS_PING)
+                                              ? PT_PING
+                                              : PT_PONG;
+                res_arr[i].hdr.rel_f = 0;
+                res_arr[i].hdr.hop_c = raw[1];
+                res_arr[i].pt = raw + PKT_CH_SZ;
+                res_arr[i].pt_len = pl_sz;
+                res_arr[i].dec_res = 0;
+                res_arr[i].used_psk = false;
+                memcpy (res_arr[i].peer_lla, peer_lla, 16);
+                res_arr[i].has_peer_lla = IS_LLA_VAL (peer_lla);
+              }
             }
           if (res_arr[i].dec_res == 0)
             continue;
           res_arr[i].dec_res = -1;
+          if (!res_arr[i].want_ckie)
+            res_arr[i].drop_why = DROP_WHY_IBS;
           continue;
         }
-      if (raw_len < PKT_HDR_SZ || (!is_loopback && !rx_rp_chk (raw)))
+      bool rp_fail = raw_len >= PKT_HDR_SZ && !is_loopback
+                     && !rx_rp_chk (raw);
+      if (raw_len < PKT_HDR_SZ || rp_fail)
         {
           res_arr[i].dec_res = -1;
+          if (rp_fail)
+            {
+              res_arr[i].drop_why = DROP_WHY_RP;
+              res_arr[i].rp_known = true;
+            }
           continue;
         }
       uint8_t src_lla[16] = { 0 };
@@ -763,9 +808,13 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
                           pkt_arr[i].data, pkt_arr[i].data_len, NULL, 0,
                           &res_arr[i].hdr, &res_arr[i].pt,
                           &res_arr[i].pt_len,
-                          &res_arr[i].used_psk, res_arr[i].peer_lla);
+                          &res_arr[i].used_psk, res_arr[i].peer_lla,
+                          &res_arr[i].aead_fail);
       if (res_arr[i].dec_res != 0)
-        continue;
+        {
+          res_arr[i].drop_why = DROP_WHY_AEAD;
+          continue;
+        }
       res_arr[i].has_peer_lla = IS_LLA_VAL (res_arr[i].peer_lla);
       if (!psk_dec_ok (res_arr[i].used_psk, is_loopback,
                        res_arr[i].hdr.pkt_type))
@@ -775,9 +824,12 @@ udp_dec_run (Cry *cry_ctx, const Rt *rt, UdpRxPkt pkt_arr[], UdpDecRes res_arr[]
         }
       bool bypass_replay
           = is_loopback && res_arr[i].hdr.pkt_type == PT_STAT_REQ;
-      if (!bypass_replay && !rx_rp_cmt (raw))
+      bool rp_kn = false;
+      if (!bypass_replay && !rx_rp_cmt (raw, &rp_kn))
         {
           res_arr[i].dec_res = -1;
+          res_arr[i].drop_why = DROP_WHY_RP;
+          res_arr[i].rp_known = rp_kn;
           continue;
         }
     }
@@ -851,40 +903,6 @@ rt_re_fnd (Rt *rt, const uint8_t lla[16])
 }
 
 static bool
-rt_static_peer_has (const Rt *rt, const uint8_t peer_lla[16],
-                    const uint8_t src_ip[16], uint16_t src_port)
-{
-  if (!rt)
-    return false;
-  for (uint32_t i = 0; i < rt->cnt; i++)
-    {
-      const Re *re = &rt->re_arr[i];
-      if (re->r2d != 0 || !re->is_static)
-        continue;
-      if (peer_lla && IS_LLA_VAL (peer_lla)
-          && memcmp (re->lla, peer_lla, 16) == 0)
-        return true;
-      if (!src_ip || src_port == 0)
-        continue;
-      if (memcmp (re->ep_ip, src_ip, 16) == 0 && re->ep_port == src_port)
-        return true;
-    }
-  return false;
-}
-
-static bool
-p2p_direct_peer_ok (const Cfg *cfg, const Rt *rt, const TpSrc *tp_src,
-                    const uint8_t src_ip[16], uint16_t src_port)
-{
-  if (!cfg)
-    return false;
-  if (cfg->p2p)
-    return true;
-  return rt_static_peer_has (rt, tp_src ? tp_src->peer_lla : NULL, src_ip,
-                             src_port);
-}
-
-static bool
 ctrl_send (Udp *udp, const Rt *rt, const Cfg *cfg, const TpSrc *tp_src,
            const uint8_t dst_ip[16], uint16_t dst_port, const uint8_t *buf,
            size_t len)
@@ -910,6 +928,26 @@ ctrl_tx_mark (Rt *rt, uint64_t *cnt, size_t len, const uint8_t dst_ip[16],
 }
 
 static void
+pl_u64_wr (uint8_t *dst, uint64_t v)
+{
+  dst[0] = (uint8_t)(v >> 56);
+  dst[1] = (uint8_t)(v >> 48);
+  dst[2] = (uint8_t)(v >> 40);
+  dst[3] = (uint8_t)(v >> 32);
+  dst[4] = (uint8_t)(v >> 24);
+  dst[5] = (uint8_t)(v >> 16);
+  dst[6] = (uint8_t)(v >> 8);
+  dst[7] = (uint8_t)(v);
+}
+
+static void
+pl_u16_wr (uint8_t *dst, uint16_t v)
+{
+  dst[0] = (uint8_t)(v >> 8);
+  dst[1] = (uint8_t)(v);
+}
+
+static void
 pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
           uint64_t sid, bool may_rel)
 {
@@ -924,7 +962,7 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
         {
           uint64_t intv = (re->state == RT_ACT && re->rt_m < RT_F_INF)
                               ? RT_KA_TMO
-                              : um_prb_intv (re_probe_age_ms (re, ts));
+                              : (RT_KA_TMO / 4);
           if (re->hp_ts != 0 && ts >= re->hp_ts && (ts - re->hp_ts) < intv)
             return;
           uint8_t hp_buf[UDP_PL_MAX];
@@ -938,41 +976,248 @@ pulse_tx (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Re *re, uint64_t ts,
                             rd.rel.relay_port, ts);
               re->hp_ts = ts;
             }
+          else if (tp_pick_none (rt, cfg, rd.rel.relay_ip,
+                                  rd.rel.relay_port))
+            atomic_fetch_add_explicit (&g_pulse_none_cnt, 1,
+                                       memory_order_relaxed);
         }
     }
   if (!use_tcp && re->r2d == 0 && re->is_static && re->ep_port != 0)
     (void)tp_probe (rt, cfg, re->ep_ip, re->ep_port);
   if (use_tcp)
     {
-      (void)sid;
       (void)tp_probe (rt, cfg, re->ep_ip, re->ep_port);
+      uint64_t p_ts = sys_ts ();
+      uint64_t w_ts = wall_ts ();
+      bool ae_ok = false;
+      uint8_t ae_ckie[IBS_CKIE_SZ];
+      bool ae_ckie_ok = false;
+      uint64_t p_tok = 0;
+      bool tok_reuse = false;
+      if (cry_ctx->auth_ibs)
+        {
+          Adm *adm = adm_glob ();
+          adm_lock (adm);
+          AdmEnt *ae = adm_fnd (adm, re->lla);
+          if (ae)
+            {
+              ae_ok = true;
+              p_tok = adm_tok_next (ae, p_ts, w_ts);
+              re->prb_tok = ae->tok_cur;
+              re->prb_tok_prv = ae->tok_prv;
+              re->prb_ts = ae->tok_ts;
+              re->prb_wts = ae->tok_wts;
+              if (ae->ckie_in_ok
+                  && memcmp (re->ep_ip, ae->ckie_src_ip, 16) == 0
+                  && re->ep_port == ae->ckie_src_port)
+                {
+                  memcpy (ae_ckie, ae->ckie_in, IBS_CKIE_SZ);
+                  ae_ckie_ok = true;
+                }
+            }
+          adm_unlock (adm);
+        }
+      if (!ae_ok)
+        {
+          tok_reuse = re->prb_tok != 0 && re->prb_ts != 0
+                      && p_ts >= re->prb_ts
+                      && (p_ts - re->prb_ts) < RT_PRB_TMO;
+          p_tok = tok_reuse ? re->prb_tok
+                            : (((uint64_t)u32_rnd () << 32)
+                               | (uint64_t)u32_rnd ());
+        }
+      uint8_t p_buf[UDP_PL_MAX];
+      size_t p_len = 0;
+      if (cry_ctx->auth_ibs)
+        {
+          if (!lla_is_z (re->lla))
+            {
+              uint8_t pl[PING_PL_SZ];
+              pl_u64_wr (pl, w_ts);
+              pl_u64_wr (pl + 8, sid);
+              memcpy (pl + 16, cfg->addr, 16);
+              pl_u16_wr (pl + 32, cfg->port);
+              pl_u64_wr (pl + 34, p_tok);
+              uint8_t phdr[PKT_CH_SZ];
+              hdr_bld (PT_PING, 0, 32, phdr);
+              pkt_enc_to (cry_ctx, re->lla, phdr, pl, sizeof (pl), p_buf,
+                          &p_len);
+            }
+        }
+      else
+        ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok, p_buf,
+                  &p_len);
+      if (p_len > 0
+          && tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, p_buf,
+                           p_len))
+        {
+          ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port,
+                        ts);
+          if (!ae_ok)
+            {
+              re->prb_ts = p_ts;
+              re->prb_wts = w_ts;
+              if (!tok_reuse)
+                {
+                  if (re->prb_tok != 0)
+                    re->prb_tok_prv = re->prb_tok;
+                  re->prb_tok = p_tok;
+                }
+            }
+          rt_prb_tx_note (re, ts);
+        }
+      else if (tp_pick_none (rt, cfg, re->ep_ip, re->ep_port))
+        atomic_fetch_add_explicit (&g_pulse_none_cnt, 1,
+                                   memory_order_relaxed);
+      if (may_rel && p_len > 0 && !lla_is_z (re->lla)
+          && tp_mask_has (cfg->tp_mask, TP_PROTO_UDP))
+        {
+          uint8_t u_buf[UDP_PL_MAX];
+          size_t u_len = 0;
+          const uint8_t *u_ckie = ae_ckie_ok ? ae_ckie : NULL;
+          if (cry_ctx->auth_ibs)
+            ibs_ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok,
+                          cfg->addr, u_ckie, u_buf, &u_len);
+          else
+            ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok, u_buf,
+                      &u_len);
+          if (u_len > 0
+              && udp_tx (udp, re->ep_ip, re->ep_port, u_buf, u_len) == 1
+              && u_ckie)
+            {
+              Adm *adm = adm_glob ();
+              adm_lock (adm);
+              AdmEnt *ae = adm_fnd (adm, re->lla);
+              if (ae && ae->ckie_in_ok
+                  && memcmp (ae->ckie_in, ae_ckie, IBS_CKIE_SZ) == 0
+                  && memcmp (re->ep_ip, ae->ckie_src_ip, 16) == 0
+                  && re->ep_port == ae->ckie_src_port)
+                ae->ckie_in_ok = false;
+              adm_unlock (adm);
+            }
+        }
       return;
     }
   uint8_t p_buf[UDP_PL_MAX];
   size_t p_len = 0;
-  bool ckie_arm = cry_ctx->auth_ibs && re->ibs_ckie_ok;
-  uint64_t p_ts = ckie_arm ? re->prb_ts : sys_ts ();
-  uint64_t w_ts = ckie_arm ? re->prb_wts : wall_ts ();
-  uint64_t p_tok = ckie_arm
-                       ? re->prb_tok
-                       : (((uint64_t)u32_rnd () << 32) | (uint64_t)u32_rnd ());
+  uint64_t p_ts = sys_ts ();
+  uint64_t w_ts = wall_ts ();
+  bool ae_ok = false;
+  uint8_t ae_ckie[IBS_CKIE_SZ];
+  bool ckie_arm = false;
+  const uint8_t *ckie_ptr = NULL;
+  uint64_t p_tok = 0;
+  bool tok_reuse = false;
+  if (cry_ctx->auth_ibs)
+    {
+      Adm *adm = adm_glob ();
+      adm_lock (adm);
+      AdmEnt *ae = adm_fnd (adm, re->lla);
+      if (ae)
+        {
+          ae_ok = true;
+          p_tok = adm_tok_next (ae, p_ts, w_ts);
+          re->prb_tok = ae->tok_cur;
+          re->prb_tok_prv = ae->tok_prv;
+          re->prb_ts = ae->tok_ts;
+          re->prb_wts = ae->tok_wts;
+          if (ae->ckie_in_ok
+              && memcmp (re->ep_ip, ae->ckie_src_ip, 16) == 0
+              && re->ep_port == ae->ckie_src_port)
+            {
+              memcpy (ae_ckie, ae->ckie_in, IBS_CKIE_SZ);
+              ckie_arm = true;
+              ckie_ptr = ae_ckie;
+            }
+        }
+      adm_unlock (adm);
+    }
+  if (!ae_ok)
+    {
+      ckie_arm = cry_ctx->auth_ibs && re->ibs_ckie_ok;
+      ckie_ptr = re->ibs_ckie;
+      tok_reuse = re->prb_tok != 0 && re->prb_ts != 0 && p_ts >= re->prb_ts
+                  && (p_ts - re->prb_ts) < RT_PRB_TMO;
+      p_tok = tok_reuse ? re->prb_tok
+                        : (((uint64_t)u32_rnd () << 32)
+                           | (uint64_t)u32_rnd ());
+    }
   if (cry_ctx->auth_ibs)
     ibs_ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok,
-                  cfg->addr, ckie_arm ? re->ibs_ckie : NULL, p_buf, &p_len);
+                  cfg->addr, ckie_arm ? ckie_ptr : NULL, p_buf, &p_len);
   else
     ping_bld (cry_ctx, cfg->addr, cfg->port, w_ts, sid, p_tok, p_buf, &p_len);
   if (tp_send_ctrl (udp, rt, cfg, re->ep_ip, re->ep_port, p_buf, p_len))
     {
       ctrl_tx_mark (rt, &rt->ping_tx_cnt, p_len, re->ep_ip, re->ep_port, ts);
-      re->prb_ts = p_ts;
-      re->prb_wts = w_ts;
-      re->prb_tok = p_tok;
-      if (cry_ctx->auth_ibs)
-        ibs_pl_hash (p_buf + PKT_CH_SZ, re->prb_hash);
-      if (ckie_arm)
-        re->ibs_ckie_ok = false;
+      if (!ae_ok)
+        {
+          re->prb_ts = p_ts;
+          re->prb_wts = w_ts;
+          if (!tok_reuse)
+            {
+              if (re->prb_tok != 0)
+                re->prb_tok_prv = re->prb_tok;
+              re->prb_tok = p_tok;
+            }
+          if (ckie_arm)
+            re->ibs_ckie_ok = false;
+        }
+      else if (ckie_arm)
+        {
+          Adm *adm = adm_glob ();
+          adm_lock (adm);
+          AdmEnt *ae = adm_fnd (adm, re->lla);
+          if (ae && ae->ckie_in_ok
+              && memcmp (ae->ckie_in, ae_ckie, IBS_CKIE_SZ) == 0)
+            ae->ckie_in_ok = false;
+          adm_unlock (adm);
+        }
       if (!ckie_arm)
         rt_prb_tx_note (re, ts);
+    }
+  else if (tp_pick_none (rt, cfg, re->ep_ip, re->ep_port))
+    atomic_fetch_add_explicit (&g_pulse_none_cnt, 1, memory_order_relaxed);
+}
+
+static void
+prb_kick_drn (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
+              uint64_t ts)
+{
+  uint8_t pend[PRB_KICK_MAX][16];
+  pthread_mutex_lock (&g_kick_lk);
+  int n = g_kick_cnt;
+  if (n > 0)
+    memcpy (pend, g_kick_lla, (size_t)n * 16U);
+  g_kick_cnt = 0;
+  pthread_mutex_unlock (&g_kick_lk);
+  for (int i = 0; i < n; i++)
+    {
+      Re *re = rt_re_fnd (rt, pend[i]);
+      if (!re)
+        {
+          for (uint32_t k = 0; k < rt->cnt; k++)
+            {
+              Re *ue = &rt->re_arr[k];
+              if (ue->r2d != 0 || !lla_is_z (ue->lla) || ue->ep_port == 0)
+                continue;
+              if (ue->state == RT_DED)
+                continue;
+              if (!cfg->p2p && !ue->is_static)
+                continue;
+              pulse_tx (udp, cry_ctx, rt, cfg, ue, ts, sid, true);
+            }
+          continue;
+        }
+      if (re->r2d != 0)
+        continue;
+      if (memcmp (re->lla, cfg->addr, 16) == 0)
+        continue;
+      if (!cfg->p2p && !re->is_static)
+        continue;
+      if (re->state != RT_PND && re->rt_m < RT_F_INF)
+        continue;
+      pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, true);
     }
 }
 
@@ -1417,17 +1662,6 @@ mesh_src_lla_from_ip6 (const uint8_t *frame, size_t frame_len,
   return IS_LLA_VAL (out_lla);
 }
 
-static bool
-rx_direct_src_lla_ok (bool has_src_peer, const uint8_t src_peer_lla[16],
-                      const uint8_t frame_src_lla[16])
-{
-  if (!frame_src_lla || !IS_LLA_VAL (frame_src_lla))
-    return false;
-  if (!has_src_peer)
-    return true;
-  return memcmp (src_peer_lla, frame_src_lla, 16) == 0;
-}
-
 void
 rt_loc_add (Rt *rt, const uint8_t our_lla[16], uint16_t port, uint8_t tp_mask,
             uint64_t now)
@@ -1510,7 +1744,7 @@ static_peers_apply (Rt *rt, PPool *pool, const P *peers, int peer_cnt,
       if (!pool_has_peer (pool, peers[i].ip, peers[i].port))
         {
           int old_cnt = pool->cnt;
-          pp_add (pool, peers[i].ip, peers[i].port);
+          pp_add (pool, peers[i].ip, peers[i].port, ts, true);
           if (pool->cnt > old_cnt)
             add_cnt++;
         }
@@ -1716,6 +1950,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
   udp_inited = true;
   udp_emsg_cb_set (on_udp_emsg);
   udp_unr_cb_set (on_udp_unr);
+  udp_drn_cb_set (on_udp_drn);
   printf ("main: udp bound to port %u\n", act_port);
   rt_loc_add (&rt, cfg.addr, act_port, cfg.tp_mask, sys_ts ());
   if (tp_rt_init (&tp_rt, act_port) != 0)
@@ -1745,6 +1980,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
 
   if (!tap_inline)
     {
+      g_tap_pipe_drn = &tap_pipe;
       if (tap_pipe_init (&tap_pipe, tap_fd, &udp, &cry_ctx, sid) != 0)
         {
           fprintf (stderr, "main: failed to init tap pipeline\n");
@@ -1787,6 +2023,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
       goto out;
     }
   tp_glb_bind (&tp_rt, epfd, &cry_ctx, &cfg, sid);
+  tp_adm_bind (adm_glob (), &adv);
 
   timer_fd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   if (timer_fd < 0)
@@ -1894,7 +2131,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
     printf ("main: type 's' and press enter to view routing table\n");
   fflush (stdout);
 
-  on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool);
+  on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid, &pool, &adv);
   rt_adv_dirty_set (&rt);
   if (!tap_inline)
     {
@@ -1916,7 +2153,8 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
                            .cfg = &cfg,
                            .sid = sid,
                            .pool = &pool,
-                           .adv = &adv };
+                           .adv = &adv,
+                           .adm = adm_glob () };
 
   struct epoll_event ev_arr[EV_MAX];
   while (1)
@@ -1989,7 +2227,7 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
           else if (tok == ID_TMR)
             {
               on_tmr (timer_fd, &udp, &cry_ctx, &rt, &cfg, act_port, sid,
-                      &pool);
+                      &pool, &adv);
               tp_rt_tick (&tp_rt, &rt, &cfg);
               if (!tap_inline)
                 tap_pipe_sync (&tap_pipe, &rt, &cfg, sys_ts ());
@@ -2029,7 +2267,9 @@ loop_run (const char *cfg_path, const Cfg *cfg_in, uint64_t sid,
                 }
             }
         }
-      adv_tick (&udp, &cry_ctx, &rt, &cfg, &adv, sys_ts ());
+      adv_tick (&udp, &cry_ctx, &rt, &cfg, &adv, sys_ts (),
+                cry_ctx.auth_ibs ? adm_glob () : NULL);
+      prb_kick_drn (&udp, &cry_ctx, &rt, &cfg, sid, sys_ts ());
       udp_ep_upd (epfd, udp.fd, udp_w_want (&udp), &u_w_watch);
     }
 
@@ -2738,11 +2978,18 @@ tap_deliver_vnet (int tap_fd, const uint8_t *vnet_frame, size_t vnet_len)
   if (cap)
     {
       if (!tap_write_all (tap_fd, vnet_frame, vnet_len))
-        fprintf (stderr, "loop: gso write to tap failed\n");
+        {
+          atomic_fetch_add_explicit (&g_tap_drop_cnt, 1,
+                                     memory_order_relaxed);
+          fprintf (stderr, "loop: gso write to tap failed\n");
+        }
       return;
     }
   if (!tap_gso_write_segments (tap_fd, vnet_frame, vnet_len, gso_t))
-    fprintf (stderr, "loop: failed to deliver gso frame to tap\n");
+    {
+      atomic_fetch_add_explicit (&g_tap_drop_cnt, 1, memory_order_relaxed);
+      fprintf (stderr, "loop: failed to deliver gso frame to tap\n");
+    }
 }
 
 static bool
@@ -2842,7 +3089,7 @@ tap_tso_par_boot (void)
       pthread_mutex_destroy (&g_tso_par.mtx);
       goto fail_buf;
     }
-  if (pthread_create (&g_tso_par.tid, NULL, tap_tso_par_loop, &g_tso_par) != 0)
+  if (nm_thread_start (&g_tso_par.tid, tap_tso_par_loop, &g_tso_par) != 0)
     {
       pthread_cond_destroy (&g_tso_par.done_cv);
       pthread_cond_destroy (&g_tso_par.cv);
@@ -3006,7 +3253,7 @@ tap_batch_fls (Udp *udp, UdpMsg batch_arr[BATCH_MAX], int *bc, const char *msg)
   if (tx_rc < 0)
     fprintf (stderr, "%s\n", msg);
   *bc = 0;
-  return !udp_w_want (udp);
+  return tx_rc >= 0;
 }
 
 static bool
@@ -3439,7 +3686,11 @@ tap_data_tx_uni (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, uint64_t sid,
       return true;
     }
   if (tx_path_lcl.type == RT_NONE)
-    return true;
+    {
+      if (!lla_is_z (tx_path_lcl.rt_key))
+        fwd_noroute_note (tx_path_lcl.rt_key);
+      return true;
+    }
 
   const uint8_t *tx_ip = tx_path_lcl.tx_ip;
   uint16_t tx_port = tx_path_lcl.tx_port;
@@ -3883,7 +4134,12 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
   uint8_t src_tp_mask = (tp_src && tp_src->is_tcp) ? TP_MASK_TCP : TP_MASK_UDP;
   uint8_t src_peer_lla[16] = { 0 };
   bool has_src_peer = false;
-  if (tp_src && tp_src->is_tcp && IS_LLA_VAL (tp_src->peer_lla))
+  if (ctx->has_id)
+    {
+      memcpy (src_peer_lla, ctx->id_lla, 16);
+      has_src_peer = true;
+    }
+  else if (tp_src && tp_src->is_tcp && IS_LLA_VAL (tp_src->peer_lla))
     {
       memcpy (src_peer_lla, tp_src->peer_lla, 16);
       has_src_peer = true;
@@ -3898,36 +4154,80 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
       has_src_peer = rt_ep_peer_lla (rt, src_ip, src_port, src_peer_lla);
     }
 
+  if (ctx->adm && cry_ctx->auth_ibs && !ctx->has_id && hdr->rel_f == 0
+      && hdr->pkt_type != PT_IBS_CKIE
+      && !(has_src && is_ip_loopback (src_ip)))
+    {
+      bool is_pp = hdr->pkt_type == PT_PING || hdr->pkt_type == PT_PONG;
+      AdjOut out;
+      bool admit = false;
+      if (tp_src && tp_src->is_tcp && is_pp)
+        {
+          adm_judge_ibs (ctx->adm, cry_ctx, rt, ctx->adv, cfg,
+                         hdr->pkt_type, pt, pt_len, NULL,
+                         has_src ? src_ip : NULL, src_port, true, ts, &out);
+          admit = out.res == ADJ_ADMIT;
+        }
+      else if (!is_pp)
+        {
+          const uint8_t *id = NULL;
+          bool has_idv = false;
+          if (tp_src && tp_src->is_tcp && IS_LLA_VAL (tp_src->peer_lla))
+            {
+              id = tp_src->peer_lla;
+              has_idv = true;
+            }
+          else if (dec_peer_lla && IS_LLA_VAL (dec_peer_lla))
+            {
+              id = dec_peer_lla;
+              has_idv = true;
+            }
+          admit = adm_judge_aead (ctx->adm, rt, cfg, id, has_idv,
+                                  has_src ? src_ip : NULL, src_port, ts,
+                                  &out);
+        }
+      else
+        admit = true;
+      if (!admit)
+        return;
+      if (out.has_lla)
+        {
+          memcpy (src_peer_lla, out.lla, 16);
+          has_src_peer = true;
+          memcpy (ctx->id_lla, out.lla, 16);
+          ctx->has_id = true;
+        }
+    }
+
   if (hdr->pkt_type == PT_DATA)
     {
       if (pt_len < VNET_HL + ETH_HLEN)
-        return;
+        {
+          rt->bad_drop_cnt++;
+          return;
+        }
       if (hdr->rel_f == 0)
         {
-          if (!p2p_direct_peer_ok (cfg, rt, tp_src, has_src ? src_ip : NULL,
-                                   src_port))
-            return;
           const uint8_t *frame = pt + VNET_HL;
           uint8_t src_lla[16] = { 0 };
           bool has_frame_src
               = mesh_src_lla_from_frame (frame, cfg->addr, src_lla)
                 || mesh_src_lla_from_ip6 (frame, pt_len - VNET_HL, src_lla);
-          if (!rx_direct_src_lla_ok (has_src_peer, src_peer_lla,
-                                     has_frame_src ? src_lla : NULL))
-            return;
           if (has_src && rt_dat_upd (rt, src_ip, src_port, ts))
             {
               if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
-                  && cfg->p2p)
-                {
-                  rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
-                }
+                  && cfg->p2p && cry_ctx->auth_ibs)
+                adm_evidence (ctx->adm, cfg, src_lla, src_ip, src_port);
+              else if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
+                       && cfg->p2p)
+                rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
             }
           tap_deliver_vnet (tap_fd, pt, pt_len);
           return;
         }
       if (hdr->hop_c <= 1)
         {
+          rt->bad_drop_cnt++;
           fprintf (stderr,
                    "routing: drop: ttl expired, routing loop detected\n");
           return;
@@ -3935,7 +4235,10 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
       uint8_t dest_lla[16] = { 0 };
       const uint8_t *frame = pt + VNET_HL;
       if (!mesh_dst_lla_from_frame (frame, cfg->addr, dest_lla))
-        return;
+        {
+          rt->bad_drop_cnt++;
+          return;
+        }
       if (memcmp (dest_lla, cfg->addr, 16) == 0)
         {
           tap_deliver_vnet (tap_fd, pt, pt_len);
@@ -3961,9 +4264,13 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (hdr->rel_f != 0)
           {
             if (payload_len < 4 + sizeof (FragHdr))
-              break;
+              {
+                rt->bad_drop_cnt++;
+                break;
+              }
             if (hdr->hop_c <= 1)
               {
+                rt->bad_drop_cnt++;
                 fprintf (stderr,
                          "routing: drop: ttl expired, routing loop detected\n");
                 break;
@@ -3974,7 +4281,10 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
             payload_len -= 4;
           }
         if (payload_len < sizeof (FragHdr))
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         uint32_t msg_id = ((uint32_t)payload[0] << 24)
                           | ((uint32_t)payload[1] << 16)
                           | ((uint32_t)payload[2] << 8)
@@ -3994,20 +4304,24 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                               (uint8_t)(hdr->hop_c - 1), ts, src_ip, src_port);
             break;
           }
-        if (hdr->rel_f == 0
-            && !p2p_direct_peer_ok (cfg, rt, tp_src,
-                                    has_src ? src_ip : NULL, src_port))
-          break;
         if (!has_src)
           break;
         if (frag_off > FRAG_DATA_MAX)
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         uint16_t full_len = 0;
         uint8_t *full_l3
             = frag_asm (src_ip, msg_id, frag_off, mf, chunk, chunk_len,
                         &full_len);
-        if (!full_l3 || full_len < VNET_HL + ETH_HLEN)
+        if (!full_l3)
           break;
+        if (full_len < VNET_HL + ETH_HLEN)
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         const uint8_t *frame = full_l3 + VNET_HL;
         uint8_t src_lla[16] = { 0 };
         bool has_frame_src
@@ -4015,16 +4329,14 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
               || mesh_src_lla_from_ip6 (frame, full_len - VNET_HL, src_lla);
         if (hdr->rel_f == 0)
           {
-            if (!rx_direct_src_lla_ok (has_src_peer, src_peer_lla,
-                                       has_frame_src ? src_lla : NULL))
-              break;
             if (rt_dat_upd (rt, src_ip, src_port, ts))
               {
                 if (has_frame_src && memcmp (src_lla, cfg->addr, 16) != 0
-                    && cfg->p2p)
-                  {
-                    rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
-                  }
+                    && cfg->p2p && cry_ctx->auth_ibs)
+                  adm_evidence (ctx->adm, cfg, src_lla, src_ip, src_port);
+                else if (has_frame_src
+                         && memcmp (src_lla, cfg->addr, 16) != 0 && cfg->p2p)
+                  rt_ep_upd (rt, src_lla, src_ip, src_port, src_tp_mask, ts);
               }
           }
         tap_deliver_vnet (tap_fd, full_l3, full_len);
@@ -4037,7 +4349,10 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         uint32_t probe_id = 0;
         uint16_t probe_mtu = 0;
         if (nbr_prs_mtu_prb (pt, pt_len, &probe_id, &probe_mtu) != 0)
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         static uint8_t ack_buf[UDP_PL_MAX];
         size_t ack_len = 0;
         mtu_ack_bld (cry_ctx, probe_id, probe_mtu,
@@ -4058,7 +4373,10 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         uint32_t probe_id = 0;
         uint16_t probe_mtu = 0;
         if (nbr_prs_mtu_prb (pt, pt_len, &probe_id, &probe_mtu) != 0)
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         rt_pmtu_ack_ep (rt, src_ip, src_port, probe_id, probe_mtu, ts);
         break;
       }
@@ -4087,32 +4405,54 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (on_ping (pt, pt_len, &req_ts, &peer_sid, peer_lla, NULL,
                      &prb_tok)
             != 0)
-          break;
-        if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         uint64_t pong_wts = wall_ts ();
         const uint8_t *peer_pk = on_ping_kx (pt, pt_len);
-        if (peer_pk)
+        if (peer_pk && !cry_ctx->auth_ibs)
           (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
         if (tp_src && tp_src->is_tcp && prb_tok != 0)
           {
             static uint8_t pong_buf[UDP_PL_MAX];
-            size_t pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid,
-                                            pong_wts, prb_tok, pong_buf);
-            (void)ctrl_send (udp, rt, cfg, tp_src, has_src ? src_ip : NULL,
-                              src_port, pong_buf, pong_len);
+            size_t pong_len = 0;
+            if (cry_ctx->auth_ibs)
+              {
+                uint8_t pl[PONG_PL_SZ];
+                pl_u64_wr (pl, req_ts);
+                pl_u64_wr (pl + 8, sid);
+                memcpy (pl + 16, cfg->addr, 16);
+                pl_u16_wr (pl + 32, cfg->port);
+                pl_u64_wr (pl + 34, pong_wts);
+                pl_u64_wr (pl + 42, prb_tok);
+                uint8_t phdr[PKT_CH_SZ];
+                hdr_bld (PT_PONG, 0, 32, phdr);
+                pkt_enc_to (cry_ctx, peer_lla, phdr, pl, sizeof (pl),
+                            pong_buf, &pong_len);
+              }
+            else
+              pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid, pong_wts,
+                                       prb_tok, pong_buf);
+            if (pong_len > 0)
+              (void)ctrl_send (udp, rt, cfg, tp_src,
+                               has_src ? src_ip : NULL, src_port, pong_buf,
+                               pong_len);
             break;
           }
-        if (hdr->rel_f == 0
-            && !p2p_direct_peer_ok (cfg, rt, tp_src,
-                                    has_src ? src_ip : NULL, src_port))
-          break;
-        (void)rt_peer_sess (rt, peer_lla, peer_sid, ts);
-        if (hdr->rel_f == 0 && has_src)
-          rt_ep_upd (rt, peer_lla, src_ip, src_port, src_tp_mask, ts);
+        if (!cry_ctx->auth_ibs)
+          {
+            {
+              Re *sre = rt_dir_ent (rt, peer_lla);
+              if (sre && peer_sid != 0 && sre->sid != peer_sid)
+                rt_adm_sess (rt, peer_lla, peer_sid, ts);
+            }
+            if (hdr->rel_f == 0 && has_src)
+              rt_ep_upd (rt, peer_lla, src_ip, src_port, src_tp_mask, ts);
+          }
         if (cfg->p2p && hdr->rel_f == 0 && has_src
             && !p_is_me (rt, cfg->addr, src_ip, src_port))
-          pp_add (pool, src_ip, src_port);
+          pp_add (pool, src_ip, src_port, ts, true);
         static uint8_t pong_buf[UDP_PL_MAX];
         size_t pong_len = pong_bld_any (cry_ctx, cfg, req_ts, sid, pong_wts,
                                         prb_tok, pong_buf);
@@ -4120,24 +4460,6 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                        pong_buf, pong_len))
           ctrl_tx_mark (rt, &rt->pong_tx_cnt, pong_len,
                         has_src ? src_ip : NULL, src_port, ts);
-        break;
-      }
-    case PT_IBS_CKIE:
-      {
-        if (pt_len < IBS_CKIE_PL_SZ)
-          break;
-        for (uint32_t i = 0; i < rt->cnt; i++)
-          {
-            Re *re = &rt->re_arr[i];
-            if (re->r2d != 0 || re->prb_tok == 0)
-              continue;
-            if (memcmp (re->prb_hash, pt + IBS_CKIE_SZ, IBS_CKIE_SZ) != 0)
-              continue;
-            memcpy (re->ibs_ckie, pt, IBS_CKIE_SZ);
-            re->ibs_ckie_ok = true;
-            if (re->ep_port != 0 && re->state != RT_DED)
-              pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
-          }
         break;
       }
     case PT_PONG:
@@ -4150,21 +4472,23 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         if (on_pong (pt, pt_len, &req_ts, &peer_sid, peer_lla, NULL,
                      &peer_rx_ts, &prb_tok)
             != 0)
-          break;
-        if (has_src_peer && memcmp (src_peer_lla, peer_lla, 16) != 0)
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         const uint8_t *peer_pk = on_pong_kx (pt, pt_len);
-        if (peer_pk)
+        if (peer_pk && !cry_ctx->auth_ibs)
           (void)cry_peer_rekey (cry_ctx, cfg->addr, peer_lla, peer_pk);
-        if (tp_src && tp_src->is_tcp && prb_tok != 0)
-          break;
-        if (hdr->rel_f == 0
-            && !p2p_direct_peer_ok (cfg, rt, tp_src,
-                                    has_src ? src_ip : NULL, src_port))
-          break;
-        (void)rt_peer_sess (rt, peer_lla, peer_sid, ts);
-        if (hdr->rel_f == 0 && has_src)
-          rt_ep_upd (rt, peer_lla, src_ip, src_port, src_tp_mask, ts);
+        if (!cry_ctx->auth_ibs)
+          {
+            {
+              Re *sre = rt_dir_ent (rt, peer_lla);
+              if (sre && peer_sid != 0 && sre->sid != peer_sid)
+                rt_adm_sess (rt, peer_lla, peer_sid, ts);
+            }
+            if (hdr->rel_f == 0 && has_src)
+              rt_ep_upd (rt, peer_lla, src_ip, src_port, src_tp_mask, ts);
+          }
         uint64_t wnow = wall_ts ();
         uint32_t rtt = (uint32_t)(wnow >= req_ts ? (wnow - req_ts) : 0);
         if (rtt == 0)
@@ -4173,25 +4497,29 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
         int64_t fwd_obs
             = has_fwd ? (int64_t)peer_rx_ts - (int64_t)req_ts : 0;
         if (!rt_ping_sample_upd (rt, peer_lla, prb_tok, rtt, fwd_obs,
-                                 has_fwd, ts)
+                                 has_fwd,
+                                 (hdr->rel_f == 0 && has_src) ? src_ip
+                                                              : NULL,
+                                 src_port, ts)
             && has_src)
           rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, fwd_obs,
                       has_fwd, ts);
         if (cfg->p2p && hdr->rel_f == 0 && has_src
             && !p_is_me (rt, cfg->addr, src_ip, src_port))
-          pp_add (pool, src_ip, src_port);
+          pp_add (pool, src_ip, src_port, ts, true);
         break;
       }
     case PT_ADV_UPD:
       {
         if (!has_src || !has_src_peer)
           break;
-        if (!p2p_direct_peer_ok (cfg, rt, tp_src, src_ip, src_port))
-          break;
         uint32_t ack_seq = 0;
         int arc = adv_on_upd (ctx->adv, src_peer_lla, pt, pt_len, &ack_seq);
         if (arc < 0)
-          break;
+          {
+            rt->bad_drop_cnt++;
+            break;
+          }
         if (arc == 0)
           {
             bool is_mod = false;
@@ -4222,6 +4550,9 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
           on_hp (pt, pt_len, cry_ctx, udp, rt, cfg, cfg->addr, sid, ts);
         break;
       }
+    default:
+      rt->bad_drop_cnt++;
+      break;
     }
 }
 
@@ -4240,8 +4571,18 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   bool has_src = rx_src_ep_get (src, NULL, 0, src_ip, &src_port);
 
   bool is_loopback = is_ip_loopback (src_ip);
-  if (len < PKT_HDR_SZ || (!is_loopback && !rx_rp_chk (frame)))
-    return false;
+  bool rp_fail = len >= PKT_HDR_SZ && !is_loopback && !rx_rp_chk (frame);
+  if (len < PKT_HDR_SZ || rp_fail)
+    {
+      if (rp_fail && ctx->rt)
+        {
+          ctx->rt->rp_drop_cnt++;
+          ctx->rt->rp_kn_drop_cnt++;
+        }
+      else if (ctx->rt)
+        ctx->rt->oth_drop_cnt++;
+      return false;
+    }
 
   static _Thread_local uint8_t pt_buf[TP_VNET_MAX + PKT_CH_SZ];
   PktHdr hdr;
@@ -4249,16 +4590,36 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   size_t pt_len = 0;
   bool used_psk = false;
   uint8_t dec_peer_lla[16] = { 0 };
+  int aead_fail = 0;
   if (pkt_dec_from (ctx->cry_ctx, src && src->is_tcp ? src->peer_lla : NULL,
                     (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr, &pt,
-                    &pt_len, &used_psk, dec_peer_lla)
+                    &pt_len, &used_psk, dec_peer_lla, &aead_fail)
       != 0)
-    return false;
+    {
+      if (ctx->rt)
+        aead_drop_note (ctx->rt, aead_fail);
+      return false;
+    }
   if (!psk_dec_ok (used_psk, is_loopback, hdr.pkt_type))
-    return false;
+    {
+      if (ctx->rt)
+        ctx->rt->oth_drop_cnt++;
+      return false;
+    }
   bool bypass_replay = is_loopback && hdr.pkt_type == PT_STAT_REQ;
-  if (!bypass_replay && !rx_rp_cmt (frame))
-    return false;
+  bool rp_kn = false;
+  if (!bypass_replay && !rx_rp_cmt (frame, &rp_kn))
+    {
+      if (ctx->rt)
+        {
+          ctx->rt->rp_drop_cnt++;
+          if (rp_kn)
+            ctx->rt->rp_kn_drop_cnt++;
+          else
+            ctx->rt->rp_un_drop_cnt++;
+        }
+      return false;
+    }
   if (has_src)
     {
       static _Thread_local uint8_t last_ack_ip[16];
@@ -4277,6 +4638,13 @@ on_tcp_frame (const uint8_t *frame, size_t len, const TpSrc *src, void *arg)
   return true;
 }
 
+static void
+adm_seed_once (const Cry *cry_ctx, Rt *rt, const Cfg *cfg, PPool *pool)
+{
+  if (cry_ctx->auth_ibs)
+    adm_seed (adm_glob (), rt, cfg, pool);
+}
+
 void
 on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         uint64_t sid, PPool *pool, Adv *adv)
@@ -4290,10 +4658,12 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                     .cfg = cfg,
                     .sid = sid,
                     .pool = pool,
-                    .adv = adv };
+                    .adv = adv,
+                    .adm = adm_glob () };
   int rc = udp_rx_pkt_arr (udp, pkt_arr, BATCH_MAX);
   if (rc <= 0)
     return;
+  adm_seed_once (cry_ctx, rt, cfg, pool);
   udp_dec_run (cry_ctx, rt, pkt_arr, dec_arr, rc);
   uint64_t ts = sys_ts ();
   frag_reap_tk (ts);
@@ -4310,18 +4680,80 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
       PktHdr *hdr = &dec_arr[i].hdr;
       uint8_t *pt = dec_arr[i].pt;
       size_t pt_len = dec_arr[i].pt_len;
-      if (dec_arr[i].want_ckie)
+      if (dec_arr[i].dec_res != 0)
         {
-          rt->ckie_fail_cnt++;
-          uint8_t cbuf[PKT_CH_SZ + IBS_CKIE_PL_SZ];
-          hdr_bld (PT_IBS_CKIE, 0, 32, cbuf);
-          memcpy (cbuf + PKT_CH_SZ, dec_arr[i].ckie_pl, IBS_CKIE_PL_SZ);
-          (void)tp_send_ctrl (udp, rt, cfg, src_ip, src_port, cbuf,
-                              sizeof (cbuf));
+          if (dec_arr[i].drop_why == DROP_WHY_IBS)
+            {
+              {
+                Adm *adm = adm_glob ();
+                adm_lock (adm);
+                adm->drop_oth++;
+                adm_unlock (adm);
+              }
+              rt->ibs_drop_cnt++;
+            }
+          else if (dec_arr[i].drop_why == DROP_WHY_RP)
+            {
+              rt->rp_drop_cnt++;
+              if (dec_arr[i].rp_known)
+                rt->rp_kn_drop_cnt++;
+              else
+                rt->rp_un_drop_cnt++;
+            }
+          else if (dec_arr[i].drop_why == DROP_WHY_AEAD)
+            aead_drop_note (rt, dec_arr[i].aead_fail);
+          else
+            rt->oth_drop_cnt++;
           continue;
         }
-      if (dec_arr[i].dec_res != 0)
-        continue;
+      if (hdr->pkt_type == PT_IBS_CKIE)
+        {
+          adm_on_ckie (adm_glob (), src_ip, src_port, pt, pt_len);
+          if (pt_len >= IBS_CKIE_PL_SZ)
+            {
+              for (uint32_t ri = 0; ri < rt->cnt; ri++)
+                {
+                  Re *re = &rt->re_arr[ri];
+                  if (re->r2d != 0)
+                    continue;
+                  if (memcmp (re->ep_ip, src_ip, 16) != 0
+                      || re->ep_port != src_port)
+                    continue;
+                  memcpy (re->ibs_ckie, pt, IBS_CKIE_SZ);
+                  re->ibs_ckie_ok = true;
+                }
+            }
+          continue;
+        }
+      ctx.has_id = false;
+      if (cry_ctx->auth_ibs
+          && (hdr->pkt_type == PT_PING || hdr->pkt_type == PT_PONG))
+        {
+          AdjOut out;
+          adm_judge_ibs (adm_glob (), cry_ctx, rt, adv, cfg,
+                         hdr->pkt_type, pt, pt_len, dec_arr[i].sig,
+                         src_ip, src_port, false, ts, &out);
+          if (out.res == ADJ_CHAL)
+            {
+              uint8_t cbuf[PKT_CH_SZ + IBS_CKIE_PL_SZ];
+              hdr_bld (PT_IBS_CKIE, 0, 32, cbuf);
+              memcpy (cbuf + PKT_CH_SZ, out.ckie_pl, IBS_CKIE_PL_SZ);
+              if (!tp_send_ctrl (udp, rt, cfg, src_ip, src_port, cbuf,
+                                 sizeof (cbuf)))
+                rt->ckie_fail_cnt++;
+              continue;
+            }
+          if (out.res == ADJ_DROP)
+            {
+              rt->ibs_drop_cnt++;
+              continue;
+            }
+          if (out.has_lla)
+            {
+              memcpy (ctx.id_lla, out.lla, 16);
+              ctx.has_id = true;
+            }
+        }
       if (!has_last_src || src_port != last_src_port
           || memcmp (src_ip, last_src_ip, 16) != 0)
         {
@@ -4336,24 +4768,6 @@ on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                      pkt_len, hdr, pt, pt_len, ts);
     }
   gro_fls_all (tap_fd);
-}
-
-static uint64_t
-um_prb_intv (uint64_t age_ms)
-{
-  if (age_ms < UM_PRB_A1)
-    return UM_PRB_I1;
-  if (age_ms < UM_PRB_A2)
-    return UM_PRB_I2;
-  if (age_ms < UM_PRB_A3)
-    return UM_PRB_I3;
-  if (age_ms < UM_PRB_A4)
-    return UM_PRB_I4;
-  if (age_ms < UM_PRB_A5)
-    return UM_PRB_I5;
-  if (age_ms < UM_PRB_A6)
-    return UM_PRB_I6;
-  return UM_PRB_IMAX;
 }
 
 static void
@@ -4382,7 +4796,7 @@ ctrl_rate_upd (Rt *rt, uint64_t ts)
 
 void
 on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-        uint16_t act_port, uint64_t sid, PPool *pool)
+        uint16_t act_port, uint64_t sid, PPool *pool, Adv *adv)
 {
   uint8_t exp_buf[8];
   if (read (timer_fd, exp_buf, sizeof (exp_buf)) < 0)
@@ -4406,6 +4820,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
     }
   rt_prn_st (rt, cfg, ts);
   rt_src_gc (rt, ts);
+  pp_gc (pool, ts);
   {
     static const uint8_t z_lla[16] = { 0 };
     for (int i = 0; i < pool->cnt; i++)
@@ -4428,11 +4843,13 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
                          || re->rt_m >= RT_F_INF;
       if (needs_probe)
         {
-          uint64_t intv = um_prb_intv (re_probe_age_ms (re, ts));
-          if (re->pnd_ts > 0 && ts >= re->pnd_ts && (ts - re->pnd_ts) < intv)
+          if (re->prb_ts > 0 && ts >= re->prb_ts
+              && (ts - re->prb_ts) < (RT_KA_TMO / 4))
+            continue;
+          if (re->unp_ts > 0 && ts > re->unp_ts
+              && (ts - re->unp_ts) > RT_CAND_AGE)
             continue;
           pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, true);
-          re->pnd_ts = ts;
           continue;
         }
 
@@ -4440,10 +4857,13 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
         continue;
       if (tap_tx_use_tcp (rt, cfg, re->ep_ip, re->ep_port))
         continue;
-      uint64_t prb_intv = RT_KA_TMO;
+      uint64_t prb_intv = RT_PRB_INTV;
       bool prb_due = !(re->prb_ts > 0 && ts >= re->prb_ts
                        && (ts - re->prb_ts) < prb_intv);
       if (!prb_due)
+        continue;
+      if (re->unp_ts > 0 && ts > re->unp_ts
+          && (ts - re->unp_ts) > RT_CAND_AGE)
         continue;
       pulse_tx (udp, cry_ctx, rt, cfg, re, ts, sid, false);
     }
@@ -4475,6 +4895,9 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
             rt_tx_ack (rt, prb_re.ep_ip, prb_re.ep_port, ts);
         }
     }
+  adm_seed_once (cry_ctx, rt, cfg, pool);
+  if (cry_ctx->auth_ibs)
+    adm_tick (adm_glob (), rt, cry_ctx, adv, cfg, ts);
   ctrl_rate_upd (rt, ts);
 }
 
@@ -4700,6 +5123,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
           char peer[INET6_ADDRSTRLEN];
           char ep[64];
           char st[10];
+          char adm[24];
           char mtu[40];
           char rtt[16];
           char loss[16];
@@ -4716,6 +5140,7 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
           }
         int w_peer = 4, w_ep = 2, w_lst = 5, w_lmtu = 3,
             w_lrtt = 3, w_lloss = 4;
+        int w_ladm = 3;
         for (int k = 0; k < l_cnt; k++)
           {
             const Re *re = lre[k];
@@ -4725,6 +5150,19 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             strcpy (lr->st, re->state == RT_ACT   ? "active"
                             : re->state == RT_PND ? "pending"
                                                   : "via");
+            {
+              AdmSt ast = ADM_UNKNOWN;
+              {
+                Adm *adm = adm_glob ();
+                adm_lock (adm);
+                AdmEnt *ae = adm_fnd (adm, re->lla);
+                if (ae)
+                  ast = ae->st;
+                adm_unlock (adm);
+              }
+              snprintf (lr->adm, sizeof (lr->adm), "adm=%s",
+                        adm_st_name (ast));
+            }
             if (re->mtu_ukb > re->mtu_lkg)
               snprintf (lr->mtu, sizeof (lr->mtu), "[%u, %u]",
                         re->mtu_lkg, re->mtu_ukb);
@@ -4746,6 +5184,8 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               w_ep = (int)strlen (lr->ep);
             if ((int)strlen (lr->st) > w_lst)
               w_lst = (int)strlen (lr->st);
+            if ((int)strlen (lr->adm) > w_ladm)
+              w_ladm = (int)strlen (lr->adm);
             if ((int)strlen (lr->mtu) > w_lmtu)
               w_lmtu = (int)strlen (lr->mtu);
             if ((int)strlen (lr->rtt) > w_lrtt)
@@ -4753,14 +5193,14 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
             if ((int)strlen (lr->loss) > w_lloss)
               w_lloss = (int)strlen (lr->loss);
           }
-        STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer, "peer",
-                    w_ep, "ep", w_lst, "state", w_lmtu, "mtu", w_lrtt,
-                    "rtt", w_lloss, "loss");
+        STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer,
+                    "peer", w_ep, "ep", w_lst, "state", w_ladm, "adm",
+                    w_lmtu, "mtu", w_lrtt, "rtt", w_lloss, "loss");
         for (int k = 0; k < l_cnt; k++)
-          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer,
+          STATUS_PUT ("%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", w_peer,
                       lrows[k].peer, w_ep, lrows[k].ep, w_lst, lrows[k].st,
-                      w_lmtu, lrows[k].mtu, w_lrtt, lrows[k].rtt, w_lloss,
-                      lrows[k].loss);
+                      w_ladm, lrows[k].adm, w_lmtu, lrows[k].mtu, w_lrtt,
+                      lrows[k].rtt, w_lloss, lrows[k].loss);
         free (lrows);
       }
     free (lre);
@@ -4885,7 +5325,9 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
 
   STATUS_PUT ("fib: active: %d/%u, static: %d, unmapped: %d\n", act_map_cnt,
               (uint32_t)rt->cnt, pool->cnt, um_cnt);
-  STATUS_PUT ("ctrl: adv_tx=%llu ping_tx=%llu pong_tx=%llu hp_tx=%llu now_tx=%s now_rx=%s avg_tx=%s avg_rx=%s tx=%s rx=%s ckie_fail=%llu\n",
+  uint64_t udp_drops[4];
+  udp_drop_get (udp_drops);
+  STATUS_PUT ("ctrl: adv_tx=%llu ping_tx=%llu pong_tx=%llu hp_tx=%llu now_tx=%s now_rx=%s avg_tx=%s avg_rx=%s tx=%s rx=%s ckie_fail=%llu ibs_drop=%llu rp_drop=%llu aead_drop=%llu pulse_none=%llu noroute=%llu oth_drop=%llu bad_drop=%llu fwd_drop=%llu tap_drop=%llu gro_drop=%llu frag_drop=%llu tcp_drop=%llu utx_qdrop=%llu utx_edrop=%llu utx_xdrop=%llu urx_ovf=%llu rp_kn_drop=%llu rp_un_drop=%llu aead_un_drop=%llu aead_au_drop=%llu aead_pr_drop=%llu\n",
               (unsigned long long)rt->adv_tx_cnt,
               (unsigned long long)rt->ping_tx_cnt,
               (unsigned long long)rt->pong_tx_cnt,
@@ -4893,7 +5335,61 @@ status_emit_core (int fd, char *buf, size_t cap, Rt *rt, const Cfg *cfg,
               ctrl_now_tx_str,
               ctrl_now_rx_str, ctrl_avg_tx_str, ctrl_avg_rx_str,
               ctrl_tx_str, ctrl_rx_str,
-              (unsigned long long)rt->ckie_fail_cnt);
+              (unsigned long long)rt->ckie_fail_cnt,
+              (unsigned long long)rt->ibs_drop_cnt,
+              (unsigned long long)rt->rp_drop_cnt,
+              (unsigned long long)rt->aead_drop_cnt,
+              (unsigned long long)atomic_load_explicit (
+                  &g_pulse_none_cnt, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit (
+                  &g_fwd_noroute_cnt, memory_order_relaxed),
+              (unsigned long long)rt->oth_drop_cnt,
+              (unsigned long long)rt->bad_drop_cnt,
+              (unsigned long long)atomic_load_explicit (
+                  &g_fwd_drop_cnt, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit (
+                  &g_tap_drop_cnt, memory_order_relaxed),
+              (unsigned long long)gro_drop_get (),
+              (unsigned long long)frag_drop_get (),
+              (unsigned long long)tp_drop_get (),
+              (unsigned long long)udp_drops[0],
+              (unsigned long long)udp_drops[1],
+              (unsigned long long)udp_drops[2],
+              (unsigned long long)udp_drops[3],
+              (unsigned long long)rt->rp_kn_drop_cnt,
+              (unsigned long long)rt->rp_un_drop_cnt,
+              (unsigned long long)rt->aead_un_drop_cnt,
+              (unsigned long long)rt->aead_au_drop_cnt,
+              (unsigned long long)rt->aead_pr_drop_cnt);
+  {
+    Adm *adm = adm_glob ();
+    adm_lock (adm);
+    for (uint32_t ai = 0; ai < adm->cnt; ai++)
+      {
+        AdmEnt *e = &adm->arr[ai];
+        if (e->chal_cnt == 0 && e->drop_ibs == 0 && e->drop_tok == 0
+            && e->drop_ckie == 0 && e->drop_state == 0)
+          continue;
+        char adm_lla[INET6_ADDRSTRLEN];
+        inet_ntop (AF_INET6, e->lla, adm_lla, sizeof (adm_lla));
+        STATUS_PUT ("ctrl: adm_peer=%s sid=%llx chal=%llu drop_ibs=%llu "
+                    "drop_tok=%llu drop_ckie=%llu "
+                    "drop_state=%llu ep_sw=%llu\n",
+                    adm_lla, (unsigned long long)e->sid,
+                    (unsigned long long)e->chal_cnt,
+                    (unsigned long long)e->drop_ibs,
+                    (unsigned long long)e->drop_tok,
+                    (unsigned long long)e->drop_ckie,
+                    (unsigned long long)e->drop_state,
+                    (unsigned long long)e->ep_sw);
+      }
+    if (adm->drop_oth > 0 || adm->chal_oth > 0 || adm->drop_ckie_oth > 0)
+      STATUS_PUT ("ctrl: adm_oth drop=%llu chal=%llu ckie=%llu\n",
+                  (unsigned long long)adm->drop_oth,
+                  (unsigned long long)adm->chal_oth,
+                  (unsigned long long)adm->drop_ckie_oth);
+    adm_unlock (adm);
+  }
   if (r_cnt > 0)
     {
       STATUS_PUT ("routes:\n");

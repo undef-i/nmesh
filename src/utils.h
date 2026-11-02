@@ -19,21 +19,6 @@ _Static_assert (FRAG_OFF_MASK * FRAG_OFF_UNIT >= TAP_F_MAX,
 #define ID_TAP_NOTE 6
 #define TICK_INTV 1
 #define UPD_TK 30
-/* Age thresholds are the cumulative sums of the doubling intervals. */
-#define UM_PRB_I1 2000ULL
-#define UM_PRB_I2 4000ULL
-#define UM_PRB_I3 8000ULL
-#define UM_PRB_I4 16000ULL
-#define UM_PRB_I5 32000ULL
-#define UM_PRB_I6 64000ULL
-#define UM_PRB_IMAX 120000ULL
-#define UM_PRB_A1 (UM_PRB_I1)
-#define UM_PRB_A2 (UM_PRB_A1 + UM_PRB_I2)
-#define UM_PRB_A3 (UM_PRB_A2 + UM_PRB_I3)
-#define UM_PRB_A4 (UM_PRB_A3 + UM_PRB_I4)
-#define UM_PRB_A5 (UM_PRB_A4 + UM_PRB_I5)
-#define UM_PRB_A6 (UM_PRB_A5 + UM_PRB_I6)
-
 extern uint32_t g_frag_mid;
 extern uint32_t g_rnd_st;
 
@@ -42,15 +27,6 @@ uint64_t wall_ts (void);
 uint32_t u32_rnd (void);
 bool rt_gw_fnd (const Rt *rt, const uint8_t our_lla[16], bool static_only,
                 uint8_t out_ip[16], uint16_t *out_port);
-
-static inline uint64_t
-re_probe_age_ms (const Re *re, uint64_t now)
-{
-  if (!re || re->rx_ts == 0 || now <= re->rx_ts)
-    return 0;
-  return now - re->rx_ts;
-}
-
 
 static inline int32_t
 re_m (const Re *re)

@@ -1,4 +1,6 @@
 #pragma once
+typedef struct Adm Adm;
+typedef struct Adv Adv;
 #include "config.h"
 #include "crypto.h"
 #include "route.h"
@@ -136,6 +138,8 @@ typedef struct
   uint32_t flow_cap;
   uint32_t tx_qd_cnt;
   uint32_t tx_bp_cnt;
+  uint8_t *cb_buf;
+  uint32_t cb_cap;
 } TpRt;
 
 typedef bool (*TpFrameFn) (const uint8_t *frame, size_t len, const TpSrc *src,
@@ -144,11 +148,10 @@ typedef bool (*TpFrameFn) (const uint8_t *frame, size_t len, const TpSrc *src,
 int tp_rt_init (TpRt *tp, uint16_t port);
 void tp_rt_free (TpRt *tp);
 int tp_rt_listen_fd_get (const TpRt *tp);
+void tp_adm_bind (Adm *adm, Adv *adv);
 void tp_glb_bind (TpRt *tp, int epfd, Cry *cry_ctx, const Cfg *cfg,
                   uint64_t sid);
 void tp_glb_unbind (void);
-bool tp_alive_get (const uint8_t peer_lla[16], const uint8_t ip[16],
-                   uint16_t port);
 bool tp_send (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len);
 bool tp_send_flow (Udp *udp, const Rt *rt, const Cfg *cfg,
@@ -157,6 +160,8 @@ bool tp_send_flow (Udp *udp, const Rt *rt, const Cfg *cfg,
 bool tp_send_ctrl (Udp *udp, const Rt *rt, const Cfg *cfg,
                    const uint8_t ip[16], uint16_t port, const uint8_t *data,
                    size_t len);
+bool tp_pick_none (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
+                   uint16_t port);
 bool tp_probe (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
                uint16_t port);
 bool tp_send_fd (int fd, const uint8_t *data, size_t len);
@@ -165,6 +170,7 @@ void tp_batch_end (void);
 bool tp_tx_pending (void);
 bool tp_w_want (void);
 void tp_rt_tick (TpRt *tp, Rt *rt, const Cfg *cfg);
+uint64_t tp_drop_get (void);
 void tp_rt_accept_ready (TpRt *tp, int epfd);
 void tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
                        const Cfg *cfg, TpFrameFn cb, void *cb_arg);

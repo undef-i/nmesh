@@ -33,10 +33,13 @@ uint8_t *stat_rsp_bld (Cry *s, uint32_t req_id, uint64_t total_len,
 int pkt_dec (Cry *s, uint8_t *raw, size_t raw_len, uint8_t *pt_buf,
              size_t pt_len, PktHdr *hdr_out, uint8_t **pt_out,
              size_t *pt_len_out);
+#define PKT_DEC_FAIL_PRE 1
+#define PKT_DEC_FAIL_UNK 2
+#define PKT_DEC_FAIL_AUTH 3
 int pkt_dec_from (Cry *s, const uint8_t src_lla[16], uint8_t *raw,
                   size_t raw_len, uint8_t *pt_buf, size_t pt_len,
                   PktHdr *hdr_out, uint8_t **pt_out, size_t *pt_len_out,
-                  bool *used_psk, uint8_t matched_lla[16]);
+                  bool *used_psk, uint8_t matched_lla[16], int *fail);
 int pkt_prs_stat_req (const uint8_t *pt, size_t pt_len, uint32_t *req_id);
 int pkt_prs_stat_rsp (const uint8_t *pt, size_t pt_len, uint32_t *req_id,
                       uint64_t *off, uint64_t *total_len,

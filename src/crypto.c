@@ -739,6 +739,17 @@ cry_peer_rekey (Cry *s, const uint8_t our_lla[16],
 }
 
 bool
+cry_rx_sid_known (Cry *s, const uint8_t sid[CRY_NONCE_SID_SZ])
+{
+  if (!s || !sid)
+    return false;
+  pthread_mutex_lock (&s->mtx);
+  bool ok = cry_peer_fnd_rx_sid_locked (s, sid) != NULL;
+  pthread_mutex_unlock (&s->mtx);
+  return ok;
+}
+
+bool
 cry_peer_ready (Cry *s, const uint8_t peer_lla[16])
 {
   bool ok = false;
@@ -749,6 +760,25 @@ cry_peer_ready (Cry *s, const uint8_t peer_lla[16])
   ok = p && p->ready;
   pthread_mutex_unlock (&s->mtx);
   return ok;
+}
+
+void
+cry_peer_drop (Cry *s, const uint8_t peer_lla[16])
+{
+  if (!s || !cry_lla_ok (peer_lla))
+    return;
+  pthread_mutex_lock (&s->mtx);
+  for (uint32_t i = 0; i < s->peer_cnt; i++)
+    {
+      if (memcmp (s->peer_arr[i].lla, peer_lla, 16) != 0)
+        continue;
+      sodium_memzero (&s->peer_arr[i], sizeof (CryPeer));
+      if (i + 1 < s->peer_cnt)
+        s->peer_arr[i] = s->peer_arr[s->peer_cnt - 1];
+      s->peer_cnt--;
+      break;
+    }
+  pthread_mutex_unlock (&s->mtx);
 }
 
 void
@@ -823,10 +853,12 @@ cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
               size_t ct_len, const uint8_t *ad, size_t ad_len,
               const uint8_t nonce[CRY_NONCE_WIRE_SZ],
               const uint8_t mac[CRY_MAC_SZ], uint8_t *pt,
-              uint8_t matched_lla[16])
+              uint8_t matched_lla[16], bool *sid_hit)
 {
   if (matched_lla)
     memset (matched_lla, 0, 16);
+  if (sid_hit)
+    *sid_hit = false;
   if (s)
     {
       uint8_t key[32];
@@ -847,6 +879,8 @@ cry_dec_from (Cry *s, const uint8_t src_lla[16], const uint8_t *ct,
           memcpy (key, p->rx_key, sizeof (key));
           memcpy (lla, p->lla, sizeof (lla));
           keyed = true;
+          if (sid_hit)
+            *sid_hit = true;
         }
       pthread_mutex_unlock (&s->mtx);
       if (keyed)

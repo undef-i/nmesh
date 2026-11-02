@@ -1,4 +1,5 @@
 #include "forward.h"
+#include "loop.h"
 #include "frag.h"
 #include "nbr.h"
 #include "pkt.h"
@@ -112,18 +113,26 @@ fwd_resolve (Rt *rt, const Cfg *cfg, const uint8_t dest_lla[16],
 {
   memset (fp, 0, sizeof (*fp));
   if (!rt_nh_get (rt, cfg, dest_lla, &fp->dec, fp->tx_ip, &fp->tx_port))
-    return false;
+    {
+      fwd_noroute_note (dest_lla);
+      return false;
+    }
   fp->has_tx_lla = rt_nh_lla_get (rt, &fp->dec, dest_lla, fp->tx_ip,
                                   fp->tx_port, fp->tx_lla);
   if (src_ip && memcmp (fp->tx_ip, src_ip, 16) == 0
       && fp->tx_port == src_port)
-    return false;
+    {
+      fwd_drop_note ();
+      return false;
+    }
   fp->pmtu = rt_mtu (rt, &fp->dec);
   fp->use_tcp = tx_path_use_tcp (rt, cfg, fp->tx_ip, fp->tx_port);
   fp->max_vnet = fp->use_tcp ? tp_vnet_cap_get ()
                              : tnl_vnet_cap_get (fp->pmtu, fp->tx_ip);
   fp->chunk_max = fp->use_tcp ? pkt_frag_pl_cap_get (true)
                               : tnl_frag_pl_cap_get (fp->max_vnet, true);
+  if (fp->chunk_max == 0)
+    fwd_drop_note ();
   return fp->chunk_max != 0;
 }
 

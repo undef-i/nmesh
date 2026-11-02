@@ -1,5 +1,7 @@
 #include "tcp.h"
+#include "adm.h"
 #include "nbr.h"
+#include "ibs.h"
 #include "pkt.h"
 #include "packet.h"
 #include "replay.h"
@@ -23,6 +25,8 @@
 static TpRt *g_tp_rt = NULL;
 static int g_tp_epfd = -1;
 static Cry *g_tp_cry = NULL;
+static Adm *g_tp_adm = NULL;
+static Adv *g_tp_adv = NULL;
 static const Cfg *g_tp_cfg = NULL;
 static uint64_t g_tp_sid = 0;
 static uint64_t g_tp_conn_last_warn_ts = 0;
@@ -458,6 +462,34 @@ tp_ping_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
              const uint8_t kx_pk[TP_KX_PUB_SZ], uint8_t *buf,
              size_t *out_len)
 {
+  if (s->auth_ibs)
+    {
+      uint8_t payload[TP_PING_KX_PL_SZ];
+      tp_u64_wr (payload, ts);
+      tp_u64_wr (payload + 8, sid);
+      memcpy (payload + 16, our_lla, 16);
+      tp_u16_wr (payload + 32, our_port);
+      tp_u64_wr (payload + 34, prb_tok);
+      memcpy (payload + PING_PL_SZ, cry_kx_pub (s), CRY_KX_PUB_SZ);
+      memcpy (payload + PING_PL_SZ + CRY_KX_PUB_SZ, kx_pk, TP_KX_PUB_SZ);
+      uint8_t sig[IBS_SIG_SZ];
+      if (!ibs_sign (s->ibs_sk, our_lla, 16, payload, sizeof (payload), sig))
+        {
+          *out_len = 0;
+          return NULL;
+        }
+      uint8_t hdr[PKT_CH_SZ];
+      hdr_bld (PT_IBS_PING, 0, 32, hdr);
+      memcpy (buf, hdr, PKT_CH_SZ);
+      memcpy (buf + PKT_CH_SZ, payload, sizeof (payload));
+      memcpy (buf + PKT_CH_SZ + sizeof (payload), sig, IBS_SIG_SZ);
+      size_t pad_len = tp_auth_pad_len (TP_PING_KX_PL_SZ);
+      if (pad_len > 0)
+        randombytes_buf (buf + PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ,
+                         pad_len);
+      *out_len = PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ + pad_len;
+      return buf;
+    }
   uint8_t payload[PKT_PT_MAX];
   tp_u64_wr (payload, ts);
   tp_u64_wr (payload + 8, sid);
@@ -480,6 +512,35 @@ tp_pong_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
              const uint8_t kx_pk[TP_KX_PUB_SZ], uint8_t *buf,
              size_t *out_len)
 {
+  if (s->auth_ibs)
+    {
+      uint8_t payload[TP_PONG_KX_PL_SZ];
+      tp_u64_wr (payload, o_ts);
+      tp_u64_wr (payload + 8, sid);
+      memcpy (payload + 16, our_lla, 16);
+      tp_u16_wr (payload + 32, our_port);
+      tp_u64_wr (payload + 34, rx_ts);
+      tp_u64_wr (payload + 42, prb_tok);
+      memcpy (payload + PONG_PL_SZ, cry_kx_pub (s), CRY_KX_PUB_SZ);
+      memcpy (payload + PONG_PL_SZ + CRY_KX_PUB_SZ, kx_pk, TP_KX_PUB_SZ);
+      uint8_t sig[IBS_SIG_SZ];
+      if (!ibs_sign (s->ibs_sk, our_lla, 16, payload, sizeof (payload), sig))
+        {
+          *out_len = 0;
+          return NULL;
+        }
+      uint8_t hdr[PKT_CH_SZ];
+      hdr_bld (PT_IBS_PONG, 0, 32, hdr);
+      memcpy (buf, hdr, PKT_CH_SZ);
+      memcpy (buf + PKT_CH_SZ, payload, sizeof (payload));
+      memcpy (buf + PKT_CH_SZ + sizeof (payload), sig, IBS_SIG_SZ);
+      size_t pad_len = tp_auth_pad_len (TP_PONG_KX_PL_SZ);
+      if (pad_len > 0)
+        randombytes_buf (buf + PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ,
+                         pad_len);
+      *out_len = PKT_CH_SZ + sizeof (payload) + IBS_SIG_SZ + pad_len;
+      return buf;
+    }
   uint8_t payload[PKT_PT_MAX];
   tp_u64_wr (payload, o_ts);
   tp_u64_wr (payload + 8, sid);
@@ -1322,6 +1383,8 @@ tp_conn_close (TpRt *tp, int epfd, TpConn *conn)
 {
   if (!tp || !conn)
     return;
+  if (g_tp_adm && conn->auth && IS_LLA_VAL (conn->peer_lla))
+    adm_tcp_close (g_tp_adm, conn->peer_lla);
   uint32_t idx = tp_conn_idx (tp, conn);
   int fd = conn->fd;
   tp_conn_txq_forget (tp, conn);
@@ -1866,13 +1929,19 @@ tp_conn_auth_finish (TpRt *tp, int epfd, TpConn *conn, Rt *rt,
       memcpy (conn->route_ip, conn->sock_ip, 16);
       conn->route_port = peer_port;
     }
+  int fd = conn->fd;
+  uint32_t slot_idx = conn->slot_idx;
   uint64_t now = sys_ts ();
-  if (rt)
-    (void)rt_peer_sess (rt, peer_lla, peer_sid, now);
-  if (rt && conn->route_port != 0 && !tp_ip_is_zero (conn->route_ip))
+  if (g_tp_cry && g_tp_cry->auth_ibs && g_tp_adm
+      && conn->route_port != 0 && !tp_ip_is_zero (conn->route_ip))
+    adm_tcp_auth (g_tp_adm, g_tp_cry, rt, g_tp_adv, cfg, peer_lla,
+                  conn->route_ip, conn->route_port, peer_sid, now);
+  else if (rt && conn->route_port != 0 && !tp_ip_is_zero (conn->route_ip))
     rt_ep_upd (rt, peer_lla, conn->route_ip, conn->route_port, TP_MASK_TCP,
                now);
-  uint32_t slot_idx = conn->slot_idx;
+  if (!tp_conn_slot_live (tp, slot_idx, conn)
+      || tp_conn_by_fd (tp, fd) != conn)
+    return false;
   memcpy (conn->peer_lla, peer_lla, 16);
   if (conn->inbound && !tp_salt_rp_commit (conn->wire_salt, now))
     {
@@ -1913,10 +1982,48 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
   PktHdr hdr;
   uint8_t *pt = NULL;
   size_t pt_len = 0;
-  if (pkt_dec (g_tp_cry, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf), &hdr,
-               &pt, &pt_len)
-      != 0)
-    return TP_AUTH_FAIL;
+  const uint8_t *wire_kx = NULL;
+  const uint8_t *sess_kx = NULL;
+  memset (&hdr, 0, sizeof (hdr));
+  if (g_tp_cry->auth_ibs)
+    {
+      if (len < PKT_CH_SZ)
+        return TP_AUTH_FAIL;
+      uint8_t raw_type = (uint8_t)(frame[0] & PKT_TF_TYPE_MASK);
+      size_t pl_sz;
+      if (raw_type == PT_IBS_PING)
+        {
+          hdr.pkt_type = PT_PING;
+          pl_sz = TP_PING_KX_PL_SZ;
+        }
+      else if (raw_type == PT_IBS_PONG)
+        {
+          hdr.pkt_type = PT_PONG;
+          pl_sz = TP_PONG_KX_PL_SZ;
+        }
+      else
+        return TP_AUTH_FAIL;
+      if (len < PKT_CH_SZ + pl_sz + IBS_SIG_SZ)
+        return TP_AUTH_FAIL;
+      pt = (uint8_t *)frame + PKT_CH_SZ;
+      pt_len = pl_sz;
+      if (!ibs_verify (g_tp_cry->ibs_mpk, pt + 16, 16, pt, pl_sz,
+                       frame + PKT_CH_SZ + pl_sz))
+        return TP_AUTH_FAIL;
+      size_t base = (hdr.pkt_type == PT_PING) ? PING_PL_SZ : PONG_PL_SZ;
+      sess_kx = pt + base;
+      wire_kx = pt + base + CRY_KX_PUB_SZ;
+    }
+  else
+    {
+      if (pkt_dec (g_tp_cry, (uint8_t *)frame, len, pt_buf, sizeof (pt_buf),
+                   &hdr, &pt, &pt_len)
+          != 0)
+        return TP_AUTH_FAIL;
+      size_t base = (hdr.pkt_type == PT_PING) ? PING_PL_SZ : PONG_PL_SZ;
+      wire_kx = pt + base;
+      sess_kx = pt + base + TP_KX_PUB_SZ;
+    }
   uint8_t peer_lla[16] = { 0 };
   uint64_t peer_sid = 0;
   uint16_t peer_port = 0;
@@ -1930,10 +2037,9 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
           || prb_tok == 0 || pt_len < TP_PING_KX_PL_SZ
           || !tp_kx_ensure (conn))
         return TP_AUTH_FAIL;
-      memcpy (conn->wire_peer_pk, pt + PING_PL_SZ, TP_KX_PUB_SZ);
+      memcpy (conn->wire_peer_pk, wire_kx, TP_KX_PUB_SZ);
       conn->wire_peer_kx_ready = true;
-      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
-                            pt + PING_PL_SZ + TP_KX_PUB_SZ);
+      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla, sess_kx);
       uint8_t pong_buf[UDP_PL_MAX];
       size_t pong_len = 0;
       tp_pong_bld (g_tp_cry, cfg->addr, cfg->port, req_ts, g_tp_sid,
@@ -1952,10 +2058,9 @@ tp_conn_auth (TpRt *tp, int epfd, TpConn *conn, Rt *rt, const Cfg *cfg,
           || prb_tok == 0 || prb_tok != conn->auth_tok
           || pt_len < TP_PONG_KX_PL_SZ)
         return TP_AUTH_FAIL;
-      memcpy (conn->wire_peer_pk, pt + PONG_PL_SZ, TP_KX_PUB_SZ);
+      memcpy (conn->wire_peer_pk, wire_kx, TP_KX_PUB_SZ);
       conn->wire_peer_kx_ready = true;
-      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla,
-                            pt + PONG_PL_SZ + TP_KX_PUB_SZ);
+      (void)cry_peer_rekey (g_tp_cry, cfg->addr, peer_lla, sess_kx);
     }
   else
     {
@@ -1975,6 +2080,13 @@ tp_pick_proto (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
   if (!cfg || !ip || port == 0)
     return TP_PROTO_NONE;
   return cfg_tp_pick (cfg, rt_ep_tp_mask (rt, ip, port));
+}
+
+bool
+tp_pick_none (const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
+              uint16_t port)
+{
+  return tp_pick_proto (rt, cfg, ip, port) == TP_PROTO_NONE;
 }
 
 static bool
@@ -2142,6 +2254,9 @@ tp_rt_free (TpRt *tp)
   tp->flow_arr = NULL;
   tp->flow_cnt = 0;
   tp->flow_cap = 0;
+  free (tp->cb_buf);
+  tp->cb_buf = NULL;
+  tp->cb_cap = 0;
   tp_send_cache_reset (tp);
   if (tp->listen_fd >= 0)
     close (tp->listen_fd);
@@ -2175,8 +2290,17 @@ tp_glb_bind (TpRt *tp, int epfd, Cry *cry_ctx, const Cfg *cfg, uint64_t sid)
 }
 
 void
+tp_adm_bind (Adm *adm, Adv *adv)
+{
+  g_tp_adm = adm;
+  g_tp_adv = adv;
+}
+
+void
 tp_glb_unbind (void)
 {
+  g_tp_adm = NULL;
+  g_tp_adv = NULL;
   g_tp_rt = NULL;
   g_tp_epfd = -1;
   g_tp_cry = NULL;
@@ -2185,19 +2309,6 @@ tp_glb_unbind (void)
   g_tp_owner_set = false;
 }
 
-bool
-tp_alive_get (const uint8_t peer_lla[16], const uint8_t ip[16], uint16_t port)
-{
-  if (!g_tp_rt || !peer_lla || !ip || port == 0 || tp_lla_is_zero (peer_lla))
-    return false;
-  tp_lock (g_tp_rt);
-  TpConn *conn = tp_conn_by_peer (g_tp_rt, peer_lla);
-  bool ok = conn && conn->fd >= 0 && conn->st == TP_ST_ESTABLISHED
-            && conn->auth && memcmp (conn->route_ip, ip, 16) == 0
-            && conn->route_port == port;
-  tp_unlock (g_tp_rt);
-  return ok;
-}
 
 bool
 tp_send_fd (int fd, const uint8_t *data, size_t len)
@@ -2317,6 +2428,20 @@ tp_conn_open (const uint8_t ip[16], uint16_t port,
   return conn;
 }
 
+static _Atomic uint64_t g_tp_drop_cnt;
+
+static void
+tp_drop_note (void)
+{
+  atomic_fetch_add_explicit (&g_tp_drop_cnt, 1, memory_order_relaxed);
+}
+
+uint64_t
+tp_drop_get (void)
+{
+  return atomic_load_explicit (&g_tp_drop_cnt, memory_order_relaxed);
+}
+
 static bool
 tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
               uint16_t port, const uint8_t *data, size_t len, bool hi,
@@ -2332,7 +2457,10 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
       return udp_tx (udp, ip, port, data, len) == 1;
     }
   if (!g_tp_rt || g_tp_epfd < 0 || !g_tp_cry || !g_tp_cfg)
-    return false;
+    {
+      tp_drop_note ();
+      return false;
+    }
 
   tp_lock (g_tp_rt);
   uint8_t peer_lla[16] = { 0 };
@@ -2371,6 +2499,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
       bool ok = tp_conn_tx_frame (g_tp_rt, g_tp_epfd, conn, data, len, hi);
       if (!ok)
         {
+          tp_drop_note ();
           tp_conn_close (g_tp_rt, g_tp_epfd, conn);
           tp_unlock (g_tp_rt);
           return false;
@@ -2384,6 +2513,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
                                  now);
   if (!n_conn)
     {
+      tp_drop_note ();
       tp_unlock (g_tp_rt);
       return false;
     }
@@ -2392,6 +2522,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
                             n_conn, now);
   if (!tp_conn_tx_frame (g_tp_rt, g_tp_epfd, n_conn, data, len, hi))
     {
+      tp_drop_note ();
       tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
@@ -2400,6 +2531,7 @@ tp_send_kind (Udp *udp, const Rt *rt, const Cfg *cfg, const uint8_t ip[16],
     tp_send_cache_note (g_tp_rt, n_conn);
   if (!tp_ev_add (g_tp_epfd, n_conn))
     {
+      tp_drop_note ();
       tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
@@ -2469,6 +2601,7 @@ tp_probe (const Rt *rt, const Cfg *cfg, const uint8_t ip[16], uint16_t port)
   TpConn *n_conn = tp_conn_open (ip, port, peer_lla, has_peer, 0, sys_ts ());
   if (!n_conn)
     {
+      tp_drop_note ();
       tp_unlock (g_tp_rt);
       return false;
     }
@@ -2476,6 +2609,7 @@ tp_probe (const Rt *rt, const Cfg *cfg, const uint8_t ip[16], uint16_t port)
     tp_send_cache_note (g_tp_rt, n_conn);
   if (!tp_ev_add (g_tp_epfd, n_conn))
     {
+      tp_drop_note ();
       tp_conn_close (g_tp_rt, g_tp_epfd, n_conn);
       tp_unlock (g_tp_rt);
       return false;
@@ -2605,6 +2739,24 @@ tp_rt_accept_ready (TpRt *tp, int epfd)
   tp_unlock (tp);
 }
 
+static bool
+tp_cb_rsv (TpRt *tp, uint32_t need)
+{
+  if (need == 0)
+    need = 1;
+  if (tp->cb_cap >= need)
+    return true;
+  uint32_t cap = tp->cb_cap ? tp->cb_cap : 4096;
+  while (cap < need)
+    cap *= 2;
+  uint8_t *buf = realloc (tp->cb_buf, cap);
+  if (!buf)
+    return false;
+  tp->cb_buf = buf;
+  tp->cb_cap = cap;
+  return true;
+}
+
 void
 tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
                   const Cfg *cfg, TpFrameFn cb, void *cb_arg)
@@ -2732,6 +2884,7 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
       uint32_t plain_len = 0;
       if (!tp_wire_decode_len (conn, conn->hdr_buf, &plain_len))
         {
+          tp_drop_note ();
           if (conn->auth)
             tp_conn_close (tp, epfd, conn);
           else
@@ -2782,7 +2935,14 @@ tp_rt_conn_ready (TpRt *tp, int epfd, int fd, uint32_t events, Rt *rt,
           memcpy (src.peer_lla, conn->peer_lla, 16);
           memcpy (src.route_ip, conn->route_ip, 16);
           src.route_port = conn->route_port;
-          frame_ptr = plain;
+          if (!tp_cb_rsv (tp, plain_len))
+            {
+              tp_conn_close (tp, epfd, conn);
+              tp_unlock (tp);
+              return;
+            }
+          memcpy (tp->cb_buf, plain, plain_len);
+          frame_ptr = tp->cb_buf;
           frame_len = plain_len;
           have_frame = true;
         }

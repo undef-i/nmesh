@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 
+typedef struct Adm Adm;
+
 typedef struct
 {
   uint8_t lla[16];
@@ -42,7 +44,7 @@ void adv_free (Adv *a);
 AdvSes *adv_ses_get (Adv *a, const uint8_t lla[16], uint64_t sid);
 void adv_ses_drop (Adv *a, const uint8_t lla[16]);
 void adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
-               uint64_t now);
+               uint64_t now, const Adm *adm);
 int adv_on_upd (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,
                 size_t pt_len, uint32_t *ack_seq);
 int adv_on_ack (Adv *a, const uint8_t src_lla[16], const uint8_t *pt,

@@ -21,6 +21,9 @@
 #ifndef SIOCSIFTXQLEN
 #define SIOCSIFTXQLEN 0x8943U
 #endif
+#ifndef SIOCGIFHWADDR
+#define SIOCGIFHWADDR 0x8927U
+#endif
 #define IFF_TAP 0x0002
 #define IFF_NO_PI 0x1000
 #define IFF_VNET_HDR 0x4000
@@ -251,6 +254,22 @@ tap_init (const char *name)
   return fd;
 }
 
+static int
+tap_mac_read (const char *name, uint8_t mac[6])
+{
+  int sock = socket (AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0)
+    return -1;
+  struct ifreq r;
+  memset (&r, 0, sizeof (r));
+  strncpy (r.ifr_name, name, IFNAMSIZ - 1);
+  int rc = ioctl (sock, SIOCGIFHWADDR, &r);
+  if (rc == 0)
+    memcpy (mac, r.ifr_hwaddr.sa_data, 6);
+  close (sock);
+  return rc < 0 ? -1 : 0;
+}
+
 int
 tap_addr_set (const char *name, const uint8_t lla[16])
 {
@@ -270,6 +289,26 @@ tap_addr_set (const char *name, const uint8_t lla[16])
                         (char *)name, "address", mac_str, NULL };
   if (tap_ip_run (addr_argv, "set address", name, NULL, 0) != 0)
     return -1;
+  {
+    char *settle_argv[] = { "udevadm", "settle", NULL };
+    (void)tap_ip_run (settle_argv, NULL, name, NULL, 0);
+  }
+  {
+    uint8_t cur[6];
+    if (tap_mac_read (name, cur) != 0)
+      return -1;
+    if (memcmp (cur, mac, 6) != 0)
+      {
+        if (tap_ip_run (addr_argv, "set address", name, NULL, 0) != 0)
+          return -1;
+        if (tap_mac_read (name, cur) != 0 || memcmp (cur, mac, 6) != 0)
+          {
+            fprintf (stderr,
+                     "tap: mac of %s is not the configured value\n", name);
+            return -1;
+          }
+      }
+  }
   char *mc_argv[] = { "ip",   "link",      "set", "dev",
                       (char *)name, "multicast", "on",  NULL };
   if (tap_ip_run (mc_argv, "enable multicast", name, NULL, 0) != 0)

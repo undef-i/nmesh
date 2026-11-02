@@ -48,6 +48,8 @@ typedef void (*LoopReadyFn) (void *arg);
 void on_udp_emsg (const uint8_t dst_ip[16], uint16_t dst_port,
                   size_t atmpt_plen);
 void on_udp_unr (const uint8_t dst_ip[16], uint16_t dst_port);
+void fwd_noroute_note (const uint8_t dest_lla[16]);
+void fwd_drop_note (void);
 void udp_ep_upd (int epfd, int udp_fd, bool w_want, bool *w_watch);
 int tap_pipe_init (TapPipe *tap_pipe, int tap_fd, Udp *udp, Cry *cry_ctx,
                    uint64_t sid);
@@ -71,7 +73,7 @@ struct Adv;
 void on_udp (int tap_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
              uint64_t sid, PPool *pool, struct Adv *adv);
 void on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
-             uint16_t act_port, uint64_t sid, PPool *pool);
+             uint16_t act_port, uint64_t sid, PPool *pool, struct Adv *adv);
 size_t status_buf_bld (char *buf, size_t cap, Rt *rt, const Cfg *cfg,
                        PPool *pool);
 void status_fd_emit (int fd, Rt *rt, const Cfg *cfg, PPool *pool);

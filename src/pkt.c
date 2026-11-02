@@ -296,24 +296,35 @@ int
 pkt_dec_from (Cry *s, const uint8_t src_lla[16], uint8_t *raw, size_t raw_len,
               uint8_t *pt_buf, size_t pt_len, PktHdr *hdr_out,
               uint8_t **pt_out, size_t *pt_len_out,
-              bool *used_psk, uint8_t matched_lla[16])
+              bool *used_psk, uint8_t matched_lla[16], int *fail)
 {
   const uint8_t *nonce, *mac, *ct;
   size_t ct_len;
   uint8_t *pt;
+  if (fail)
+    *fail = 0;
   if (pkt_dec_prep (raw, raw_len, pt_buf, pt_len, &nonce, &mac, &ct,
                     &ct_len, &pt)
       != 0)
-    return -1;
+    {
+      if (fail)
+        *fail = PKT_DEC_FAIL_PRE;
+      return -1;
+    }
   bool psk = false;
   if (matched_lla)
     memset (matched_lla, 0, 16);
+  bool sid_hit = false;
   if (cry_dec_from (s, src_lla, ct, ct_len, NULL, 0, nonce, mac, pt,
-                    matched_lla)
+                    matched_lla, &sid_hit)
       != 0)
     {
       if (cry_dec (s, ct, ct_len, NULL, 0, nonce, mac, pt) != 0)
-        return -1;
+        {
+          if (fail)
+            *fail = sid_hit ? PKT_DEC_FAIL_AUTH : PKT_DEC_FAIL_UNK;
+          return -1;
+        }
       psk = true;
     }
   if (used_psk)

@@ -61,6 +61,7 @@ typedef void (*UdpEmsgsizeCallback) (const uint8_t dst_ip[16],
                                      uint16_t dst_port, size_t atmpt_plen);
 typedef void (*UdpUnreachCallback) (const uint8_t dst_ip[16],
                                     uint16_t dst_port);
+typedef void (*UdpDrainCallback) (void);
 int udp_init (Udp *s, uint16_t *port);
 void udp_free (Udp *s);
 int udp_tx_arr (Udp *s, UdpMsg *msgs, int cnt);
@@ -69,9 +70,11 @@ int udp_tx (Udp *s, const uint8_t dst_ip[16], uint16_t dst_port,
             const uint8_t *data, size_t data_len);
 void udp_emsg_cb_set (UdpEmsgsizeCallback cb);
 void udp_unr_cb_set (UdpUnreachCallback cb);
+void udp_drn_cb_set (UdpDrainCallback cb);
 bool udp_w_want (Udp *s);
 int udp_w_hnd (Udp *s);
 bool udp_rx_pending (const Udp *s);
 uint16_t udp_host_mtu_max (void);
 uint16_t udp_ep_mtu_get (const uint8_t dst_ip[16]);
 int udp_err_rd (Udp *s, uint8_t dst_ip[16], uint16_t *dst_port, uint16_t *mtu);
+void udp_drop_get (uint64_t out[4]);

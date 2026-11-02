@@ -1,4 +1,5 @@
 #include "adv.h"
+#include "adm.h"
 #include "bogon.h"
 #include "utils.h"
 #include "nbr.h"
@@ -329,7 +330,7 @@ adv_ack_bld (Cry *s, uint32_t seq, const uint8_t dst_lla[16], uint8_t *buf,
 
 void
 adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
-          uint64_t now)
+          uint64_t now, const Adm *adm)
 {
   bool rev_changed = (rt->sync_rev != a->last_rev);
   for (uint32_t i = 0; i < rt->cnt; i++)
@@ -343,6 +344,17 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
         continue;
       if (re->ep_port == 0)
         continue;
+      if (adm)
+        {
+          bool adm_ok = false;
+          Adm *adm_nc = (Adm *)adm;
+          adm_lock (adm_nc);
+          AdmEnt *ae = adm_fnd (adm_nc, re->lla);
+          adm_ok = ae && (ae->st == ADM_ADMITTED || ae->st == ADM_SUSPECT);
+          adm_unlock (adm_nc);
+          if (!adm_ok)
+            continue;
+        }
       AdvSes *ses = adv_ses_get (a, re->lla, re->sid);
       if (!ses)
         continue;
@@ -466,20 +478,20 @@ adv_tick (Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg, Adv *a,
       free (ch);
       free (set);
     }
-  for (uint32_t i = 0; i < a->cnt;)
-    {
-      bool has_dir = false;
-      for (uint32_t j = 0; j < rt->cnt; j++)
-        {
-          if (rt->re_arr[j].r2d == 0
-              && memcmp (rt->re_arr[j].lla, a->ses[i].lla, 16) == 0)
-            has_dir = true;
-        }
-      if (!has_dir)
-        adv_ses_drop (a, a->ses[i].lla);
-      else
-        i++;
-    }
+  if (adm)
+    for (uint32_t i = 0; i < a->cnt;)
+      {
+        bool adm_ok = false;
+        Adm *adm_nc = (Adm *)adm;
+        adm_lock (adm_nc);
+        AdmEnt *ae = adm_fnd (adm_nc, a->ses[i].lla);
+        adm_ok = ae && (ae->st == ADM_ADMITTED || ae->st == ADM_SUSPECT);
+        adm_unlock (adm_nc);
+        if (!adm_ok)
+          adv_ses_drop (a, a->ses[i].lla);
+        else
+          i++;
+      }
   a->last_rev = rt->sync_rev;
 }
 
@@ -742,7 +754,7 @@ ent_bld (Rt *rt, const Re *re, const uint8_t our_lla[16],
     ent_strip_dir (out);
   else if (!dir_hint_ok)
     ent_strip_dir (out);
-  if (!is_z && !(out->flags & ADV_F_SEL_DIR))
+  if (!is_z && re->r2d != 0 && !(out->flags & ADV_F_SEL_DIR))
     {
       memset (out->ep_ip, 0, 16);
       out->ep_port = 0;
@@ -778,7 +790,7 @@ adv_set_bld (Rt *rt, const uint8_t our_lla[16], bool self_dir_ok,
               && re->ep_port == dec.rel.relay_port
               && memcmp (re->nhop_lla, dec.rel.relay_lla, 16) == 0)
             is_sel = true;
-          if (!is_sel)
+          if (!is_sel && re->r2d != 0)
             continue;
         }
       memset (&out[n], 0, sizeof (AdvEnt));
@@ -787,6 +799,25 @@ adv_set_bld (Rt *rt, const uint8_t our_lla[16], bool self_dir_ok,
       n++;
     }
   return n;
+}
+
+static bool
+set_has_sel_dir (const uint8_t *pt, size_t pt_len, uint16_t cnt,
+                 const uint8_t lla[16])
+{
+  size_t off = 2;
+  for (uint16_t i = 0; i < cnt; i++)
+    {
+      AdvEnt se;
+      int sc = adv_ent_des (&se, pt + off, pt_len - off);
+      if (sc < 0)
+        return false;
+      off += (size_t)sc;
+      if ((se.flags & ADV_F_SEL_DIR) != 0
+          && memcmp (se.lla, lla, 16) == 0)
+        return true;
+    }
+  return false;
 }
 
 int
@@ -844,7 +875,7 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
                          sys_ts);
               if (pool)
                 {
-                  pp_add (pool, ent.ep_ip, ent.ep_port);
+                  pp_add (pool, ent.ep_ip, ent.ep_port, sys_ts, false);
                 }
             }
           continue;
@@ -899,9 +930,14 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
       bool eff_no_dir = no_dir || (!is_s_owner && rt_src_no_dir (rt, ent.lla));
       bool is_s_self = (memcmp (ent.ep_ip, src_ip, 16) == 0
                         && ent.ep_port == src_port);
+      bool cand_only = !is_s_owner && !is_s_self && has_dir_hint
+                       && ent.path_len == 2
+                       && (ent.flags & ADV_F_SEL_DIR) == 0;
+      if (cand_only)
+        cand_only = set_has_sel_dir (pt, pt_len, cnt, ent.lla);
       if (eff_no_dir && !is_s_self)
         rt_dir_hint_prune (rt, ent.lla);
-      if (!is_s_self && !is_s_owner && has_s_lla)
+      if (!is_s_self && !is_s_owner && has_s_lla && !cand_only)
         {
           Re rel_re;
           memset (&rel_re, 0, sizeof (rel_re));
@@ -931,9 +967,8 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
         }
       bool import_dir_hint
           = allow_dir_hint && !eff_no_dir && has_dir_hint
-            && has_udp_hint
-            && (!is_s_owner || is_s_self)
-            && (is_s_self || (ent.flags & ADV_F_SEL_DIR) != 0);
+            && has_udp_hint && ent.ep_port != 0
+            && (!is_s_owner || is_s_self);
       if (import_dir_hint)
         {
           if (bogon_ip_match (ent.ep_ip))
@@ -962,10 +997,11 @@ adv_import (const uint8_t *pt, size_t pt_len, const uint8_t src_ip[16],
           else
             memcpy (dir_re.nhop_lla, ent.lla, 16);
           rt_upd (rt, &dir_re, sys_ts);
+          rt_dir_adv_note (rt, ent.lla, ent.ep_ip, ent.ep_port, sys_ts);
           if (pool
               && !p_is_me (rt, our_lla, ent.ep_ip, ent.ep_port))
             {
-              pp_add (pool, ent.ep_ip, ent.ep_port);
+              pp_add (pool, ent.ep_ip, ent.ep_port, sys_ts, false);
             }
         }
     }

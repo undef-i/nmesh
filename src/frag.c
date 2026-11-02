@@ -1,8 +1,23 @@
 #include "frag.h"
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+static _Atomic uint64_t g_frag_drop_cnt;
+
+static void
+frag_drop_note (void)
+{
+  atomic_fetch_add_explicit (&g_frag_drop_cnt, 1, memory_order_relaxed);
+}
+
+uint64_t
+frag_drop_get (void)
+{
+  return atomic_load_explicit (&g_frag_drop_cnt, memory_order_relaxed);
+}
 
 static FBktMeta *g_frag_meta = NULL;
 static FBktData *g_frag_data = NULL;
@@ -131,6 +146,7 @@ frag_bkt_new (const uint8_t src_lla[16], uint32_t msg_id)
         }
       if (idx < 0)
         return -1;
+      frag_drop_note ();
       g_frag_meta[idx].is_act = false;
     }
 
@@ -152,8 +168,13 @@ uint8_t *
 frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off, bool mf,
           const uint8_t *data, size_t data_len, uint16_t *out_len)
 {
-  if (!data || data_len == 0 || (size_t)off + data_len > FRAG_DATA_MAX)
+  if (!data || data_len == 0)
     return NULL;
+  if ((size_t)off + data_len > FRAG_DATA_MAX)
+    {
+      frag_drop_note ();
+      return NULL;
+    }
 
   int idx = frag_bkt_get (src_lla, msg_id);
   if (idx < 0)
@@ -170,13 +191,19 @@ frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off, bool mf,
   if (!mf)
     {
       if (end == 0 || (m->end_seen && m->tot_len != end))
-        return NULL;
+        {
+          frag_drop_note ();
+          return NULL;
+        }
       m->tot_len = end;
       m->end_seen = true;
     }
 
   if (m->end_seen && end > m->tot_len)
-    return NULL;
+    {
+      frag_drop_note ();
+      return NULL;
+    }
   memcpy (d->buf + off, data, data_len);
   for (size_t i = 0; i < data_len; i++)
     {
@@ -215,6 +242,9 @@ frag_reap_tk (uint64_t now)
       if (!g_frag_meta[i].is_act)
         continue;
       if (now < g_frag_meta[i].cre_ts || now - g_frag_meta[i].cre_ts > 1500ULL)
-        g_frag_meta[i].is_act = false;
+        {
+          frag_drop_note ();
+          g_frag_meta[i].is_act = false;
+        }
     }
 }

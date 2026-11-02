@@ -152,26 +152,15 @@ ibs_ping_pl_bld (Cry *s, const uint8_t our_lla[16], uint16_t our_port,
 }
 
 void
-ibs_pl_hash (const uint8_t *pl, uint8_t out[IBS_CKIE_SZ])
-{
-  uint8_t tmp[IBS_PING_PL_SZ];
-  memcpy (tmp, pl, sizeof (tmp));
-  memset (tmp + IBS_PING_CKIE_OFF, 0, IBS_CKIE_SZ);
-  crypto_generichash (out, IBS_CKIE_SZ, tmp, sizeof (tmp), NULL, 0);
-}
-
-void
 ibs_ckie_calc (const uint8_t key[IBS_CKIE_SZ], const uint8_t lla[16],
-               const uint8_t ip[16], uint16_t port,
-               const uint8_t pl_hash[IBS_CKIE_SZ], uint64_t bucket,
+               const uint8_t ip[16], uint16_t port, uint64_t bucket,
                uint8_t out[IBS_CKIE_SZ])
 {
-  uint8_t in[16 + 16 + 2 + IBS_CKIE_SZ + 8];
+  uint8_t in[16 + 16 + 2 + 8];
   memcpy (in, lla, 16);
   memcpy (in + 16, ip, 16);
   u16_wr (in + 32, port);
-  memcpy (in + 34, pl_hash, IBS_CKIE_SZ);
-  u64_wr (in + 34 + IBS_CKIE_SZ, bucket);
+  u64_wr (in + 34, bucket);
   crypto_generichash (out, IBS_CKIE_SZ, in, sizeof (in), key, IBS_CKIE_SZ);
 }
 

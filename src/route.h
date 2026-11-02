@@ -20,6 +20,16 @@
 #define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
 #define RT_PRB_INTV 5000ULL
 #define RT_KA_TMO (4 * RT_PRB_INTV)
+#define RT_PRB_TMO 15000ULL
+#define RT_STL_HL 6ULL
+#define RT_REL_STL_HL 12ULL
+#define RT_REL_DED_HL 24ULL
+#define RT_DED_HL 30ULL
+#define RT_REL_STL (RT_HL_INTV * RT_REL_STL_HL)
+#define RT_REL_DED (RT_HL_INTV * RT_REL_DED_HL)
+#define RT_STL_TS (RT_HL_INTV * RT_STL_HL)
+#define RT_DED_TS (RT_HL_INTV * RT_DED_HL)
+#define RT_CAND_AGE RT_DED_TS
 #define RT_METRIC_WIN_BINS (RT_GHS_TS / RT_PRB_INTV)
 
 #if (RT_GHS_TS % RT_PRB_INTV) != 0
@@ -91,6 +101,7 @@ typedef struct
   uint64_t prb_ts;
   uint64_t prb_wts;
   uint64_t prb_tok;
+  uint64_t prb_tok_prv;
   uint64_t prb_win_id[RT_METRIC_WIN_BINS];
   uint32_t prb_win_tx[RT_METRIC_WIN_BINS];
   uint32_t prb_win_rx[RT_METRIC_WIN_BINS];
@@ -99,9 +110,10 @@ typedef struct
   uint64_t pnd_ts;
   uint64_t hp_ts;
   uint64_t dat_ts;
+  uint64_t unp_ts;
+  uint64_t adv_ts;
   uint8_t ibs_ckie[IBS_CKIE_SZ];
   bool ibs_ckie_ok;
-  uint8_t prb_hash[IBS_CKIE_SZ];
 } Re;
 
 typedef struct Pth
@@ -174,6 +186,8 @@ typedef struct
 {
   uint8_t ip[16];
   uint16_t port;
+  uint64_t fs_ts;
+  bool pv;
 } PAnc;
 
 typedef struct
@@ -214,6 +228,16 @@ typedef struct Rt
   uint64_t ctrl_now_tx_bps;
   uint64_t ctrl_now_rx_bps;
   uint64_t ckie_fail_cnt;
+  uint64_t ibs_drop_cnt;
+  uint64_t rp_drop_cnt;
+  uint64_t rp_kn_drop_cnt;
+  uint64_t rp_un_drop_cnt;
+  uint64_t aead_drop_cnt;
+  uint64_t aead_un_drop_cnt;
+  uint64_t aead_au_drop_cnt;
+  uint64_t aead_pr_drop_cnt;
+  uint64_t oth_drop_cnt;
+  uint64_t bad_drop_cnt;
   Pth *pth_pool;
   RtMap *rtm_pool;
 } Rt;
@@ -260,6 +284,7 @@ void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
                  bool has_fwd, uint64_t sys_ts);
 bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
                          uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
+                         const uint8_t *ep_ip, uint16_t ep_port,
                          uint64_t sys_ts);
 void rt_ep_upd (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
                 uint16_t port, uint8_t tp_mask, uint64_t sys_ts);
@@ -304,9 +329,15 @@ bool rt_ep_peer_lla (const Rt *t, const uint8_t ip[16], uint16_t port,
 bool rt_peer_ep_fnd (const Rt *t, const uint8_t peer_lla[16],
                      uint8_t out_ip[16], uint16_t *out_port);
 void rt_dir_hint_prune (Rt *t, const uint8_t lla[16]);
-bool rt_peer_sess (Rt *t, const uint8_t rt_id[16], uint64_t peer_sid,
-                   uint64_t sys_ts);
+void rt_dir_adv_note (Rt *t, const uint8_t lla[16], const uint8_t ip[16],
+                      uint16_t port, uint64_t sys_ts);
+Re *rt_dir_ent (Rt *t, const uint8_t lla[16]);
+void rt_dir_del (Rt *t, const uint8_t lla[16]);
+void rt_adm_sess (Rt *t, const uint8_t lla[16], uint64_t new_sid,
+                  uint64_t sys_ts);
 void pp_init (PPool *p);
 void pp_free (PPool *p);
-void pp_add (PPool *p, const uint8_t ip[16], uint16_t port);
+void pp_add (PPool *p, const uint8_t ip[16], uint16_t port, uint64_t sys_ts,
+             bool proven);
+void pp_gc (PPool *p, uint64_t sys_ts);
 void rt_adv_dirty_set (Rt *t);

@@ -10,8 +10,18 @@
 #include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <stdatomic.h>
+
+static _Atomic uint64_t g_gro_drop_cnt;
+
+uint64_t
+gro_drop_get (void)
+{
+  return atomic_load_explicit (&g_gro_drop_cnt, memory_order_relaxed);
+}
 
 #define GRO_MAX_SZ 65535U
+#define GRO_SEG_MAX 128U
 #define GRO_SLOTS 32
 #define GRO_PROTO_TCP 6
 #define GRO_PROTO_UDP 17
@@ -56,14 +66,6 @@ u32_be_rd (const uint8_t *p)
          | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static inline void
-u32_be_wr (uint8_t *p, uint32_t v)
-{
-  p[0] = (uint8_t)(v >> 24);
-  p[1] = (uint8_t)(v >> 16);
-  p[2] = (uint8_t)(v >> 8);
-  p[3] = (uint8_t)(v & 0xffU);
-}
 
 static uint32_t
 csum_add (uint32_t sum, const uint8_t *buf, size_t len)
@@ -196,6 +198,7 @@ gro_ent_fls (int tap_fd, GroEnt *gro)
                           { .iov_base = gro->buf, .iov_len = gro->len } };
   if (writev (tap_fd, iov, 2) < 0)
     {
+      atomic_fetch_add_explicit (&g_gro_drop_cnt, 1, memory_order_relaxed);
       fprintf (stderr, "gro: gso write failed errno=%d\n", errno);
     }
   gro->act = false;
@@ -219,6 +222,14 @@ gro_fls_all (int tap_fd)
 {
   for (int i = 0; i < GRO_SLOTS; i++)
     gro_ent_fls (tap_fd, &g_gro[i]);
+}
+
+static bool
+gro_seg_room (const GroEnt *gro, size_t add_len)
+{
+  size_t hdr = (size_t)gro->mac_hl + gro->ip_hl + gro->l4_hl;
+  size_t pl = gro->len - hdr + add_len;
+  return (pl + gro->gso_sz - 1) / gro->gso_sz <= GRO_SEG_MAX;
 }
 
 static bool
@@ -251,7 +262,8 @@ gro_tcp_try (int tap_fd, const uint8_t *frm, size_t len, size_t mac_hl,
           && memcmp (gro->dst_ip, is_v6 ? ip + 24 : ip + 16, is_v6 ? 16 : 4) == 0
           && memcmp (gro_tcp, tcp, 4) == 0
           && memcmp (gro_tcp + 8, tcp + 8, 8) == 0
-          && seq == gro->nxt_seq && (gro->len + pl_len) <= GRO_MAX_SZ)
+          && seq == gro->nxt_seq && (gro->len + pl_len) <= GRO_MAX_SZ
+          && gro_seg_room (gro, pl_len))
         {
           memcpy (gro->buf + gro->len, tcp + tcp_hl, pl_len);
           gro->len += pl_len;
@@ -315,7 +327,8 @@ gro_udp_try (int tap_fd, const uint8_t *frm, size_t len, size_t mac_hl,
           && memcmp (gro->src_ip, is_v6 ? ip + 8 : ip + 12, is_v6 ? 16 : 4) == 0
           && memcmp (gro->dst_ip, is_v6 ? ip + 24 : ip + 16, is_v6 ? 16 : 4) == 0
           && memcmp (gro_udp, udp, 4) == 0 && gro->gso_sz == pl_len
-          && (gro->len + pl_len) <= GRO_MAX_SZ)
+          && (gro->len + pl_len) <= GRO_MAX_SZ
+          && gro_seg_room (gro, pl_len))
         {
           memcpy (gro->buf + gro->len, udp + 8, pl_len);
           gro->len += pl_len;

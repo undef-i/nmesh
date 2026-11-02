@@ -28,3 +28,4 @@ uint8_t *frag_asm (const uint8_t src_lla[16], uint32_t msg_id, uint16_t off,
                    bool mf, const uint8_t *data, size_t data_len,
                    uint16_t *out_len);
 void frag_reap_tk (uint64_t sys_ts);
+uint64_t frag_drop_get (void);
