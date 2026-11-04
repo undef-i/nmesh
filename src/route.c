@@ -239,6 +239,38 @@ re_rto_upd (Re *re, uint32_t rtt_ms)
   re->rto = rto;
 }
 
+static uint64_t
+ka_rto (const Re *re)
+{
+  return re->rto ? re->rto : RTO_INIT;
+}
+
+bool
+rt_ka_dead (const Re *re, uint64_t sys_ts)
+{
+  if (!re || re->r2d != 0 || re->rx_ts == 0 || sys_ts <= re->rx_ts)
+    return false;
+  if (re->prb_ts <= re->rx_ts)
+    return false;
+  return (sys_ts - re->rx_ts) >= (RT_KA_INTV + 4ULL * ka_rto (re));
+}
+
+bool
+rt_ka_due (const Re *re, uint64_t sys_ts)
+{
+  if (!re || re->r2d != 0 || re->rx_ts == 0 || sys_ts < re->rx_ts)
+    return false;
+  if ((sys_ts - re->rx_ts) < RT_KA_INTV)
+    return false;
+  if (rt_ka_dead (re, sys_ts))
+    return false;
+  if (re->prb_ts <= re->rx_ts)
+    return true;
+  if (sys_ts < re->prb_ts)
+    return false;
+  return (sys_ts - re->prb_ts) >= ka_rto (re);
+}
+
 static int32_t
 pth_m (const Pth *pth)
 {
@@ -489,6 +521,14 @@ re_rtt_min_apply (Re *re, uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
   if (has_fwd)
     re_fwd_win_add (re, fwd_obs, sys_ts);
   re_metric_refresh (re, sys_ts);
+}
+
+bool
+rt_fwd_unp (const Re *re, uint64_t sys_ts)
+{
+  if (!re || re->r2d != 0)
+    return false;
+  return re_fwd_win_cur (re, sys_ts) >= RT_F_INF;
 }
 
 
@@ -1164,31 +1204,29 @@ rt_mtu_probe_set (Rt *t, bool is_on)
     rt_adv_dirty_set (t);
 }
 
-static uint64_t
-rt_nhop_pong_age (const Rt *t, const uint8_t nhop_lla[16], uint64_t sys_ts)
+static RtSt
+rt_nhop_st (const Rt *t, const uint8_t nhop_lla[16])
 {
   if (is_z16 (nhop_lla) || memcmp (nhop_lla, t->our_lla, 16) == 0)
-    return 0;
-  uint64_t best = 0;
+    return RT_ACT;
+  RtSt best = RT_DED;
   for (uint32_t i = 0; i < t->cnt; i++)
     {
       const Re *nh = &t->re_arr[i];
       if (nh->r2d != 0 || memcmp (nh->lla, nhop_lla, 16) != 0)
         continue;
-      if (nh->pong_ts > best)
-        best = nh->pong_ts;
+      if (nh->state == RT_ACT)
+        return RT_ACT;
+      if (nh->state == RT_PND)
+        best = RT_PND;
     }
-  if (best == 0)
-    return UINT64_MAX;
-  if (sys_ts <= best)
-    return 0;
-  return sys_ts - best;
+  return best;
 }
 
 static bool
-rt_nhop_proof_ok (const Rt *t, const uint8_t nhop_lla[16], uint64_t sys_ts)
+rt_nhop_proof_ok (const Rt *t, const uint8_t nhop_lla[16])
 {
-  return rt_nhop_pong_age (t, nhop_lla, sys_ts) <= RT_KA_TMO;
+  return rt_nhop_st (t, nhop_lla) == RT_ACT;
 }
 
 void
@@ -1209,7 +1247,7 @@ rt_upd (Rt *t, const Re *re, uint64_t sys_ts)
   if (!is_rel && !rt_direct_ep_ip_ok (re->ep_ip))
     return;
   bool is_dir_obs = !is_zero && !is_rel && !is_loc_inj;
-  bool rel_proof_ok = !is_rel || rt_nhop_proof_ok (t, re->nhop_lla, sys_ts);
+  bool rel_proof_ok = !is_rel || rt_nhop_proof_ok (t, re->nhop_lla);
   if (!is_zero && !is_rel)
     {
       Re *roam = rt_dir_ep_roam_pick (t, re->lla, re->ep_ip, re->ep_port);
@@ -1399,7 +1437,7 @@ rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out)
 void
 rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
             uint16_t port, uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
-            uint64_t sys_ts)
+            uint64_t sys_ts, bool live)
 {
   if (rtt_ms == 0)
     rtt_ms = 1;
@@ -1414,8 +1452,11 @@ rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
       if (t->re_arr[i].ep_port != port)
         continue;
       re_rtt_min_apply (&t->re_arr[i], rtt_ms, fwd_obs, has_fwd, sys_ts);
-      re_rx_note (&t->re_arr[i], sys_ts);
-      (void)re_dir_activate (&t->re_arr[i], sys_ts);
+      if (live)
+        {
+          re_rx_note (&t->re_arr[i], sys_ts);
+          (void)re_dir_activate (&t->re_arr[i], sys_ts);
+        }
       re_rto_upd (&t->re_arr[i], rtt_ms);
       rt_map_mark (t);
       return;
@@ -2252,7 +2293,7 @@ rt_unr_hnd (Rt *t, const uint8_t ip[16], uint16_t port, uint64_t sys_ts)
       if (re->ep_port != port)
         continue;
       if (re->pong_ts > 0 && sys_ts >= re->pong_ts
-          && (sys_ts - re->pong_ts) <= RT_PRB_INTV)
+          && (sys_ts - re->pong_ts) <= RT_KA_INTV)
         {
           re->tx_ts = sys_ts;
           continue;
@@ -2286,10 +2327,9 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
       uint64_t ded_ts = is_rel ? RT_REL_DED : RT_DED_TS;
       if (!is_rel && re_metric_refresh (re, sys_ts))
         is_mod = true;
-      if (!is_rel && re->state == RT_ACT && re->pong_ts > 0
-          && !is_z16 (re->lla)
+      if (!is_rel && re->state == RT_ACT && !is_z16 (re->lla)
           && memcmp (re->lla, t->our_lla, 16) != 0
-          && sys_ts > re->pong_ts && (sys_ts - re->pong_ts) > RT_KA_TMO)
+          && rt_ka_dead (re, sys_ts))
         {
           if (rt_dir_is_sel (t, re))
             any_ded = true;
@@ -2299,8 +2339,8 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
         }
       if (is_rel && re->state != RT_DED)
         {
-          uint64_t nh_age = rt_nhop_pong_age (t, re->nhop_lla, sys_ts);
-          if (nh_age > RT_STL_TS)
+          RtSt nh_st = rt_nhop_st (t, re->nhop_lla);
+          if (nh_st == RT_DED)
             {
               if (re->state == RT_ACT)
                 any_ded = true;
@@ -2310,7 +2350,7 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
               re_metric_win_clear (re);
               is_mod = true;
             }
-          else if (re->state == RT_ACT && nh_age > RT_KA_TMO)
+          else if (re->state == RT_ACT && nh_st == RT_PND)
             {
               if (re->state == RT_ACT)
                 any_ded = true;
@@ -2319,6 +2359,16 @@ rt_prn_st (Rt *t, const Cfg *cfg, uint64_t sys_ts)
               re->sm_m = RT_M_INF;
               re_metric_win_clear (re);
               re->pnd_ts = sys_ts;
+              is_mod = true;
+            }
+          else if (re->state == RT_PND && nh_st == RT_ACT
+                   && re->adv_m < RT_F_INF && re->rx_ts > 0
+                   && sys_ts >= re->rx_ts
+                   && (sys_ts - re->rx_ts) <= RT_DED_TS)
+            {
+              rt_adv_dirty_set (t);
+              re->state = RT_ACT;
+              re->rt_m = re->adv_m;
               is_mod = true;
             }
         }

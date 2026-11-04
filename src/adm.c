@@ -762,8 +762,9 @@ adm_tick_i (Adm *a, Rt *rt, Cry *cry, Adv *adv, const Cfg *cfg, uint64_t ts)
   for (uint32_t i = 0; i < a->cnt; i++)
     {
       AdmEnt *e = &a->arr[i];
-      if (e->st == ADM_ADMITTED && !e->tp_tcp && e->ts_pong > 0
-          && ts > e->ts_pong && (ts - e->ts_pong) > RT_KA_TMO)
+      Re *re = rt_dir_ent (rt, e->lla);
+      if (e->st == ADM_ADMITTED && !e->tp_tcp && re
+          && rt_ka_dead (re, ts))
         e->st = ADM_SUSPECT;
       uint64_t last = e->ts_adm > e->ts_seen ? e->ts_adm : e->ts_seen;
       bool since_dead = e->ts_dead != 0 && e->ts_seen <= e->ts_dead
@@ -792,7 +793,6 @@ adm_tick_i (Adm *a, Rt *rt, Cry *cry, Adv *adv, const Cfg *cfg, uint64_t ts)
         }
       if (e->tp_tcp && e->ep_ok)
         rt_rx_ack (rt, e->ep_ip, e->ep_port, ts);
-      Re *re = rt_dir_ent (rt, e->lla);
       if (re)
         {
           RtSt want = RT_DED;

@@ -4503,7 +4503,7 @@ on_rx_dec_pkt (LoopRxCtx *ctx, const TpSrc *tp_src, const uint8_t udp_src_ip[16]
                                  src_port, ts)
             && has_src)
           rt_rtt_upd (rt, peer_lla, src_ip, src_port, rtt, fwd_obs,
-                      has_fwd, ts);
+                      has_fwd, ts, true);
         if (cfg->p2p && hdr->rel_f == 0 && has_src
             && !p_is_me (rt, cfg->addr, src_ip, src_port))
           pp_add (pool, src_ip, src_port, ts, true);
@@ -4840,7 +4840,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       bool is_unmapped = lla_is_z (re->lla);
       bool needs_probe = is_unmapped || re->state == RT_PND
-                         || re->rt_m >= RT_F_INF;
+                         || re->rt_m >= RT_F_INF || rt_fwd_unp (re, ts);
       if (needs_probe)
         {
           if (re->prb_ts > 0 && ts >= re->prb_ts
@@ -4855,12 +4855,7 @@ on_tmr (int timer_fd, Udp *udp, Cry *cry_ctx, Rt *rt, const Cfg *cfg,
 
       if (re->state != RT_ACT)
         continue;
-      if (tap_tx_use_tcp (rt, cfg, re->ep_ip, re->ep_port))
-        continue;
-      uint64_t prb_intv = RT_PRB_INTV;
-      bool prb_due = !(re->prb_ts > 0 && ts >= re->prb_ts
-                       && (ts - re->prb_ts) < prb_intv);
-      if (!prb_due)
+      if (!rt_ka_due (re, ts))
         continue;
       if (re->unp_ts > 0 && ts > re->unp_ts
           && (ts - re->unp_ts) > RT_CAND_AGE)

@@ -20,6 +20,7 @@
 #define RT_GHS_TS (RT_HL_INTV * RT_GHS_HL)
 #define RT_PRB_INTV 5000ULL
 #define RT_KA_TMO (4 * RT_PRB_INTV)
+#define RT_KA_INTV 25000ULL
 #define RT_PRB_TMO 15000ULL
 #define RT_STL_HL 6ULL
 #define RT_REL_STL_HL 12ULL
@@ -279,9 +280,12 @@ bool rt_dir_fnd (Rt *t, const uint8_t dst_lla[16], Re *out);
 bool rt_dir_is_sel (Rt *t, const Re *re);
 bool rt_loss_pct_get (const Re *re, uint32_t *out_pct);
 void rt_prb_tx_note (Re *re, uint64_t sys_ts);
+bool rt_ka_due (const Re *re, uint64_t sys_ts);
+bool rt_ka_dead (const Re *re, uint64_t sys_ts);
+bool rt_fwd_unp (const Re *re, uint64_t sys_ts);
 void rt_rtt_upd (Rt *t, const uint8_t peer_lla[16], const uint8_t ip[16],
                  uint16_t port, uint32_t rtt_ms, int64_t fwd_obs,
-                 bool has_fwd, uint64_t sys_ts);
+                 bool has_fwd, uint64_t sys_ts, bool live);
 bool rt_ping_sample_upd (Rt *t, const uint8_t peer_lla[16], uint64_t prb_tok,
                          uint32_t rtt_ms, int64_t fwd_obs, bool has_fwd,
                          const uint8_t *ep_ip, uint16_t ep_port,
